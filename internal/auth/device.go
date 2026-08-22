@@ -1,13 +1,11 @@
 package auth
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
-	"io"
-	"m365-copilot2api/internal/outbound"
 	"net/http"
 	"net/url"
-	"strings"
 	"time"
 )
 
@@ -33,20 +31,14 @@ type deviceCodeResponse struct {
 }
 
 func StartDeviceCode() (DeviceCode, error) {
+	return StartDeviceCodeContext(context.Background())
+}
+
+func StartDeviceCodeContext(ctx context.Context) (DeviceCode, error) {
 	form := url.Values{}
 	form.Set("client_id", DeviceClientID())
 	form.Set("scope", DeviceScope())
-	req, err := http.NewRequest(http.MethodPost, DeviceCodeEndpoint(), strings.NewReader(form.Encode()))
-	if err != nil {
-		return DeviceCode{}, err
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	resp, err := outbound.HTTPClient().Do(req)
-	if err != nil {
-		return DeviceCode{}, err
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
+	resp, body, err := postAuthForm(ctx, DeviceCodeEndpoint(), form)
 	if err != nil {
 		return DeviceCode{}, err
 	}
@@ -57,8 +49,11 @@ func StartDeviceCode() (DeviceCode, error) {
 	if dr.Error != "" {
 		return DeviceCode{}, fmt.Errorf("%s: %s", dr.Error, dr.ErrorDesc)
 	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return DeviceCode{}, fmt.Errorf("device code endpoint HTTP %d", resp.StatusCode)
+	}
 	if dr.DeviceCode == "" || dr.UserCode == "" {
-		return DeviceCode{}, fmt.Errorf("invalid device code response: %s", string(body))
+		return DeviceCode{}, fmt.Errorf("invalid device code response")
 	}
 	interval := dr.Interval
 	if interval <= 0 {
@@ -76,21 +71,15 @@ func StartDeviceCode() (DeviceCode, error) {
 }
 
 func PollDeviceCode(deviceCode string) (TokenSet, bool, error) {
+	return PollDeviceCodeContext(context.Background(), deviceCode)
+}
+
+func PollDeviceCodeContext(ctx context.Context, deviceCode string) (TokenSet, bool, error) {
 	form := url.Values{}
 	form.Set("client_id", DeviceClientID())
 	form.Set("grant_type", "urn:ietf:params:oauth:grant-type:device_code")
 	form.Set("device_code", deviceCode)
-	req, err := http.NewRequest(http.MethodPost, DeviceTokenEndpoint(), strings.NewReader(form.Encode()))
-	if err != nil {
-		return TokenSet{}, false, err
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	resp, err := outbound.HTTPClient().Do(req)
-	if err != nil {
-		return TokenSet{}, false, err
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
+	resp, body, err := postAuthForm(ctx, DeviceTokenEndpoint(), form)
 	if err != nil {
 		return TokenSet{}, false, err
 	}
@@ -110,33 +99,11 @@ func PollDeviceCode(deviceCode string) (TokenSet, bool, error) {
 			return TokenSet{}, false, fmt.Errorf("%s: %s", tr.Error, tr.ErrorDesc)
 		}
 	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return TokenSet{}, false, fmt.Errorf("device token endpoint HTTP %d", resp.StatusCode)
+	}
 	if tr.AccessToken == "" {
 		return TokenSet{}, false, fmt.Errorf("token endpoint returned no access token")
 	}
-	set := TokenSet{
-		AccessToken:  tr.AccessToken,
-		RefreshToken: tr.RefreshToken,
-		IDToken:      tr.IDToken,
-		TokenType:    tr.TokenType,
-		Scope:        tr.Scope,
-		ExpiresIn:    tr.ExpiresIn,
-		ExpiresAt:    time.Now().Add(time.Duration(tr.ExpiresIn) * time.Second),
-	}
-	if claims, err := decodeJWTClaims(tr.AccessToken); err == nil {
-		set.Email = firstNonEmpty(claims["unique_name"], claims["upn"], claims["preferred_username"], claims["email"])
-		set.DisplayName = firstNonEmpty(claims["name"], set.Email)
-		set.HomeOID = firstNonEmpty(claims["oid"], claims["sub"])
-		set.TenantID = firstNonEmpty(claims["tid"], claims["tenant_id"])
-	}
-	if tr.IDToken != "" {
-		if claims, err := decodeJWTClaims(tr.IDToken); err == nil {
-			if set.Email == "" {
-				set.Email = firstNonEmpty(claims["preferred_username"], claims["email"], claims["upn"])
-				set.DisplayName = firstNonEmpty(claims["name"], set.Email)
-				set.HomeOID = firstNonEmpty(claims["oid"], claims["sub"], set.HomeOID)
-			}
-			set.TenantID = firstNonEmpty(set.TenantID, claims["tid"], claims["tenant_id"])
-		}
-	}
-	return set, true, nil
+	return tokenSetFromResponse(tr), true, nil
 }

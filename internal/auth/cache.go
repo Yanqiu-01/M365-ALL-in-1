@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"os"
@@ -34,6 +35,7 @@ type Store struct {
 	data     Cache
 	nextIdx  int
 	inflight map[string]*inflightRefresh
+	refresh  func(context.Context, string) (TokenSet, error)
 }
 
 // inflightRefresh coalesces concurrent EnsureValid refreshes for the same
@@ -237,79 +239,132 @@ func (s *Store) Next() (AccountToken, bool) {
 }
 
 func (s *Store) EnsureValid(id string) (AccountToken, error) {
-	acc, ok := s.Get(id)
+	ctx, cancel := context.WithTimeout(context.Background(), authRequestTimeout)
+	defer cancel()
+	return s.EnsureValidContext(ctx, id)
+}
+
+// EnsureValidContext coalesces refreshes using the latest stored account state.
+// Waiters can leave when their context is cancelled instead of blocking forever.
+func (s *Store) EnsureValidContext(ctx context.Context, id string) (AccountToken, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	s.mu.Lock()
+	idx, acc, ok := s.findAccountLocked(id)
 	if !ok {
+		s.mu.Unlock()
 		return AccountToken{}, os.ErrNotExist
 	}
 	if time.Now().Before(acc.ExpiresAt.Add(-30 * time.Second)) {
+		s.mu.Unlock()
 		return acc, nil
+	}
+	if err := ctx.Err(); err != nil {
+		s.mu.Unlock()
+		return acc, err
 	}
 	if acc.RefreshToken == "" {
 		acc.Status = "expired"
-		s.mu.Lock()
-		for i, a := range s.data.Accounts {
-			if a.ID == acc.ID {
-				s.data.Accounts[i] = acc
-				_ = s.saveLocked()
-				break
-			}
-		}
+		acc.UpdatedAt = time.Now()
+		s.data.Accounts[idx] = acc
+		saveErr := s.saveLocked()
 		s.mu.Unlock()
+		if saveErr != nil {
+			return acc, errors.Join(fmtExpired(), saveErr)
+		}
 		return acc, fmtExpired()
 	}
-	return s.refreshInflight(acc)
-}
-
-// refreshInflight runs the AAD token refresh exactly once per account; waiters
-// block on the shared flight instead of redeeming the one-time refresh token
-// themselves. The winner's outcome is broadcast to all waiters.
-func (s *Store) refreshInflight(acc AccountToken) (AccountToken, error) {
-	s.mu.Lock()
 	if s.inflight == nil {
 		s.inflight = map[string]*inflightRefresh{}
 	}
 	if f, ok := s.inflight[acc.ID]; ok {
 		s.mu.Unlock()
-		<-f.done
-		return f.acc, f.err
+		select {
+		case <-f.done:
+			return f.acc, f.err
+		case <-ctx.Done():
+			return acc, ctx.Err()
+		}
 	}
 	f := &inflightRefresh{done: make(chan struct{})}
 	s.inflight[acc.ID] = f
+	refresh := s.refresh
+	if refresh == nil {
+		refresh = RefreshContext
+	}
+	usedRefreshToken := acc.RefreshToken
 	s.mu.Unlock()
 
-	tok, err := Refresh(acc.RefreshToken)
-	if err != nil {
-		acc.Status = "expired"
-		s.mu.Lock()
-		for i, a := range s.data.Accounts {
-			if a.ID == acc.ID {
-				s.data.Accounts[i] = acc
-				_ = s.saveLocked()
-				break
-			}
-		}
-		s.mu.Unlock()
-		f.acc, f.err = acc, err
-	} else {
-		if tok.Email == "" {
-			tok.Email = acc.Email
-		}
-		if tok.DisplayName == "" {
-			tok.DisplayName = acc.DisplayName
-		}
-		if tok.HomeOID == "" {
-			tok.HomeOID = firstNonEmpty(acc.OID, acc.ID)
-		}
-		if tok.TenantID == "" {
-			tok.TenantID = acc.TID
-		}
-		f.acc, f.err = s.Upsert(tok)
-	}
-	close(f.done)
+	tok, refreshErr := refresh(ctx, usedRefreshToken)
+
 	s.mu.Lock()
+	f.acc, f.err = s.applyRefreshResultLocked(acc, usedRefreshToken, tok, refreshErr)
 	delete(s.inflight, acc.ID)
+	close(f.done)
 	s.mu.Unlock()
 	return f.acc, f.err
+}
+
+func (s *Store) findAccountLocked(id string) (int, AccountToken, bool) {
+	for i, acc := range s.data.Accounts {
+		if acc.ID == id || acc.OID == id || acc.Email == id {
+			return i, acc, true
+		}
+	}
+	return -1, AccountToken{}, false
+}
+
+func (s *Store) applyRefreshResultLocked(original AccountToken, usedRefreshToken string, tok TokenSet, refreshErr error) (AccountToken, error) {
+	idx, current, ok := s.findAccountLocked(original.ID)
+	if !ok {
+		return AccountToken{}, os.ErrNotExist
+	}
+	if refreshErr != nil {
+		if isPermanentRefreshError(refreshErr) && current.RefreshToken == usedRefreshToken {
+			current.Status = "expired"
+			current.UpdatedAt = time.Now()
+			s.data.Accounts[idx] = current
+			if err := s.saveLocked(); err != nil {
+				return current, errors.Join(refreshErr, err)
+			}
+		}
+		return current, refreshErr
+	}
+	if current.RefreshToken != usedRefreshToken {
+		if time.Now().Before(current.ExpiresAt.Add(-30 * time.Second)) {
+			return current, nil
+		}
+		return current, errors.New("token refresh superseded by a concurrent account update")
+	}
+	if tok.AccessToken == "" {
+		return current, errors.New("refresh returned an empty access token")
+	}
+
+	updated := current
+	updated.Status = "online"
+	updated.AccessToken = tok.AccessToken
+	updated.RefreshToken = firstNonEmpty(tok.RefreshToken, current.RefreshToken)
+	updated.ExpiresAt = tok.ExpiresAt
+	updated.UpdatedAt = time.Now()
+	updated.Email = firstNonEmpty(tok.Email, current.Email)
+	updated.DisplayName = firstNonEmpty(tok.DisplayName, current.DisplayName)
+	updated.OID = firstNonEmpty(tok.HomeOID, current.OID, current.ID)
+	updated.TID = firstNonEmpty(tok.TenantID, current.TID)
+	if updated.ClientID == "" {
+		updated.ClientID = ClientID()
+	}
+	s.data.Accounts[idx] = updated
+	if err := s.saveLocked(); err != nil {
+		return updated, err
+	}
+	return updated, nil
+}
+
+func isPermanentRefreshError(err error) bool {
+	var oauthErr *OAuthError
+	return errors.As(err, &oauthErr) && oauthErr.Code == "invalid_grant"
 }
 
 func fmtExpired() error {

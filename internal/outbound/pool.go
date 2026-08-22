@@ -62,6 +62,25 @@ func (p *Pool) pick() *poolEntry {
 	p.next = (p.next + 1) % len(p.entries)
 	return e
 }
+func (p *Pool) pickExcept(exclude *poolEntry) *poolEntry {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.entries) <= 1 {
+		return nil
+	}
+	now := time.Now()
+	for i := 0; i < len(p.entries); i++ {
+		idx := (p.next + i) % len(p.entries)
+		e := p.entries[idx]
+		if e == exclude || now.Before(e.cooldown) {
+			continue
+		}
+		p.next = (idx + 1) % len(p.entries)
+		return e
+	}
+	return nil
+}
+
 func (p *Pool) mark(raw string, err error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -147,32 +166,49 @@ type poolRoundTripper struct {
 	base  http.RoundTripper
 }
 
+func retryableRequest(r *http.Request) bool {
+	switch r.Method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodTrace:
+		return true
+	default:
+		return false
+	}
+}
+
+func closeResponseBody(resp *http.Response) {
+	if resp != nil && resp.Body != nil {
+		_ = resp.Body.Close()
+	}
+}
+
 func (t *poolRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) {
 	resp, err := t.base.RoundTrip(r)
 	t.pool.mark(t.entry.raw, err)
 	if err == nil {
 		return resp, nil
 	}
-	// Replay the request on the next healthy proxy once (body must be replayable).
-	if r.Body != nil && r.GetBody == nil {
+	closeResponseBody(resp)
+	if r.Context().Err() != nil || !retryableRequest(r) || (r.Body != nil && r.GetBody == nil) {
 		return resp, err
 	}
-	for i := 0; i < len(t.pool.entries)+1; i++ {
-		next := t.pool.pick()
-		if next == nil || next == t.entry {
-			break
-		}
+	next := t.pool.pickExcept(t.entry)
+	if next == nil {
+		return resp, err
+	}
+	retry := r.Clone(r.Context())
+	if r.Body != nil {
 		body, berr := r.GetBody()
 		if berr != nil {
-			break
+			return resp, err
 		}
-		retry := r.Clone(r.Context())
 		retry.Body = body
-		resp2, err2 := next.clients.HTTP.Transport.RoundTrip(retry)
-		t.pool.mark(next.raw, err2)
-		if err2 == nil {
-			return resp2, nil
-		}
+	} else {
+		retry.Body = nil
 	}
-	return resp, err
+	resp2, err2 := next.clients.HTTP.Transport.RoundTrip(retry)
+	t.pool.mark(next.raw, err2)
+	if err2 != nil {
+		closeResponseBody(resp2)
+	}
+	return resp2, err2
 }

@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -10,6 +11,11 @@ import (
 	"net/url"
 	"strings"
 	"time"
+)
+
+const (
+	authRequestTimeout   = 30 * time.Second
+	maxAuthResponseBytes = int64(1 << 20)
 )
 
 type TokenSet struct {
@@ -63,6 +69,10 @@ func (t TokenSet) Valid() bool {
 }
 
 func ExchangeCode(code, verifier, redirect string) (TokenSet, error) {
+	return ExchangeCodeContext(context.Background(), code, verifier, redirect)
+}
+
+func ExchangeCodeContext(ctx context.Context, code, verifier, redirect string) (TokenSet, error) {
 	form := url.Values{}
 	form.Set("client_id", ClientID())
 	form.Set("grant_type", "authorization_code")
@@ -70,22 +80,30 @@ func ExchangeCode(code, verifier, redirect string) (TokenSet, error) {
 	form.Set("redirect_uri", redirect)
 	form.Set("code_verifier", verifier)
 	form.Set("scope", Scope())
-	return requestToken(form)
+	return requestTokenContext(ctx, form)
 }
 
 func Refresh(refreshToken string) (TokenSet, error) {
+	return RefreshContext(context.Background(), refreshToken)
+}
+
+func RefreshContext(ctx context.Context, refreshToken string) (TokenSet, error) {
 	form := url.Values{}
 	form.Set("client_id", ClientID())
 	form.Set("grant_type", "refresh_token")
 	form.Set("refresh_token", refreshToken)
 	form.Set("scope", Scope())
-	return requestToken(form)
+	return requestTokenContext(ctx, form)
 }
 
 // RefreshWithScope redeems the same account refresh token for a separately
 // consented Microsoft resource, such as the Designer App Service used to
 // download generated images. The caller must persist a rotated refresh token.
 func RefreshWithScope(refreshToken, clientID, scope string) (TokenSet, error) {
+	return RefreshWithScopeContext(context.Background(), refreshToken, clientID, scope)
+}
+
+func RefreshWithScopeContext(ctx context.Context, refreshToken, clientID, scope string) (TokenSet, error) {
 	form := url.Values{}
 	clientID = strings.TrimSpace(clientID)
 	if clientID == "" {
@@ -95,31 +113,29 @@ func RefreshWithScope(refreshToken, clientID, scope string) (TokenSet, error) {
 	form.Set("grant_type", "refresh_token")
 	form.Set("refresh_token", refreshToken)
 	form.Set("scope", scope)
-	return requestToken(form)
+	return requestTokenContext(ctx, form)
 }
 
 func ROPC(username, password string) (TokenSet, error) {
+	return ROPCContext(context.Background(), username, password)
+}
+
+func ROPCContext(ctx context.Context, username, password string) (TokenSet, error) {
 	form := url.Values{}
 	form.Set("client_id", ClientID())
 	form.Set("grant_type", "password")
 	form.Set("username", username)
 	form.Set("password", password)
 	form.Set("scope", Scope())
-	return requestTokenTenant(form, Authority()+"/organizations/oauth2/v2.0/token")
+	return requestTokenTenantContext(ctx, form, Authority()+"/organizations/oauth2/v2.0/token")
 }
 
 func requestTokenTenant(form url.Values, endpoint string) (TokenSet, error) {
-	req, err := http.NewRequest(http.MethodPost, endpoint, strings.NewReader(form.Encode()))
-	if err != nil {
-		return TokenSet{}, err
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	resp, err := outbound.HTTPClient().Do(req)
-	if err != nil {
-		return TokenSet{}, err
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
+	return requestTokenTenantContext(context.Background(), form, endpoint)
+}
+
+func requestTokenTenantContext(ctx context.Context, form url.Values, endpoint string) (TokenSet, error) {
+	resp, body, err := postAuthForm(ctx, endpoint, form)
 	if err != nil {
 		return TokenSet{}, err
 	}
@@ -130,39 +146,21 @@ func requestTokenTenant(form url.Values, endpoint string) (TokenSet, error) {
 	if tr.Error != "" {
 		return TokenSet{}, fmt.Errorf("ROPC %s: %s", tr.Error, tr.ErrorDesc)
 	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return TokenSet{}, fmt.Errorf("ROPC HTTP %d", resp.StatusCode)
+	}
 	if tr.AccessToken == "" {
 		return TokenSet{}, fmt.Errorf("ROPC HTTP %d: empty access token", resp.StatusCode)
 	}
-	set := TokenSet{
-		AccessToken:  tr.AccessToken,
-		RefreshToken: tr.RefreshToken,
-		IDToken:      tr.IDToken,
-		TokenType:    tr.TokenType,
-		Scope:        tr.Scope,
-		ExpiresIn:    tr.ExpiresIn,
-		ExpiresAt:    time.Now().Add(time.Duration(tr.ExpiresIn) * time.Second),
-	}
-	if claims, err := decodeJWTClaims(tr.AccessToken); err == nil {
-		set.Email = firstNonEmpty(claims["unique_name"], claims["upn"], claims["preferred_username"], claims["email"])
-		set.DisplayName = firstNonEmpty(claims["name"], set.Email)
-		set.HomeOID = firstNonEmpty(claims["oid"], claims["sub"])
-		set.TenantID = firstNonEmpty(claims["tid"], claims["tenant_id"])
-	}
-	return set, nil
+	return tokenSetFromResponse(tr), nil
 }
 
 func requestToken(form url.Values) (TokenSet, error) {
-	req, err := http.NewRequest(http.MethodPost, TokenEndpoint(), strings.NewReader(form.Encode()))
-	if err != nil {
-		return TokenSet{}, err
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	resp, err := outbound.HTTPClient().Do(req)
-	if err != nil {
-		return TokenSet{}, err
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
+	return requestTokenContext(context.Background(), form)
+}
+
+func requestTokenContext(ctx context.Context, form url.Values) (TokenSet, error) {
+	resp, body, err := postAuthForm(ctx, TokenEndpoint(), form)
 	if err != nil {
 		return TokenSet{}, err
 	}
@@ -179,12 +177,48 @@ func requestToken(form url.Values) (TokenSet, error) {
 			TraceID:       firstNonEmpty(tr.TraceID, resp.Header.Get("x-ms-request-id")),
 		}
 	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		return TokenSet{}, fmt.Errorf("token endpoint HTTP %d", resp.StatusCode)
 	}
 	if tr.AccessToken == "" {
 		return TokenSet{}, fmt.Errorf("token endpoint HTTP %d: empty access token", resp.StatusCode)
 	}
+	return tokenSetFromResponse(tr), nil
+}
+
+func postAuthForm(ctx context.Context, endpoint string, form url.Values) (*http.Response, []byte, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(ctx, authRequestTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(form.Encode()))
+	if err != nil {
+		return nil, nil, err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp, err := outbound.HTTPClient().Do(req)
+	if err != nil {
+		if resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+		return nil, nil, err
+	}
+	if resp == nil || resp.Body == nil {
+		return nil, nil, fmt.Errorf("authentication endpoint returned no response body")
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxAuthResponseBytes+1))
+	if err != nil {
+		return nil, nil, err
+	}
+	if int64(len(body)) > maxAuthResponseBytes {
+		return nil, nil, fmt.Errorf("authentication response exceeds %d bytes", maxAuthResponseBytes)
+	}
+	return resp, body, nil
+}
+
+func tokenSetFromResponse(tr tokenResponse) TokenSet {
 	set := TokenSet{
 		AccessToken:  tr.AccessToken,
 		RefreshToken: tr.RefreshToken,
@@ -210,7 +244,7 @@ func requestToken(form url.Values) (TokenSet, error) {
 			set.TenantID = firstNonEmpty(set.TenantID, claims["tid"], claims["tenant_id"])
 		}
 	}
-	return set, nil
+	return set
 }
 
 func aadstsCode(description string) string {
@@ -244,9 +278,8 @@ func decodeJWTClaims(token string) (map[string]string, error) {
 	}
 	out := map[string]string{}
 	for k, v := range m {
-		switch t := v.(type) {
-		case string:
-			out[k] = t
+		if value, ok := v.(string); ok {
+			out[k] = value
 		}
 	}
 	return out, nil
