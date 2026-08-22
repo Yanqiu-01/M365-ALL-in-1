@@ -36,7 +36,12 @@ def start():
         return
 
     env = os.environ.copy()
-    admin_pw = env.get("M365_ADMIN_PASSWORD", "admin123")
+    admin_pw = env.get("M365_ADMIN_PASSWORD", "").strip()
+    bootstrap_file = env.get("M365_ADMIN_PASSWORD_BOOTSTRAP_FILE", "").strip()
+    persisted_file = os.path.join(DATA_DIR, "admin-password")
+    if not admin_pw and not (bootstrap_file and os.path.isfile(bootstrap_file)) and not os.path.isfile(persisted_file):
+        print("Administrator authentication is not configured; refusing to start.")
+        return
     env.update({
         "M365_LISTEN": "0.0.0.0:4141",
         "M365_DATA_DIR": os.path.join(DATA_DIR, ""),

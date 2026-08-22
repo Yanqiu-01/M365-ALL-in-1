@@ -1,7 +1,10 @@
 package web
 
 import (
+	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net"
@@ -13,6 +16,71 @@ import (
 )
 
 const defaultAdminPassword = "admin123"
+
+const passwordVerifierPrefix = "v1$"
+const passwordHashIterations = 100000
+
+func newPasswordVerifier(password string) (string, error) {
+	if password == "" {
+		return "", errors.New("administrator password is empty")
+	}
+	salt := make([]byte, 16)
+	if _, err := rand.Read(salt); err != nil {
+		return "", err
+	}
+	digest := derivePasswordDigest(password, salt)
+	return passwordVerifierPrefix + hex.EncodeToString(salt) + "$" + hex.EncodeToString(digest), nil
+}
+
+func derivePasswordDigest(password string, salt []byte) []byte {
+	h := sha256.New()
+	_, _ = h.Write(salt)
+	_, _ = h.Write([]byte(password))
+	digest := h.Sum(nil)
+	for i := 1; i < passwordHashIterations; i++ {
+		h.Reset()
+		_, _ = h.Write(salt)
+		_, _ = h.Write(digest)
+		digest = h.Sum(digest[:0])
+	}
+	return digest
+}
+
+func parsePasswordVerifier(verifier string) ([]byte, []byte, bool) {
+	parts := strings.Split(verifier, "$")
+	if len(parts) != 3 || parts[0] != "v1" {
+		return nil, nil, false
+	}
+	salt, err := hex.DecodeString(parts[1])
+	if err != nil || len(salt) != 16 {
+		return nil, nil, false
+	}
+	digest, err := hex.DecodeString(parts[2])
+	if err != nil || len(digest) != sha256.Size {
+		return nil, nil, false
+	}
+	return salt, digest, true
+}
+
+func verifyAdminPassword(password, verifier string) bool {
+	salt, expected, ok := parsePasswordVerifier(verifier)
+	if !ok {
+		return false
+	}
+	actual := derivePasswordDigest(password, salt)
+	return subtle.ConstantTimeCompare(actual, expected) == 1
+}
+
+func configuredAdminPassword() string {
+	if bootstrap := strings.TrimSpace(os.Getenv("M365_ADMIN_PASSWORD_BOOTSTRAP_FILE")); bootstrap != "" {
+		if b, err := os.ReadFile(bootstrap); err == nil {
+			if password := strings.TrimSpace(string(b)); password != "" {
+				return password
+			}
+		}
+	}
+	return strings.TrimSpace(os.Getenv("M365_ADMIN_PASSWORD"))
+}
 
 type loginAttempt struct {
 	Failures                 int
@@ -33,37 +101,66 @@ func adminPasswordPath() string {
 	return filepath.Join(home, ".config", "m365-copilot2api", "admin-password")
 }
 func loadAdminPassword() (string, bool) {
-	// The writable persisted value takes precedence over bootstrap sources.
-	if b, e := os.ReadFile(adminPasswordPath()); e == nil && strings.TrimSpace(string(b)) != "" {
-		p := strings.TrimSpace(string(b))
-		if p == defaultAdminPassword {
-			// A leftover persisted file holding the default password (for
-			// example a clone of a previously initialized data directory)
-			// must not silently defeat an explicit M365_ADMIN_PASSWORD.
-			if envP := strings.TrimSpace(os.Getenv("M365_ADMIN_PASSWORD")); envP != "" {
-				_ = saveAdminPassword(envP)
-				return envP, envP == defaultAdminPassword
+	if b, err := os.ReadFile(adminPasswordPath()); err == nil {
+		if persisted := strings.TrimSpace(string(b)); persisted != "" {
+			if persisted == defaultAdminPassword {
+				configured := configuredAdminPassword()
+				if configured == "" || configured == defaultAdminPassword {
+					return "", true
+				}
+				verifier, err := newPasswordVerifier(configured)
+				if err != nil {
+					return "", true
+				}
+				if err := saveAdminPasswordVerifier(verifier); err != nil {
+					return "", true
+				}
+				return verifier, false
 			}
+			if strings.HasPrefix(persisted, passwordVerifierPrefix) {
+				if _, _, ok := parsePasswordVerifier(persisted); !ok {
+					return "", true
+				}
+				return persisted, false
+			}
+			verifier, err := newPasswordVerifier(persisted)
+			if err != nil {
+				return "", true
+			}
+			if err := saveAdminPasswordVerifier(verifier); err != nil {
+				return "", true
+			}
+			return verifier, false
 		}
-		return p, p == defaultAdminPassword
 	}
-	if bootstrap := strings.TrimSpace(os.Getenv("M365_ADMIN_PASSWORD_BOOTSTRAP_FILE")); bootstrap != "" {
-		if b, e := os.ReadFile(bootstrap); e == nil && strings.TrimSpace(string(b)) != "" {
-			p := strings.TrimSpace(string(b))
-			return p, p == defaultAdminPassword
-		}
+
+	configured := configuredAdminPassword()
+	if configured == "" || configured == defaultAdminPassword {
+		return "", true
 	}
-	if p := strings.TrimSpace(os.Getenv("M365_ADMIN_PASSWORD")); p != "" {
-		return p, p == defaultAdminPassword
+	verifier, err := newPasswordVerifier(configured)
+	if err != nil {
+		return "", true
 	}
-	return defaultAdminPassword, true
+	return verifier, false
 }
 func saveAdminPassword(password string) error {
+	verifier, err := newPasswordVerifier(password)
+	if err != nil {
+		return err
+	}
+	return saveAdminPasswordVerifier(verifier)
+}
+
+func saveAdminPasswordVerifier(verifier string) error {
+	if _, _, ok := parsePasswordVerifier(verifier); !ok {
+		return errors.New("invalid administrator password verifier")
+	}
 	p := adminPasswordPath()
 	if err := os.MkdirAll(filepath.Dir(p), 0700); err != nil {
 		return err
 	}
-	return writeFileAtomic(p, []byte(password+"\n"), 0600)
+	return writeFileAtomic(p, []byte(verifier+"\n"), 0600)
 }
 func clientIP(r *http.Request) string {
 	// Trust proxy headers only when the direct peer is loopback (normal local reverse-proxy deployment).
@@ -158,7 +255,7 @@ func (s *Server) adminChangePassword(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	current := s.adminPassword
 	s.mu.Unlock()
-	if subtle.ConstantTimeCompare([]byte(b.Current), []byte(current)) != 1 {
+	if !verifyAdminPassword(b.Current, current) {
 		writeOpenAIError(w, 401, "auth_error", "current password is invalid")
 		return
 	}
@@ -166,12 +263,17 @@ func (s *Server) adminChangePassword(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, 400, "invalid_request_error", err.Error())
 		return
 	}
-	if err := saveAdminPassword(b.New); err != nil {
+	verifier, err := newPasswordVerifier(b.New)
+	if err != nil {
+		writeOpenAIError(w, 500, "storage_error", "administrator password could not be prepared")
+		return
+	}
+	if err := saveAdminPasswordVerifier(verifier); err != nil {
 		writeOpenAIError(w, 500, "storage_error", "administrator password could not be saved; check the persistent data directory permissions")
 		return
 	}
 	s.mu.Lock()
-	s.adminPassword = b.New
+	s.adminPassword = verifier
 	s.mustChangePassword = false
 	s.adminSessions = map[string]time.Time{}
 	s.mu.Unlock()

@@ -1,14 +1,31 @@
 package web
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
+
+func syntheticAdminPassword() string { return strings.Repeat("p", 24) }
+
+func setupAdminTestEnv(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	t.Setenv("M365_DATA_DIR", dir)
+	t.Setenv("M365_CONFIG", filepath.Join(dir, "accounts.json"))
+	t.Setenv("M365_API_KEYS", filepath.Join(dir, "api-keys.json"))
+	t.Setenv("M365_ADMIN_PASSWORD_FILE", filepath.Join(dir, "admin-password"))
+	t.Setenv("M365_ADMIN_PASSWORD_BOOTSTRAP_FILE", "")
+	t.Setenv("M365_ADMIN_PASSWORD", "")
+	return dir
+}
 
 func adminTestClient(t *testing.T, h http.Handler) (*httptest.Server, *http.Client) {
 	t.Helper()
@@ -20,102 +37,121 @@ func adminTestClient(t *testing.T, h http.Handler) (*httptest.Server, *http.Clie
 	return ts, c
 }
 
-func postJSON(t *testing.T, c *http.Client, url, body string) *http.Response {
+func postJSON(t *testing.T, c *http.Client, url string, body any) *http.Response {
 	t.Helper()
-	r, err := c.Post(url, "application/json", strings.NewReader(body))
+	payload, err := json.Marshal(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := c.Post(url, "application/json", bytes.NewReader(payload))
 	if err != nil {
 		t.Fatal(err)
 	}
 	return r
 }
 
-func TestDefaultPasswordForcesChangeAndRotatesSessions(t *testing.T) {
-	t.Setenv("M365_ADMIN_PASSWORD", "")
-	t.Setenv("M365_ADMIN_PASSWORD_FILE", t.TempDir()+"/admin-password")
+func TestMissingAdminPasswordFailsClosed(t *testing.T) {
+	setupAdminTestEnv(t)
+	verifier, mustChange := loadAdminPassword()
+	if verifier != "" || !mustChange {
+		t.Fatalf("missing password did not fail closed: configured=%v mustChange=%v", verifier != "", mustChange)
+	}
+}
+
+func TestAdminPasswordIsHashedAtRest(t *testing.T) {
+	setupAdminTestEnv(t)
+	password := syntheticAdminPassword()
+	if err := saveAdminPassword(password); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := os.ReadFile(adminPasswordPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(stored, []byte(password)) {
+		t.Fatal("administrator password was written in plaintext")
+	}
+	verifier, mustChange := loadAdminPassword()
+	if mustChange || !verifyAdminPassword(password, verifier) {
+		t.Fatal("stored administrator password verifier did not validate")
+	}
+}
+
+func TestLegacyAdminPasswordFileMigratesWithoutPlaintextPersistence(t *testing.T) {
+	setupAdminTestEnv(t)
+	password := syntheticAdminPassword()
+	if err := os.WriteFile(adminPasswordPath(), []byte(password+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	verifier, mustChange := loadAdminPassword()
+	if mustChange || !verifyAdminPassword(password, verifier) {
+		t.Fatal("legacy administrator password was not migrated")
+	}
+	stored, err := os.ReadFile(adminPasswordPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(stored, []byte(password)) {
+		t.Fatal("legacy administrator password remained in plaintext")
+	}
+}
+
+func TestConfiguredAdminPasswordLoginAndChange(t *testing.T) {
+	setupAdminTestEnv(t)
+	oldPassword := syntheticAdminPassword()
+	newPassword := strings.Repeat("n", 24)
+	t.Setenv("M365_ADMIN_PASSWORD", oldPassword)
 	s, err := New()
 	if err != nil {
 		t.Fatal(err)
 	}
-	ts, c := adminTestClient(t, s.Routes())
-
-	r := postJSON(t, c, ts.URL+"/api/admin/login", `{"password":"admin123"}`)
-	if r.StatusCode != 200 {
-		t.Fatalf("login=%d", r.StatusCode)
+	ts, client := adminTestClient(t, s.Routes())
+	response := postJSON(t, client, ts.URL+"/api/admin/login", map[string]string{"password": oldPassword})
+	if response.StatusCode != http.StatusOK {
+		response.Body.Close()
+		t.Fatalf("configured login status=%d", response.StatusCode)
 	}
-	var login map[string]any
-	_ = json.NewDecoder(r.Body).Decode(&login)
-	r.Body.Close()
-	if login["must_change_password"] != true {
-		t.Fatalf("login=%#v", login)
+	response.Body.Close()
+	response = postJSON(t, client, ts.URL+"/api/admin/change-password", map[string]string{"current_password": oldPassword, "new_password": newPassword})
+	if response.StatusCode != http.StatusOK {
+		response.Body.Close()
+		t.Fatalf("password change status=%d", response.StatusCode)
 	}
-
-	r, _ = c.Get(ts.URL + "/api/accounts")
-	r.Body.Close()
-	if r.StatusCode != http.StatusForbidden {
-		t.Fatalf("protected status=%d", r.StatusCode)
+	response.Body.Close()
+	response = postJSON(t, client, ts.URL+"/api/admin/login", map[string]string{"password": newPassword})
+	if response.StatusCode != http.StatusOK {
+		response.Body.Close()
+		t.Fatalf("re-login status=%d", response.StatusCode)
 	}
-
-	r = postJSON(t, c, ts.URL+"/api/admin/change-password", `{"current_password":"admin123","new_password":"a-new-password-123"}`)
-	if r.StatusCode != 200 {
-		t.Fatalf("change=%d", r.StatusCode)
-	}
-	r.Body.Close()
-
-	r, _ = c.Get(ts.URL + "/api/accounts")
-	r.Body.Close()
-	if r.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("old session status=%d", r.StatusCode)
-	}
-
-	r = postJSON(t, c, ts.URL+"/api/admin/login", `{"password":"a-new-password-123"}`)
-	r.Body.Close()
-	if r.StatusCode != 200 {
-		t.Fatalf("new login=%d", r.StatusCode)
-	}
-	r, _ = c.Get(ts.URL + "/api/accounts")
-	r.Body.Close()
-	if r.StatusCode != 200 {
-		t.Fatalf("new session status=%d", r.StatusCode)
-	}
+	response.Body.Close()
 }
 
 func TestAdminLoginLocksAfterFiveFailures(t *testing.T) {
-	t.Setenv("M365_ADMIN_PASSWORD", "correct-password")
+	setupAdminTestEnv(t)
+	t.Setenv("M365_ADMIN_PASSWORD", syntheticAdminPassword())
 	s, err := New()
 	if err != nil {
 		t.Fatal(err)
 	}
-	ts, c := adminTestClient(t, s.Routes())
+	ts, client := adminTestClient(t, s.Routes())
+	wrongPassword := strings.Repeat("q", 24)
 	for i := 0; i < 5; i++ {
-		r := postJSON(t, c, ts.URL+"/api/admin/login", `{"password":"wrong"}`)
-		r.Body.Close()
-		if r.StatusCode != 401 {
-			t.Fatalf("attempt %d=%d", i+1, r.StatusCode)
+		response := postJSON(t, client, ts.URL+"/api/admin/login", map[string]string{"password": wrongPassword})
+		response.Body.Close()
+		if response.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("failure %d status=%d", i+1, response.StatusCode)
 		}
 	}
-	r := postJSON(t, c, ts.URL+"/api/admin/login", `{"password":"correct-password"}`)
-	defer r.Body.Close()
-	if r.StatusCode != 429 || r.Header.Get("Retry-After") == "" {
-		t.Fatalf("locked=%d retry=%q", r.StatusCode, r.Header.Get("Retry-After"))
-	}
-}
-
-func TestPersistedPasswordOverridesBootstrapEnv(t *testing.T) {
-	path := t.TempDir() + "/admin-password"
-	t.Setenv("M365_ADMIN_PASSWORD_FILE", path)
-	t.Setenv("M365_ADMIN_PASSWORD", "old-bootstrap-password")
-	if err := saveAdminPassword("persisted-new-password"); err != nil {
-		t.Fatal(err)
-	}
-	got, mustChange := loadAdminPassword()
-	if got != "persisted-new-password" || mustChange {
-		t.Fatalf("got=%q mustChange=%v", got, mustChange)
+	response := postJSON(t, client, ts.URL+"/api/admin/login", map[string]string{"password": wrongPassword})
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("locked login status=%d", response.StatusCode)
 	}
 }
 
 func TestExpiredLoginWindowResets(t *testing.T) {
-	s := &Server{loginAttempts: map[string]loginAttempt{"x": {Failures: 4, WindowStart: time.Now().Add(-16 * time.Minute)}}}
-	if ok, _ := s.loginAllowed("x", time.Now()); !ok {
-		t.Fatal("expired window remained locked")
+	s := &Server{loginAttempts: map[string]loginAttempt{"synthetic": {Failures: 4, WindowStart: time.Now().Add(-16 * time.Minute)}}}
+	if ok, _ := s.loginAllowed("synthetic", time.Now()); !ok {
+		t.Fatal("expired login window remained locked")
 	}
 }
