@@ -1,0 +1,12 @@
+# 网关 + 面板
+fastapi>=0.115,<1
+uvicorn>=0.30,<1
+httpx>=0.27,<1
+# ChatHub 是 WebSocket 传输。v13 的 legacy client 只认 extra_headers,
+# 这里用的是 additional_headers,所以下限必须 >=14。
+websockets>=14,<18
+# refresh token 落盘加密。缺了它会退化成明文存储并告警。
+cryptography>=42
+
+# 注册 / 授权脚本(不跑这些功能可以不装)
+playwright>=1.48

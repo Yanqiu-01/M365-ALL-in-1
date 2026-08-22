@@ -1,0 +1,53 @@
+{
+  "_comment": "复制为 config.json 后填写。config.json 已被 .gitignore 忽略,不要提交。",
+
+  "gateway": {
+    "host": "127.0.0.1",
+    "port": 4141,
+    "data_dir": "~/.config/m365-gateway",
+    "chat_timeout_seconds": 900,
+    "chat_read_timeout_seconds": 300
+  },
+
+  "panel": {
+    "host": "127.0.0.1",
+    "port": 8555
+  },
+
+  "auth": {
+    "_comment": "管理员密码与客户端 API key。首次运行 run.py --bootstrap 时写入,之后从 data_dir 读取。",
+    "admin_password_env": "M365_ADMIN_PASSWORD",
+    "api_key_env": "M365_API_KEY"
+  },
+
+  "register": {
+    "_comment": "注册用的站点与账号规则,按自己的来源填写。前 5 项留空则注册功能不可用。",
+    "site_url": "",
+    "turnstile_sitekey": "",
+    "email_domain": "",
+    "email_prefix": "",
+    "password": "",
+
+    "plan_id": "1",
+    "domain_id": "1",
+    "email_start_num": 1000,
+    "email_count": 10,
+    "display_base": 1,
+
+    "cred_file": "./data/credentials.txt",
+    "proxy_file": "./data/proxies.txt",
+    "cloak_browser_glob": "~/.cloakbrowser/chromium-*/chrome.exe",
+
+    "_clash": "Clash/mihomo 外部控制接口,用于按节点轮换出口",
+    "clash_api": "http://127.0.0.1:9097",
+    "clash_secret": "",
+    "clash_group": "",
+    "clash_nodes": [
+      {"name": "节点名(须与 Clash 里一致)", "expect_ip": ""}
+    ],
+    "clash_proxy": "http://127.0.0.1:7897",
+
+    "_phone": "手机上的 SOCKS5 代理;换 IP 靠 adb 切数据开关,需已授权调试",
+    "phone_socks": "socks5://127.0.0.1:1081"
+  }
+}
