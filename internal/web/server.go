@@ -78,6 +78,7 @@ type Server struct {
 	accountPool         *accountHealth
 	accountConcurrency  *accountConcurrency
 	pkce                map[string]pendingPKCE
+	exchangeCode        func(code, verifier, redirectURI string) (auth.TokenSet, error)
 	chat                *chathub.Client
 	sessions            *sessionStore
 	userSessions        *userSessionStore
@@ -95,6 +96,13 @@ type Server struct {
 	usage               *usageLog
 	generatedImages     map[string]generatedImage
 	convCache           *conversationCache
+}
+
+func (s *Server) exchangeAuthorizationCode(code, verifier, redirectURI string) (auth.TokenSet, error) {
+	if s.exchangeCode != nil {
+		return s.exchangeCode(code, verifier, redirectURI)
+	}
+	return auth.ExchangeCode(code, verifier, redirectURI)
 }
 
 const maxResponsesPerTenant = 256
@@ -248,11 +256,12 @@ func (s *Server) adminMiddleware(next http.Handler) http.Handler {
 			return
 		}
 		if strings.HasPrefix(r.URL.Path, "/v1/") {
-			if !s.validAPIKey(r) {
+			identity, ok := s.apiKeyIdentityForRequest(r)
+			if !ok {
 				http.Error(w, `{"error":{"message":"valid API key required","type":"auth_error"}}`, http.StatusUnauthorized)
 				return
 			}
-			next.ServeHTTP(w, r)
+			next.ServeHTTP(w, withAPIKeyIdentity(r, identity))
 			return
 		}
 		if s.adminPassword == "" {
@@ -433,18 +442,79 @@ func (s *Server) adminKeys(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", 405)
 	}
 }
-func (s *Server) validAPIKey(r *http.Request) bool {
-	if s.apiKeys == nil {
-		return false
+
+type apiKeyContextKey struct{}
+
+func rawAPIKey(r *http.Request) string {
+	if r == nil {
+		return ""
 	}
-	raw := strings.TrimSpace(r.Header.Get("x-api-key"))
+	if raw := strings.TrimSpace(r.Header.Get("X-API-Key")); raw != "" {
+		return raw
+	}
+	auth := r.Header.Get("Authorization")
+	if strings.HasPrefix(strings.ToLower(auth), "bearer ") {
+		return strings.TrimSpace(auth[7:])
+	}
+	return ""
+}
+
+func redactAPIKey(raw string) string {
+	raw = strings.TrimSpace(raw)
 	if raw == "" {
-		auth := r.Header.Get("Authorization")
-		if strings.HasPrefix(strings.ToLower(auth), "bearer ") {
-			raw = strings.TrimSpace(auth[7:])
-		}
+		return ""
 	}
-	return raw != "" && s.apiKeys.valid(raw)
+	if len(raw) > 8 {
+		return raw[:8] + "..."
+	}
+	return "[redacted]"
+}
+
+func withAPIKeyIdentity(r *http.Request, identity apiKeyIdentity) *http.Request {
+	return r.WithContext(context.WithValue(r.Context(), apiKeyContextKey{}, identity))
+}
+
+func requestAPIKeyIdentity(r *http.Request) (apiKeyIdentity, bool) {
+	if r == nil {
+		return apiKeyIdentity{}, false
+	}
+	identity, ok := r.Context().Value(apiKeyContextKey{}).(apiKeyIdentity)
+	return identity, ok && identity.ID != ""
+}
+
+func requestAPIKeyOwner(r *http.Request) string {
+	if identity, ok := requestAPIKeyIdentity(r); ok {
+		return identity.ID
+	}
+	if raw := rawAPIKey(r); raw != "" {
+		// This fallback is only for direct unit-level handler calls. Production
+		// requests receive the stable record ID from adminMiddleware.
+		return "unverified:" + keyHash(raw)
+	}
+	return ""
+}
+
+func requestAPIKeyPrefix(r *http.Request) string {
+	if identity, ok := requestAPIKeyIdentity(r); ok {
+		return identity.Prefix
+	}
+	return redactAPIKey(rawAPIKey(r))
+}
+
+func (s *Server) apiKeyIdentityForRequest(r *http.Request) (apiKeyIdentity, bool) {
+	if s.apiKeys == nil {
+		return apiKeyIdentity{}, false
+	}
+	raw := rawAPIKey(r)
+	if raw == "" {
+		return apiKeyIdentity{}, false
+	}
+	return s.apiKeys.authenticate(raw)
+}
+
+func (s *Server) validAPIKey(r *http.Request) bool {
+	_, ok := s.apiKeyIdentityForRequest(r)
+	return ok
 }
 func jsonOut(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
@@ -615,6 +685,19 @@ func (s *Server) provisionAccount(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) startPKCE(w http.ResponseWriter, _ *http.Request) {
+	authorizeEndpoint := auth.AuthorizeEndpoint()
+	redirectURI := auth.RedirectURI()
+	if err := auth.ValidateAuthorizationTarget(authorizeEndpoint, redirectURI); err != nil {
+		// Do not echo configuration values: an overridden OAuth target can be attacker-controlled.
+		log.Printf("pkce authorization configuration rejected")
+		http.Error(w, "OAuth authorization configuration is invalid", http.StatusBadRequest)
+		return
+	}
+	if err := auth.ValidateTokenEndpoint(auth.TokenEndpoint()); err != nil {
+		log.Printf("pkce token configuration rejected")
+		http.Error(w, "OAuth token configuration is invalid", http.StatusBadRequest)
+		return
+	}
 	v, err := auth.Verifier()
 	if err != nil {
 		http.Error(w, "pkce failure", http.StatusInternalServerError)
@@ -626,23 +709,23 @@ func (s *Server) startPKCE(w http.ResponseWriter, _ *http.Request) {
 		return
 	}
 	state := hex.EncodeToString(b)
-	redirectURI := auth.RedirectURI()
+	authorizationURL := auth.AuthorizationURL(
+		authorizeEndpoint,
+		auth.ClientID(),
+		redirectURI,
+		state,
+		auth.Challenge(v),
+		auth.Scope(),
+	)
 	s.mu.Lock()
 	s.pkce[state] = pendingPKCE{Verifier: v, Created: time.Now(), Status: "pending", RedirectURI: redirectURI}
 	s.mu.Unlock()
 	jsonOut(w, map[string]string{
-		"status": "pkce_ready",
-		"state":  state,
-		"url": auth.AuthorizationURL(
-			auth.AuthorizeEndpoint(),
-			auth.ClientID(),
-			redirectURI,
-			state,
-			auth.Challenge(v),
-			auth.Scope(),
-		),
+		"status":      "pkce_ready",
+		"state":       state,
+		"url":         authorizationURL,
 		"redirectUri": redirectURI,
-		"note":        "If redirect is nativeclient, paste the final URL/code into /api/auth/callback after login.",
+		"note":        "Open the Microsoft sign-in page. The mobile app captures the verified callback automatically.",
 	})
 }
 
@@ -674,20 +757,45 @@ func (s *Server) pkceStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) callbackPKCE(w http.ResponseWriter, r *http.Request) {
-	state := r.URL.Query().Get("state")
-	code := r.URL.Query().Get("code")
-	oauthError := r.URL.Query().Get("error")
-	// also accept pasted full callback URL
-	if code == "" && oauthError == "" {
-		if u := r.URL.Query().Get("url"); u != "" {
-			if parsed, err := http.NewRequest(http.MethodGet, u, nil); err == nil {
-				code = parsed.URL.Query().Get("code")
-				oauthError = parsed.URL.Query().Get("error")
-				if state == "" {
-					state = parsed.URL.Query().Get("state")
-				}
-			}
+	query := r.URL.Query()
+	var state, code, oauthError string
+	rawCallbackValues, hasRawCallbackURL := query["url"]
+	if hasRawCallbackURL && len(rawCallbackValues) != 1 {
+		http.Error(w, "invalid OAuth callback URL", http.StatusBadRequest)
+		return
+	}
+	if hasRawCallbackURL {
+		// A pasted callback is untrusted input. It may not be mixed with
+		// direct result parameters, which could otherwise select two values.
+		if _, hasCode := query["code"]; hasCode {
+			http.Error(w, "ambiguous OAuth callback", http.StatusBadRequest)
+			return
 		}
+		if _, hasError := query["error"]; hasError {
+			http.Error(w, "ambiguous OAuth callback", http.StatusBadRequest)
+			return
+		}
+		if values := query["state"]; len(values) > 1 {
+			http.Error(w, "ambiguous OAuth callback", http.StatusBadRequest)
+			return
+		}
+		parsed, err := auth.ParseNativeClientCallbackURL(rawCallbackValues[0])
+		if err != nil {
+			http.Error(w, "invalid OAuth callback URL", http.StatusBadRequest)
+			return
+		}
+		if values, hasState := query["state"]; hasState && values[0] != parsed.State {
+			http.Error(w, "callback state mismatch", http.StatusBadRequest)
+			return
+		}
+		state, code, oauthError = parsed.State, parsed.Code, parsed.Error
+	} else {
+		parsed, err := auth.ParseOAuthCallbackParameters(query)
+		if err != nil {
+			http.Error(w, "invalid OAuth callback", http.StatusBadRequest)
+			return
+		}
+		state, code, oauthError = parsed.State, parsed.Code, parsed.Error
 	}
 	if state == "" || (code == "" && oauthError == "") {
 		http.Error(w, "missing state or authorization result", http.StatusBadRequest)
@@ -725,7 +833,17 @@ func (s *Server) callbackPKCE(w http.ResponseWriter, r *http.Request) {
 	if redirectURI == "" {
 		redirectURI = auth.RedirectURI()
 	}
-	tok, err := auth.ExchangeCode(code, p.Verifier, redirectURI)
+	if err := auth.ValidateNativeClientRedirectURI(redirectURI); err != nil {
+		log.Printf("oauth callback rejected pending redirect configuration")
+		s.mu.Lock()
+		p.Status = "error"
+		p.Error = "OAuth redirect configuration is invalid"
+		s.pkce[state] = p
+		s.mu.Unlock()
+		http.Error(w, "OAuth redirect configuration is invalid", http.StatusBadRequest)
+		return
+	}
+	tok, err := s.exchangeAuthorizationCode(code, p.Verifier, redirectURI)
 	if err != nil {
 		logOAuthError("code_exchange", err)
 		s.mu.Lock()
@@ -888,6 +1006,7 @@ func (s *Server) chatOnce(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	ownerID := requestAPIKeyOwner(r)
 	var body chatBody
 	r.Body = http.MaxBytesReader(w, r.Body, 10<<20)
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -900,7 +1019,7 @@ func (s *Server) chatOnce(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if body.SessionKey != "" {
-		if v, ok := s.sessions.get(body.SessionKey); ok {
+		if v, ok := s.sessions.getForOwner(ownerID, body.SessionKey); ok {
 			body.AccountID = firstNonEmpty(body.AccountID, v.AccountID)
 			body.ConversationID = firstNonEmpty(body.ConversationID, v.ConversationID)
 			body.SessionID = firstNonEmpty(body.SessionID, v.SessionID)
@@ -971,7 +1090,7 @@ func (s *Server) chatOnce(w http.ResponseWriter, r *http.Request) {
 	res.Text = sanitizePublicAssistantText(res.Text)
 	res.Reasoning = sanitizePublicReasoningText(res.Reasoning)
 	if body.SessionKey != "" {
-		s.sessions.upsert(conversation{ID: body.SessionKey, AccountID: acc.ID, ConversationID: res.ConversationID, SessionID: res.SessionID, Title: text})
+		s.sessions.upsertForOwner(ownerID, conversation{ID: body.SessionKey, AccountID: acc.ID, ConversationID: res.ConversationID, SessionID: res.SessionID, Title: text})
 	}
 	jsonOut(w, map[string]any{
 		"status":         "ok",
@@ -1167,6 +1286,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		requestID = uuid.NewString()
 	}
 	startedAt := time.Now()
+	ownerID := requestAPIKeyOwner(r)
 	log.Printf("[req-trace] id=%s stage=http_start stream=%t", requestID, r.URL.Query().Get("stream") == "true")
 	defer func() {
 		log.Printf("[req-trace] id=%s stage=http_return total_ms=%d", requestID, time.Since(startedAt).Milliseconds())
@@ -1232,14 +1352,14 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if body.SessionKey != "" {
-		if v, ok := s.sessions.get(body.SessionKey); ok {
+		if v, ok := s.sessions.getForOwner(ownerID, body.SessionKey); ok {
 			body.AccountID = firstNonEmpty(body.AccountID, v.AccountID)
 			body.ConversationID = firstNonEmpty(body.ConversationID, v.ConversationID)
 			body.SessionID = firstNonEmpty(body.SessionID, v.SessionID)
 		}
 	}
 	if body.User != "" && body.ConversationID == "" {
-		if us, ok := s.userSessions.Get(body.User); ok {
+		if us, ok := s.userSessions.GetForOwner(ownerID, body.User); ok {
 			body.AccountID = firstNonEmpty(body.AccountID, us.AccountID)
 			body.ConversationID = us.ConversationID
 			body.SessionID = us.SessionID
@@ -1251,7 +1371,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	answerPrompt := prompt
 	resolvedConversationID := ""
 	if body.ConversationID == "" && len(body.Messages) > 0 {
-		resolved := s.sessionResolver.Resolve(r, &body)
+		resolved := s.sessionResolver.ResolveOwned(r, &body, ownerID)
 		if !resolved.IsNew {
 			resolvedConversationID = resolved.ConversationID
 			body.ConversationID = resolved.ConversationID
@@ -1294,7 +1414,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	convCacheModel := firstNonEmpty(body.Model, "m365-copilot")
 	if body.ConversationID == "" && len(body.Messages) > 1 {
 		sysHash := systemPromptHash(body.Messages)
-		if cached := s.convCache.Lookup(acc.ID, convCacheModel); cached != nil && cached.SystemPrompt == sysHash {
+		if cached := s.convCache.Lookup(ownerID, acc.ID, convCacheModel); cached != nil && cached.SystemPrompt == sysHash {
 			if len(body.Messages) > cached.MessageCount {
 				incPrompt, incAtt := flattenPromptMessages(body.Messages[cached.MessageCount:], nil)
 				incPrompt = strings.TrimSpace(incPrompt)
@@ -1544,7 +1664,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			log.Printf("[req-trace] id=%s stage=stream_error err=%v", requestID, err)
 			s.accountPool.MarkFailure(acc.ID, err, rateLimitCooldown)
 			if convReused {
-				s.invalidateConvCache(acc.ID, convCacheModel)
+				s.invalidateConvCache(ownerID, acc.ID, convCacheModel)
 			}
 			msg := upstreamError(err)
 			if IsRateLimited(err) {
@@ -1600,10 +1720,10 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			calls = limitToolCalls(calls, adaptiveToolCallLimit(calls, configuredToolCallLimit(s.settings)))
 			_ = writeToolResponse(w, id, model, true, calls, toolResult)
 			if body.User != "" && res.ConversationID != "" {
-				s.userSessions.Put(body.User, res.ConversationID, res.SessionID, acc.ID)
+				s.userSessions.PutForOwner(ownerID, body.User, res.ConversationID, res.SessionID, acc.ID)
 			}
 			s.bindConversation(acc, &body, r, res, answerPrompt, startedAt)
-			s.storeConvCache(acc.ID, convCacheModel, res, tone, body.Messages, convReused)
+			s.storeConvCache(ownerID, acc.ID, convCacheModel, res, tone, body.Messages, convReused)
 			return
 		}
 		if err := emitText(pending.String()); err != nil {
@@ -1614,10 +1734,10 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(finishChunk)+"\n\n")
 		_ = sseRaw(r.Context(), w, flusher, "data: [DONE]\n\n")
 		if body.User != "" && res.ConversationID != "" {
-			s.userSessions.Put(body.User, res.ConversationID, res.SessionID, acc.ID)
+			s.userSessions.PutForOwner(ownerID, body.User, res.ConversationID, res.SessionID, acc.ID)
 		}
 		s.bindConversation(acc, &body, r, res, answerPrompt, startedAt)
-		s.storeConvCache(acc.ID, convCacheModel, res, tone, body.Messages, convReused)
+		s.storeConvCache(ownerID, acc.ID, convCacheModel, res, tone, body.Messages, convReused)
 		return
 	}
 	// Ask the upstream model to select and validate the next tool. The gateway
@@ -1796,7 +1916,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 			log.Printf("[req-trace] id=%s stage=stream_error err=%v", requestID, err)
 			s.accountPool.MarkFailure(acc.ID, err, rateLimitCooldown)
 			if convReused {
-				s.invalidateConvCache(acc.ID, convCacheModel)
+				s.invalidateConvCache(ownerID, acc.ID, convCacheModel)
 			}
 			msg := upstreamError(err)
 			if IsRateLimited(err) {
@@ -1856,7 +1976,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 	if err != nil {
 		s.accountPool.MarkFailure(acc.ID, err, rateLimitCooldown)
 		if convReused {
-			s.invalidateConvCache(acc.ID, convCacheModel)
+			s.invalidateConvCache(ownerID, acc.ID, convCacheModel)
 			log.Printf("[conv-cache] invalidated account=%s model=%s after error: %v", acc.ID, convCacheModel, err)
 		}
 		writeUpstreamError(w, err)
@@ -1865,26 +1985,26 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 	s.accountPool.MarkSuccess(acc.ID)
 	if body.Stream {
 		if body.User != "" && res.ConversationID != "" {
-			s.userSessions.Put(body.User, res.ConversationID, res.SessionID, acc.ID)
+			s.userSessions.PutForOwner(ownerID, body.User, res.ConversationID, res.SessionID, acc.ID)
 		}
 		s.bindConversation(acc, &body, r, res, prompt, startedAt)
-		s.storeConvCache(acc.ID, convCacheModel, res, tone, body.Messages, convReused)
+		s.storeConvCache(ownerID, acc.ID, convCacheModel, res, tone, body.Messages, convReused)
 		return
 	}
 
 	if body.SessionKey != "" {
-		s.sessions.upsert(conversation{ID: body.SessionKey, AccountID: acc.ID, ConversationID: res.ConversationID, SessionID: res.SessionID, Title: prompt})
+		s.sessions.upsertForOwner(ownerID, conversation{ID: body.SessionKey, AccountID: acc.ID, ConversationID: res.ConversationID, SessionID: res.SessionID, Title: prompt})
 	}
 	if body.User != "" && res.ConversationID != "" {
-		s.userSessions.Put(body.User, res.ConversationID, res.SessionID, acc.ID)
+		s.userSessions.PutForOwner(ownerID, body.User, res.ConversationID, res.SessionID, acc.ID)
 		log.Printf("[user-session] put user=%s conversation=%s session=%s", body.User, res.ConversationID, res.SessionID)
 	}
 	if res.ConversationID != "" {
 		s.bindConversation(acc, &body, r, res, prompt, startedAt)
-		s.storeConvCache(acc.ID, convCacheModel, res, tone, body.Messages, convReused)
+		s.storeConvCache(ownerID, acc.ID, convCacheModel, res, tone, body.Messages, convReused)
 	}
 	if res.ConversationID != "" {
-		resolved := s.sessionResolver.Resolve(r, &body)
+		resolved := s.sessionResolver.ResolveOwned(r, &body, ownerID)
 		if !resolved.IsNew {
 			w.Header().Set(sessionHeaderName, resolved.SessionID)
 		}
@@ -2107,6 +2227,7 @@ const sessionHeaderName = "X-M365-Session-Id"
 // 路径共用。会话为内容键，云端的对话由 auto_cleanup 按 2h 闲置窗口回收，
 // 这里不再做"用完即删"，否则复用永远不可能命中。
 func (s *Server) bindConversation(acc auth.AccountToken, body *oaiReq, r *http.Request, res chathub.Result, prompt string, startedAt time.Time) {
+	ownerID := requestAPIKeyOwner(r)
 	if res.ConversationID == "" {
 		return
 	}
@@ -2116,7 +2237,7 @@ func (s *Server) bindConversation(acc auth.AccountToken, body *oaiReq, r *http.R
 		Content:          res.Text,
 		ReasoningContent: res.Reasoning,
 	})
-	s.sessionResolver.Bind(res.SessionID, res.ConversationID, acc.ID, &historyBody, "", r)
+	s.sessionResolver.BindOwned(res.SessionID, res.ConversationID, acc.ID, ownerID, &historyBody, "", r)
 	s.conversationManager.Record(res.ConversationID, acc.ID, prompt)
 	if s.conversationManager.ShouldCleanup() {
 		if cleaned := s.conversationManager.Cleanup(); len(cleaned) > 0 {
@@ -2152,18 +2273,7 @@ func (s *Server) bindConversation(acc auth.AccountToken, body *oaiReq, r *http.R
 }
 
 func extractAPIKey(r *http.Request) string {
-	key := strings.TrimSpace(r.Header.Get("X-API-Key"))
-	if key != "" {
-		return key
-	}
-	auth := r.Header.Get("Authorization")
-	if strings.HasPrefix(strings.ToLower(auth), "bearer ") {
-		key = strings.TrimSpace(auth[7:])
-	}
-	if len(key) > 8 {
-		return key[:8] + "..."
-	}
-	return key
+	return requestAPIKeyPrefix(r)
 }
 
 func firstNonEmpty(vals ...string) string {

@@ -22,6 +22,14 @@ type apiKeyRecord struct {
 	LastUsedAt *time.Time `json:"lastUsedAt,omitempty"`
 	Revoked    bool       `json:"revoked"`
 }
+
+// apiKeyIdentity is the non-secret identity attached to an authenticated
+// request. Resource ownership must use the stable record ID rather than the
+// caller-supplied secret (or a short prefix that can collide).
+type apiKeyIdentity struct {
+	ID     string
+	Prefix string
+}
 type apiKeyStore struct {
 	mu      sync.Mutex
 	Path    string
@@ -83,16 +91,16 @@ func (s *apiKeyStore) create(name string) (apiKeyRecord, string, error) {
 	s.mu.Lock()
 	s.Keys = append(s.Keys, r)
 	s.mu.Unlock()
-		if err := s.persist.flushNowBlocking(); err != nil {
-			s.mu.Lock()
-			s.Keys = s.Keys[:len(s.Keys)-1]
-			s.mu.Unlock()
-			return apiKeyRecord{}, "", err
-		}
-		r.Hash = ""
-		r.Raw = ""
-		return r, raw, nil
+	if err := s.persist.flushNowBlocking(); err != nil {
+		s.mu.Lock()
+		s.Keys = s.Keys[:len(s.Keys)-1]
+		s.mu.Unlock()
+		return apiKeyRecord{}, "", err
 	}
+	r.Hash = ""
+	r.Raw = ""
+	return r, raw, nil
+}
 func (s *apiKeyStore) list() []apiKeyRecord {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -171,20 +179,32 @@ func (s *apiKeyStore) update(id, name string, revoked *bool) (bool, error) {
 	return true, nil
 }
 func (s *apiKeyStore) valid(raw string) bool {
+	_, ok := s.authenticate(raw)
+	return ok
+}
+
+func (s *apiKeyStore) authenticate(raw string) (apiKeyIdentity, bool) {
 	s.mu.Lock()
 	h := keyHash(raw)
-	found := false
+	var identity apiKeyIdentity
 	for i := range s.Keys {
 		if s.Keys[i].Hash == h && !s.Keys[i].Revoked {
 			now := time.Now()
 			s.Keys[i].LastUsedAt = &now
-			found = true
+			identity.ID = s.Keys[i].ID
+			if identity.ID == "" {
+				identity.ID = h[:16]
+			}
+			identity.Prefix = s.Keys[i].Prefix
+			if identity.Prefix == "" {
+				identity.Prefix = redactAPIKey(raw)
+			}
 			break
 		}
 	}
 	s.mu.Unlock()
-	if found {
+	if identity.ID != "" {
 		s.persist.markDirty()
 	}
-	return found
+	return identity, identity.ID != ""
 }

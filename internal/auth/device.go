@@ -35,10 +35,14 @@ func StartDeviceCode() (DeviceCode, error) {
 }
 
 func StartDeviceCodeContext(ctx context.Context) (DeviceCode, error) {
+	endpoint := DeviceCodeEndpoint()
+	if err := ValidateDeviceCodeEndpoint(endpoint); err != nil {
+		return DeviceCode{}, err
+	}
 	form := url.Values{}
 	form.Set("client_id", DeviceClientID())
 	form.Set("scope", DeviceScope())
-	resp, body, err := postAuthForm(ctx, DeviceCodeEndpoint(), form)
+	resp, body, err := postAuthForm(ctx, endpoint, form)
 	if err != nil {
 		return DeviceCode{}, err
 	}
@@ -75,11 +79,15 @@ func PollDeviceCode(deviceCode string) (TokenSet, bool, error) {
 }
 
 func PollDeviceCodeContext(ctx context.Context, deviceCode string) (TokenSet, bool, error) {
+	endpoint := DeviceTokenEndpoint()
+	if err := ValidateTokenEndpoint(endpoint); err != nil {
+		return TokenSet{}, false, err
+	}
 	form := url.Values{}
 	form.Set("client_id", DeviceClientID())
 	form.Set("grant_type", "urn:ietf:params:oauth:grant-type:device_code")
 	form.Set("device_code", deviceCode)
-	resp, body, err := postAuthForm(ctx, DeviceTokenEndpoint(), form)
+	resp, body, err := postAuthForm(ctx, endpoint, form)
 	if err != nil {
 		return TokenSet{}, false, err
 	}

@@ -60,9 +60,10 @@ func (s *Server) conversationCleanup(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
+	ownerID := requestAPIKeyOwner(r)
 	switch r.Method {
 	case http.MethodGet:
-		sessions := s.sessionResolver.ListSessions()
+		sessions := s.sessionResolver.ListSessionsForOwner(ownerID)
 		jsonOut(w, map[string]any{
 			"object": "list",
 			"data":   sessions,
@@ -72,7 +73,7 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 			SessionID string `json:"session_id"`
 		}
 		json.NewDecoder(r.Body).Decode(&body)
-		sess, ok := s.sessionResolver.GetSession(body.SessionID)
+		sess, ok := s.sessionResolver.GetSessionForOwner(ownerID, body.SessionID)
 		if !ok {
 			jsonOut(w, map[string]any{
 				"object":     "session",
@@ -102,9 +103,9 @@ func (s *Server) handleCacheStats(w http.ResponseWriter, r *http.Request) {
 	}
 	stats := cacheStats.GetStats()
 	jsonOut(w, map[string]any{
-		"object":       "cache_stats",
-		"stats":        stats,
-		"conv_cache":   s.convCache.Stats(),
+		"object":     "cache_stats",
+		"stats":      stats,
+		"conv_cache": s.convCache.Stats(),
 	})
 }
 
@@ -311,7 +312,7 @@ func (s *Server) handleSessionDelete(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "session_id required", http.StatusBadRequest)
 		return
 	}
-	if s.sessionResolver.DeleteSession(sessionID) {
+	if s.sessionResolver.DeleteSessionForOwner(requestAPIKeyOwner(r), sessionID) {
 		jsonOut(w, map[string]any{"status": "deleted", "session_id": sessionID})
 	} else {
 		http.Error(w, "session not found", http.StatusNotFound)

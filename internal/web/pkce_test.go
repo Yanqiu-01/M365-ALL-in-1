@@ -2,7 +2,6 @@ package web
 
 import (
 	"encoding/json"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -87,6 +86,56 @@ func TestCallbackPKCERejectsMissingUnknownExpiredAndConsumedState(t *testing.T) 
 	}
 }
 
+func TestCallbackPKCERejectsUntrustedPastedURLWithoutConsumingState(t *testing.T) {
+	tests := []struct {
+		name string
+		url  string
+	}{
+		{
+			name: "non-Microsoft host",
+			url:  "https://example.test/common/oauth2/nativeclient?state=state&error=access_denied",
+		},
+		{
+			name: "wrong Microsoft path",
+			url:  "https://login.microsoftonline.com/common/oauth2/v2.0/authorize?state=state&error=access_denied",
+		},
+		{
+			name: "duplicate state",
+			url:  "https://login.microsoftonline.com/common/oauth2/nativeclient?state=state&state=second&error=access_denied",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &Server{pkce: map[string]pendingPKCE{
+				"state": {Created: time.Now(), Status: "pending"},
+			}}
+			rr := httptest.NewRecorder()
+			s.callbackPKCE(rr, httptest.NewRequest(http.MethodGet, "/api/auth/callback?url="+url.QueryEscape(tc.url), nil))
+			if rr.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+			}
+			if got := s.pkce["state"].Status; got != "pending" {
+				t.Fatalf("unsafe pasted URL changed state to %q", got)
+			}
+		})
+	}
+}
+
+func TestCallbackPKCEAcceptsTrustedPastedMicrosoftNativeClientError(t *testing.T) {
+	s := &Server{pkce: map[string]pendingPKCE{
+		"state": {Created: time.Now(), Status: "pending"},
+	}}
+	callbackURL := "https://login.microsoftonline.com/common/oauth2/nativeclient?state=state&error=access_denied"
+	rr := httptest.NewRecorder()
+	s.callbackPKCE(rr, httptest.NewRequest(http.MethodGet, "/api/auth/callback?url="+url.QueryEscape(callbackURL), nil))
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	if got := s.pkce["state"].Status; got != "error" {
+		t.Fatalf("trusted provider denial state = %q, want error", got)
+	}
+}
+
 func TestCallbackPKCEConsumesMicrosoftErrorOnce(t *testing.T) {
 	s := &Server{pkce: map[string]pendingPKCE{
 		"state": {Created: time.Now(), Status: "pending"},
@@ -104,56 +153,39 @@ func TestCallbackPKCEConsumesMicrosoftErrorOnce(t *testing.T) {
 	}
 }
 
-func TestCallbackPKCEAcceptsPastedURLAndReturnsSafeCompletionPage(t *testing.T) {
+func TestCallbackPKCENativeClientCallbackDoesNotExposeAuthorizationResult(t *testing.T) {
 	const code = "sensitive-authorization-code"
-	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if err := r.ParseForm(); err != nil {
-			t.Fatal(err)
-		}
-		if r.Form.Get("code") != code || r.Form.Get("code_verifier") != "verifier" {
-			t.Fatalf("unexpected exchange form: %v", r.Form)
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{"access_token":"header.payload.signature","refresh_token":"sensitive-refresh-token","expires_in":3600}`)
-	}))
-	defer tokenServer.Close()
-	t.Setenv("M365_TOKEN_ENDPOINT", tokenServer.URL)
 	store, err := auth.OpenStore(t.TempDir() + "/accounts.json")
 	if err != nil {
 		t.Fatal(err)
 	}
-	redirectURI := "http://127.0.0.1:4141/api/auth/callback"
 	s := &Server{tokens: store, pkce: map[string]pendingPKCE{
-		"state": {Verifier: "verifier", Created: time.Now(), Status: "pending", RedirectURI: redirectURI},
+		"state": {Verifier: "verifier", Created: time.Now(), Status: "pending", RedirectURI: auth.DefaultRedirectURI},
+	}, exchangeCode: func(gotCode, verifier, redirectURI string) (auth.TokenSet, error) {
+		if gotCode != code || verifier != "verifier" || redirectURI != auth.DefaultRedirectURI {
+			t.Fatalf("unexpected code exchange arguments")
+		}
+		return auth.TokenSet{AccessToken: "header.payload.signature", RefreshToken: "sensitive-refresh-token", ExpiresAt: time.Now().Add(time.Hour)}, nil
 	}}
-	callbackURL := redirectURI + "?code=" + code + "&state=state"
 	rr := httptest.NewRecorder()
-	s.callbackPKCE(rr, httptest.NewRequest(http.MethodGet, "/api/auth/callback?url="+url.QueryEscape(callbackURL), nil))
+	s.callbackPKCE(rr, httptest.NewRequest(http.MethodGet, "/api/auth/callback?state=state&code="+url.QueryEscape(code), nil))
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
 	}
 	body := rr.Body.String()
-	for _, secret := range []string{code, "sensitive-refresh-token", callbackURL} {
+	for _, secret := range []string{code, "sensitive-refresh-token"} {
 		if strings.Contains(body, secret) {
-			t.Fatalf("completion page exposed sensitive value %q", secret)
+			t.Fatalf("callback response exposed sensitive value %q", secret)
 		}
-	}
-	if !strings.Contains(body, "window.close()") {
-		t.Fatal("completion page does not attempt to close the popup")
 	}
 }
 
 func TestCallbackPKCEFailureDoesNotExposeAuthorizationCode(t *testing.T) {
 	const code = "sensitive-failed-code"
-	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		_, _ = io.WriteString(w, `{"error":"invalid_grant","error_description":"AADSTS70000: invalid grant"}`)
-	}))
-	defer tokenServer.Close()
-	t.Setenv("M365_TOKEN_ENDPOINT", tokenServer.URL)
 	s := &Server{pkce: map[string]pendingPKCE{
 		"state": {Verifier: "verifier", Created: time.Now(), Status: "pending", RedirectURI: auth.DefaultRedirectURI},
+	}, exchangeCode: func(_, _, _ string) (auth.TokenSet, error) {
+		return auth.TokenSet{}, &auth.OAuthError{Code: "invalid_grant"}
 	}}
 	rr := httptest.NewRecorder()
 	s.callbackPKCE(rr, httptest.NewRequest(http.MethodGet, "/api/auth/callback?state=state&code="+code, nil))
@@ -165,35 +197,43 @@ func TestCallbackPKCEFailureDoesNotExposeAuthorizationCode(t *testing.T) {
 	}
 }
 
-func TestStartPKCEUsesConfiguredRedirectURIExactly(t *testing.T) {
-	const redirectURI = "https://app.example.test/api/auth/callback"
-	t.Setenv("M365_REDIRECT_URI", redirectURI)
-	t.Setenv("M365_PUBLIC_URL", "https://other.example.test")
+func TestStartPKCERejectsUnsafeConfiguredTargets(t *testing.T) {
+	tests := []struct {
+		name              string
+		authorizeEndpoint string
+		redirectURI       string
+	}{
+		{
+			name:              "non-Microsoft authorization endpoint",
+			authorizeEndpoint: "https://example.test/common/oauth2/v2.0/authorize",
+		},
+		{
+			name:        "non-Microsoft redirect URI",
+			redirectURI: "https://app.example.test/api/auth/callback",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("M365_BROWSER_AUTHORITY", "")
+			t.Setenv("M365_AUTHORITY", "")
+			t.Setenv("M365_BROWSER_REDIRECT_URI", "")
+			t.Setenv("M365_REDIRECT_URI", tc.redirectURI)
+			t.Setenv("M365_AUTHORIZE_ENDPOINT", tc.authorizeEndpoint)
 
-	s := &Server{pkce: map[string]pendingPKCE{}}
-	rr := httptest.NewRecorder()
-	r := httptest.NewRequest(http.MethodPost, "/api/auth/start", nil)
-	r.Host = "172.30.0.214"
-	r.Header.Set("X-Forwarded-Host", "unregistered.example")
-	r.Header.Set("X-Forwarded-Proto", "https")
-	s.startPKCE(rr, r)
+			s := &Server{pkce: map[string]pendingPKCE{}}
+			rr := httptest.NewRecorder()
+			s.startPKCE(rr, httptest.NewRequest(http.MethodPost, "/api/auth/start", nil))
 
-	var response struct {
-		URL         string `json:"url"`
-		RedirectURI string `json:"redirectUri"`
-	}
-	if err := json.NewDecoder(rr.Body).Decode(&response); err != nil {
-		t.Fatal(err)
-	}
-	if got := response.RedirectURI; got != redirectURI {
-		t.Fatalf("redirect URI = %q, want %q", got, redirectURI)
-	}
-	u, err := url.Parse(response.URL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := u.Query().Get("redirect_uri"); got != redirectURI {
-		t.Fatalf("authorization redirect URI = %q, want %q", got, redirectURI)
+			if rr.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+			}
+			if len(s.pkce) != 0 {
+				t.Fatal("unsafe OAuth configuration created pending PKCE state")
+			}
+			if strings.Contains(rr.Body.String(), "example.test") {
+				t.Fatal("unsafe OAuth configuration was reflected to the client")
+			}
+		})
 	}
 }
 

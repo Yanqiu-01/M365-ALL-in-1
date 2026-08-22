@@ -37,9 +37,16 @@ func directClients() *Clients {
 	tlsCache := tls.NewLRUClientSessionCache(32)
 	httpTLSConf := &tls.Config{ClientSessionCache: tlsCache}
 	wsTLSConf := &tls.Config{ClientSessionCache: tlsCache, NextProtos: []string{"http/1.1"}}
+	dnsResolver := &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			d := net.Dialer{Timeout: 5 * time.Second}
+			return d.DialContext(ctx, "udp", "1.1.1.1:53")
+		},
+	}
 	t := &http.Transport{
-		Proxy:                 nil,
-		DialContext:           (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		Proxy: nil,
+		DialContext: (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second, Resolver: dnsResolver}).DialContext,
 		MaxIdleConns:          100,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,

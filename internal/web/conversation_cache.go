@@ -32,35 +32,35 @@ func newConversationCache() *conversationCache {
 	}
 }
 
-func (c *conversationCache) key(accountID, model string) string {
-	return accountID + "|" + model
+func (c *conversationCache) key(ownerID, accountID, model string) string {
+	return ownerID + "|" + accountID + "|" + model
 }
 
-func (c *conversationCache) Lookup(accountID, model string) *cachedConversation {
+func (c *conversationCache) Lookup(ownerID, accountID, model string) *cachedConversation {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	entry := c.entries[c.key(accountID, model)]
+	entry := c.entries[c.key(ownerID, accountID, model)]
 	if entry == nil {
 		return nil
 	}
 	if time.Since(entry.LastUsedAt) > c.maxAge {
-		delete(c.entries, c.key(accountID, model))
+		delete(c.entries, c.key(ownerID, accountID, model))
 		return nil
 	}
 	return entry
 }
 
-func (c *conversationCache) Store(accountID, model string, conv *cachedConversation) {
+func (c *conversationCache) Store(ownerID, accountID, model string, conv *cachedConversation) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	conv.LastUsedAt = time.Now()
-	c.entries[c.key(accountID, model)] = conv
+	c.entries[c.key(ownerID, accountID, model)] = conv
 }
 
-func (c *conversationCache) Invalidate(accountID, model string) {
+func (c *conversationCache) Invalidate(ownerID, accountID, model string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	delete(c.entries, c.key(accountID, model))
+	delete(c.entries, c.key(ownerID, accountID, model))
 }
 
 func (c *conversationCache) GC() {
@@ -103,11 +103,11 @@ func extractLastUserMessage(messages []oaiMsg) string {
 	return ""
 }
 
-func (s *Server) storeConvCache(accID, model string, res chathub.Result, tone string, messages []oaiMsg, reused bool) {
+func (s *Server) storeConvCache(ownerID, accID, model string, res chathub.Result, tone string, messages []oaiMsg, reused bool) {
 	if res.ConversationID == "" {
 		return
 	}
-	cached := s.convCache.Lookup(accID, model)
+	cached := s.convCache.Lookup(ownerID, accID, model)
 	entry := &cachedConversation{
 		ConversationID: res.ConversationID,
 		SessionID:      res.SessionID,
@@ -120,9 +120,9 @@ func (s *Server) storeConvCache(accID, model string, res chathub.Result, tone st
 	} else {
 		entry.TurnCount = 1
 	}
-	s.convCache.Store(accID, model, entry)
+	s.convCache.Store(ownerID, accID, model, entry)
 }
 
-func (s *Server) invalidateConvCache(accID, model string) {
-	s.convCache.Invalidate(accID, model)
+func (s *Server) invalidateConvCache(ownerID, accID, model string) {
+	s.convCache.Invalidate(ownerID, accID, model)
 }

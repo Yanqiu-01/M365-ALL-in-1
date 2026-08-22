@@ -21,6 +21,7 @@ import (
 type sessionBinding struct {
 	SessionID      string    `json:"sessionId"`
 	ConversationID string    `json:"conversationId"`
+	OwnerID        string    `json:"ownerId,omitempty"`
 	AccountID      string    `json:"accountId"`
 	CreatedAt      time.Time `json:"createdAt"`
 	LastUsedAt     time.Time `json:"lastUsedAt"`
@@ -113,16 +114,33 @@ func (sr *sessionResolver) flush() error {
 	return writeFileAtomic(sr.path, b, 0o600)
 }
 
+func ownerIndexKey(ownerID, value string) string {
+	if value == "" {
+		return ""
+	}
+	return ownerID + "\x00" + value
+}
+
+func sessionMatchesOwner(sess sessionBinding, ownerID string) bool {
+	if ownerID == "" {
+		return sess.OwnerID == ""
+	}
+	return sess.OwnerID == ownerID
+}
+
 func (sr *sessionResolver) reindexLocked(s sessionBinding) {
 	sr.sessions[s.SessionID] = s
+	if s.SessionID != "" {
+		sr.byExplicit[ownerIndexKey(s.OwnerID, s.SessionID)] = s.SessionID
+	}
 	if s.UserField != "" {
-		sr.byUserField[s.UserField] = s.SessionID
+		sr.byUserField[ownerIndexKey(s.OwnerID, s.UserField)] = s.SessionID
 	}
 	if s.IPFingerprint != "" {
-		sr.byIPFinger[s.IPFingerprint] = s.SessionID
+		sr.byIPFinger[ownerIndexKey(s.OwnerID, s.IPFingerprint)] = s.SessionID
 	}
 	if s.ContextFinger != "" {
-		sr.byContext[s.ContextFinger] = s.SessionID
+		sr.byContext[ownerIndexKey(s.OwnerID, s.ContextFinger)] = s.SessionID
 	}
 }
 
@@ -150,14 +168,17 @@ func (sr *sessionResolver) evictLocked() {
 
 func (sr *sessionResolver) dropLocked(id string, s sessionBinding) {
 	delete(sr.sessions, id)
-	if sr.byUserField[s.UserField] == id {
-		delete(sr.byUserField, s.UserField)
+	if sr.byExplicit[ownerIndexKey(s.OwnerID, s.SessionID)] == id {
+		delete(sr.byExplicit, ownerIndexKey(s.OwnerID, s.SessionID))
 	}
-	if sr.byIPFinger[s.IPFingerprint] == id {
-		delete(sr.byIPFinger, s.IPFingerprint)
+	if sr.byUserField[ownerIndexKey(s.OwnerID, s.UserField)] == id {
+		delete(sr.byUserField, ownerIndexKey(s.OwnerID, s.UserField))
 	}
-	if sr.byContext[s.ContextFinger] == id {
-		delete(sr.byContext, s.ContextFinger)
+	if sr.byIPFinger[ownerIndexKey(s.OwnerID, s.IPFingerprint)] == id {
+		delete(sr.byIPFinger, ownerIndexKey(s.OwnerID, s.IPFingerprint))
+	}
+	if sr.byContext[ownerIndexKey(s.OwnerID, s.ContextFinger)] == id {
+		delete(sr.byContext, ownerIndexKey(s.OwnerID, s.ContextFinger))
 	}
 }
 
@@ -199,6 +220,10 @@ func contextFingerprint(messages []oaiMsg) string {
 }
 
 func (sr *sessionResolver) Resolve(r *http.Request, body *oaiReq) ResolveResult {
+	return sr.ResolveOwned(r, body, "")
+}
+
+func (sr *sessionResolver) ResolveOwned(r *http.Request, body *oaiReq, ownerID string) ResolveResult {
 	sr.mu.Lock()
 	defer sr.mu.Unlock()
 	sr.evictLocked()
@@ -208,22 +233,22 @@ func (sr *sessionResolver) Resolve(r *http.Request, body *oaiReq) ResolveResult 
 	// 瀹㈡埛绔樉寮忔寚瀹氱殑浼氳瘽 ID 鏄渶楂樹紭鍏堢殑缁帴璇箟锛氫笉鍙備笌浠讳綍韬唤鍒ゅ畾锛?
 	// 鐢辫皟鐢ㄦ柟涓诲姩鍐冲畾瑕佺户缁摢涓簯绔璇濄€?
 	if explicitID != "" {
-		if sessID, ok := sr.byExplicit[explicitID]; ok {
-			if sess, ok := sr.sessions[sessID]; ok {
-			sess.LastUsedAt = time.Now().UTC()
-			sr.sessions[sessID] = sess
-			sr.persist.markDirty()
-			return ResolveResult{
-				SessionID:      sess.SessionID,
-				ConversationID: sess.ConversationID,
-				AccountID:      sess.AccountID,
-				MatchedBy:      "explicit",
-				IsNew:          false,
-				HistoryLen:     len(sess.ContextHistory),
-			}
+		if sessID, ok := sr.byExplicit[ownerIndexKey(ownerID, explicitID)]; ok {
+			if sess, ok := sr.sessions[sessID]; ok && sessionMatchesOwner(sess, ownerID) {
+				sess.LastUsedAt = time.Now().UTC()
+				sr.sessions[sessID] = sess
+				sr.persist.markDirty()
+				return ResolveResult{
+					SessionID:      sess.SessionID,
+					ConversationID: sess.ConversationID,
+					AccountID:      sess.AccountID,
+					MatchedBy:      "explicit",
+					IsNew:          false,
+					HistoryLen:     len(sess.ContextHistory),
+				}
 			}
 		}
-		if sess, ok := sr.sessions[explicitID]; ok {
+		if sess, ok := sr.sessions[explicitID]; ok && sessionMatchesOwner(sess, ownerID) {
 			sess.LastUsedAt = time.Now().UTC()
 			sr.sessions[explicitID] = sess
 			sr.persist.markDirty()
@@ -242,7 +267,7 @@ func (sr *sessionResolver) Resolve(r *http.Request, body *oaiReq) ResolveResult 
 	// 浜戠瀵硅瘽锛屼絾鍙湪鍚屼竴 IP/UA 鎸囩汗涓嬶紝閬垮厤鐭秷鎭湪涓嶅悓鐢ㄦ埛闂翠簰绔?
 	// HistoryLen 杩斿洖璇ュ墠缂€闀垮害锛屼笂灞傛嵁姝ゅ彧鍙戦€?messages[HistoryLen:] 澧為噺銆?
 	ipFinger := clientIPFingerprint(r)
-	if bestID, n := sr.matchContextLocked(ipFinger, body.Messages); bestID != "" {
+	if bestID, n := sr.matchContextLocked(ownerID, ipFinger, body.Messages); bestID != "" {
 		sess := sr.sessions[bestID]
 		sess.LastUsedAt = time.Now().UTC()
 		sr.sessions[bestID] = sess
@@ -259,7 +284,7 @@ func (sr *sessionResolver) Resolve(r *http.Request, body *oaiReq) ResolveResult 
 
 	// 寮辩害鏉熷厹搴曪細鍐呭涓嶆瀯鎴愪弗鏍煎墠缂€锛屼絾涓庢煇涓巻鍙查珮搴︾浉浼硷紙濡傚鎴风
 	// 鏈湴鎴柇浜嗗巻鍙诧級锛屼粛澶嶇敤璇ヤ細璇濄€傛鏃跺閲忚竟鐣屾湭鐭ワ紝涓婂眰鍙戦€佸叏閲忋€?
-	suffixID, suffixN := sr.matchSuffixLocked(ipFinger, body.Messages)
+	suffixID, suffixN := sr.matchSuffixLocked(ownerID, ipFinger, body.Messages)
 	if suffixID != "" {
 		sess := sr.sessions[suffixID]
 		sess.LastUsedAt = time.Now().UTC()
@@ -278,7 +303,7 @@ func (sr *sessionResolver) Resolve(r *http.Request, body *oaiReq) ResolveResult 
 	return ResolveResult{IsNew: true}
 }
 
-func (sr *sessionResolver) matchSuffixLocked(ipFinger string, messages []oaiMsg) (string, int) {
+func (sr *sessionResolver) matchSuffixLocked(ownerID, ipFinger string, messages []oaiMsg) (string, int) {
 	if len(messages) < 2 {
 		return "", 0
 	}
@@ -293,7 +318,7 @@ func (sr *sessionResolver) matchSuffixLocked(ipFinger string, messages []oaiMsg)
 		if time.Since(sess.LastUsedAt) > sr.contextTTL {
 			continue
 		}
-		if sess.IPFingerprint != ipFinger {
+		if !sessionMatchesOwner(sess, ownerID) || sess.IPFingerprint != ipFinger {
 			continue
 		}
 		hist := sess.ContextHistory
@@ -327,21 +352,21 @@ func suffixMatchLen(hist, msgs []oaiMsg) int {
 // matchContextLocked 浠庡叏閮ㄤ細璇濅腑鎵惧埌鍏?contextHistory 涓ユ牸浣滀负娑堟伅鍓嶇紑鐨?
 // 閭ｄ釜浼氳瘽锛涘彧閫夊墠缂€鏈€闀跨殑涓€涓紝閬垮厤鐭墠缂€鍦ㄤ笉鍚屼細璇濋棿浜掓挒銆傝繑鍥?
 // (sessionID, 鍖归厤鍒扮殑娑堟伅鏉℃暟)銆?
-func (sr *sessionResolver) matchContextLocked(ipFinger string, messages []oaiMsg) (string, int) {
+func (sr *sessionResolver) matchContextLocked(ownerID, ipFinger string, messages []oaiMsg) (string, int) {
 	if len(messages) == 0 {
 		return "", 0
 	}
 	type match struct {
-		id      string
-		n       int
-		recent  time.Time
+		id     string
+		n      int
+		recent time.Time
 	}
 	best := match{}
 	for id, sess := range sr.sessions {
 		if time.Since(sess.LastUsedAt) > sr.contextTTL {
 			continue
 		}
-		if sess.IPFingerprint != ipFinger {
+		if !sessionMatchesOwner(sess, ownerID) || sess.IPFingerprint != ipFinger {
 			continue
 		}
 		n := contextPrefixLen(sess.ContextHistory, messages)
@@ -408,6 +433,10 @@ func toolCallEqual(x, y map[string]any) bool {
 }
 
 func (sr *sessionResolver) Bind(sessionID, conversationID, accountID string, body *oaiReq, assistantText string, r *http.Request) {
+	sr.BindOwned(sessionID, conversationID, accountID, "", body, assistantText, r)
+}
+
+func (sr *sessionResolver) BindOwned(sessionID, conversationID, accountID, ownerID string, body *oaiReq, assistantText string, r *http.Request) {
 	sr.mu.Lock()
 	defer sr.mu.Unlock()
 	sr.evictLocked()
@@ -421,33 +450,40 @@ func (sr *sessionResolver) Bind(sessionID, conversationID, accountID string, bod
 	if explicitID != "" && sessionID == "" {
 		sessionID = explicitID
 	}
-	// 同一云端对话只保留一条记录：内容键命中后增量轮次更新已存在会话，
-	// 而不是每次 Bind 都新建一条，避免 sessions.json 膨胀。
+	// Never let a caller overwrite a session owned by another API key. If a
+	// client reuses the same explicit ID under a different key, allocate a new
+	// server session ID instead.
 	if sessionID != "" {
 		if sess, ok := sr.sessions[sessionID]; ok {
-			sess.ConversationID = conversationID
-			sess.AccountID = accountID
-			sess.LastUsedAt = now
-			sess.UserField = body.User
-			sess.IPFingerprint = clientIPFingerprint(r)
-			sess.ContextFinger = contextFingerprint(history)
-			sess.ContextHistory = history
-			sr.sessions[sessionID] = sess
-			sr.reindexLocked(sess)
-			sr.persist.markDirty()
-			return
-		}
-	}
-	if sessionID == "" {
-		for sid, sess := range sr.sessions {
-			if sess.ConversationID == conversationID {
-				sess.LastUsedAt = now
+			if !sessionMatchesOwner(sess, ownerID) {
+				sessionID = ""
+			} else {
+				sr.dropLocked(sessionID, sess)
+				sess.ConversationID = conversationID
 				sess.AccountID = accountID
+				sess.OwnerID = ownerID
+				sess.LastUsedAt = now
 				sess.UserField = body.User
 				sess.IPFingerprint = clientIPFingerprint(r)
 				sess.ContextFinger = contextFingerprint(history)
 				sess.ContextHistory = history
-				sr.sessions[sid] = sess
+				sr.reindexLocked(sess)
+				sr.persist.markDirty()
+				return
+			}
+		}
+	}
+	if sessionID == "" {
+		for sid, sess := range sr.sessions {
+			if sess.ConversationID == conversationID && sessionMatchesOwner(sess, ownerID) {
+				sr.dropLocked(sid, sess)
+				sess.LastUsedAt = now
+				sess.AccountID = accountID
+				sess.OwnerID = ownerID
+				sess.UserField = body.User
+				sess.IPFingerprint = clientIPFingerprint(r)
+				sess.ContextFinger = contextFingerprint(history)
+				sess.ContextHistory = history
 				sr.reindexLocked(sess)
 				sr.persist.markDirty()
 				return
@@ -459,6 +495,7 @@ func (sr *sessionResolver) Bind(sessionID, conversationID, accountID string, bod
 	sess := sessionBinding{
 		SessionID:      sessionID,
 		ConversationID: conversationID,
+		OwnerID:        ownerID,
 		AccountID:      accountID,
 		CreatedAt:      now,
 		LastUsedAt:     now,
@@ -473,17 +510,29 @@ func (sr *sessionResolver) Bind(sessionID, conversationID, accountID string, bod
 }
 
 func (sr *sessionResolver) GetSession(sessionID string) (sessionBinding, bool) {
+	return sr.GetSessionForOwner("", sessionID)
+}
+
+func (sr *sessionResolver) GetSessionForOwner(ownerID, sessionID string) (sessionBinding, bool) {
 	sr.mu.Lock()
 	defer sr.mu.Unlock()
 	s, ok := sr.sessions[sessionID]
-	return s, ok
+	if !ok || !sessionMatchesOwner(s, ownerID) {
+		return sessionBinding{}, false
+	}
+	s.ContextHistory = cloneMessages(s.ContextHistory)
+	return s, true
 }
 
 func (sr *sessionResolver) GetConversation(conversationID string) (sessionBinding, bool) {
+	return sr.GetConversationForOwner("", conversationID)
+}
+
+func (sr *sessionResolver) GetConversationForOwner(ownerID, conversationID string) (sessionBinding, bool) {
 	sr.mu.Lock()
 	defer sr.mu.Unlock()
 	for _, session := range sr.sessions {
-		if session.ConversationID == conversationID {
+		if session.ConversationID == conversationID && sessionMatchesOwner(session, ownerID) {
 			session.ContextHistory = cloneMessages(session.ContextHistory)
 			return session, true
 		}
@@ -492,11 +541,22 @@ func (sr *sessionResolver) GetConversation(conversationID string) (sessionBindin
 }
 
 func (sr *sessionResolver) ListSessions() []sessionBinding {
+	return sr.listSessionsForOwner("")
+}
+
+func (sr *sessionResolver) ListSessionsForOwner(ownerID string) []sessionBinding {
+	return sr.listSessionsForOwner(ownerID)
+}
+
+func (sr *sessionResolver) listSessionsForOwner(ownerID string) []sessionBinding {
 	sr.mu.Lock()
 	defer sr.mu.Unlock()
 	out := make([]sessionBinding, 0, len(sr.sessions))
 	for _, s := range sr.sessions {
-		out = append(out, s)
+		if sessionMatchesOwner(s, ownerID) {
+			s.ContextHistory = cloneMessages(s.ContextHistory)
+			out = append(out, s)
+		}
 	}
 	sort.Slice(out, func(i, j int) bool {
 		return out[i].LastUsedAt.After(out[j].LastUsedAt)
@@ -505,23 +565,17 @@ func (sr *sessionResolver) ListSessions() []sessionBinding {
 }
 
 func (sr *sessionResolver) DeleteSession(sessionID string) bool {
+	return sr.DeleteSessionForOwner("", sessionID)
+}
+
+func (sr *sessionResolver) DeleteSessionForOwner(ownerID, sessionID string) bool {
 	sr.mu.Lock()
 	defer sr.mu.Unlock()
 	s, ok := sr.sessions[sessionID]
-	if !ok {
+	if !ok || !sessionMatchesOwner(s, ownerID) {
 		return false
 	}
-	delete(sr.sessions, sessionID)
-	delete(sr.byExplicit, sessionID)
-	if s.UserField != "" {
-		delete(sr.byUserField, s.UserField)
-	}
-	if s.IPFingerprint != "" {
-		delete(sr.byIPFinger, s.IPFingerprint)
-	}
-	if s.ContextFinger != "" {
-		delete(sr.byContext, s.ContextFinger)
-	}
+	sr.dropLocked(sessionID, s)
 	sr.persist.markDirty()
 	return true
 }
@@ -537,17 +591,7 @@ func (sr *sessionResolver) UnbindByConversation(conversationID string) int {
 		if s.ConversationID != conversationID {
 			continue
 		}
-		delete(sr.sessions, sid)
-		delete(sr.byExplicit, sid)
-		if s.UserField != "" {
-			delete(sr.byUserField, s.UserField)
-		}
-		if s.IPFingerprint != "" {
-			delete(sr.byIPFinger, s.IPFingerprint)
-		}
-		if s.ContextFinger != "" {
-			delete(sr.byContext, s.ContextFinger)
-		}
+		sr.dropLocked(sid, s)
 		removed++
 	}
 	if removed > 0 {

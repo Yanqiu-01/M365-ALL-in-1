@@ -1076,25 +1076,30 @@ async function deleteAccount(id){
   catch(e){showNotice(e.message,'error');}
 }
 
+function isTrustedMicrosoftAuthorizeURL(raw){
+  try{
+    const u=new URL(raw);
+    const parts=u.pathname.split('/');
+    return u.protocol==='https:'&&
+      u.hostname.toLowerCase()==='login.microsoftonline.com'&&
+      !u.username&&!u.password&&!u.port&&!u.search&&!u.hash&&
+      parts.length===5&&parts[0]===''&&parts[1]!==''&&
+      parts[2]==='oauth2'&&parts[3]==='v2.0'&&parts[4]==='authorize';
+  }catch(e){return false;}
+}
+
 async function startPKCE(){
   try{
     const d=await api('/api/auth/start');
+    if(!d||typeof d.url!=='string'||typeof d.state!=='string'||!d.state||!isTrustedMicrosoftAuthorizeURL(d.url)){
+      $('authStatus').innerHTML='<div class="highlight-box warning"><div class="highlight-box-title"><i data-lucide="alert-circle" style="width:14px;height:14px"></i>OAuth configuration error</div><p>The gateway did not return a supported Microsoft sign-in address. Authorization was not opened.</p></div>';
+      lucide.createIcons();
+      return;
+    }
     $('callbackInput').dataset.state=d.state;
-    const popup=window.open(d.url,'pkce','width=600,height=800');
-    if(!popup){$('authStatus').innerHTML='<div class="highlight-box warning"><div class="highlight-box-title"><i data-lucide="alert-circle" style="width:14px;height:14px"></i>Popup blocked by browser</div><p>Please allow popups for this site, then click "Start authorization" again.</p></div>';lucide.createIcons();return;}
-    $('authStatus').innerHTML='<div class="highlight-box"><div class="highlight-box-title"><i data-lucide="info" style="width:14px;height:14px"></i>Authorization page opened in a new window</div><p>Complete the sign-in in the popup. After signing in, the popup will show a blank or error page — this is normal. Copy the <b>full URL from the popup&#39;s address bar</b> and paste it into the Callback URL field below.</p></div>';
-    $('callbackInput').focus();
-    $('callbackInput').placeholder='Paste the full callback URL from the popup address bar…';
-    if(pkceTimer)clearInterval(pkceTimer);
-    const start=Date.now();
-    pkceTimer=setInterval(async()=>{
-      if(Date.now()-start>600000){clearInterval(pkceTimer);$('authStatus').innerHTML='<div class="highlight-box warning"><b>Authorization timed out. Start authorization again.</b></div>';return;}
-      if(popup&&popup.closed){clearInterval(pkceTimer);$('authStatus').innerHTML='<div class="highlight-box warning"><b>The authorization window was closed before completion.</b></div>';return;}
-      try{const s=await api('/api/auth/status?state='+d.state);
-        if(s.status==='authenticated'){clearInterval(pkceTimer);$('authStatus').innerHTML='<div class="highlight-box success"><div class="highlight-box-title"><i data-lucide="check-circle" style="width:14px;height:14px"></i>Authorization successful</div><p>Account added to the account pool.</p></div>';showNotice('Authorization successful','success');loadAccounts();}
-        if(s.status==='error'||s.status==='expired'){clearInterval(pkceTimer);$('authStatus').innerHTML='<div class="highlight-box warning"><b>Authorization failed or expired</b></div>';}
-      }catch(e){}
-    },2000);
+    $('authStatus').innerHTML='<div class="highlight-box"><div class="highlight-box-title"><i data-lucide="info" style="width:14px;height:14px"></i>Opening Microsoft sign-in</div><p>Continue in the app authorization screen. On mobile, the verified callback is captured automatically.</p></div>';
+    lucide.createIcons();
+    window.location.assign(d.url);
   }catch(e){showNotice(e.message,'error');}
 }
 

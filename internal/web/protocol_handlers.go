@@ -243,7 +243,7 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 		writeResponsesError(w, 400, "invalid_request_error", err.Error())
 		return
 	}
-	tenant := extractAPIKey(r)
+	tenant := requestAPIKeyOwner(r)
 	if body.PreviousResponseID != "" {
 		s.responseMu.Lock()
 		prior, ok := s.responseMessages[tenant][body.PreviousResponseID]

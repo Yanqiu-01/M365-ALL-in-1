@@ -127,7 +127,7 @@ func ROPCContext(ctx context.Context, username, password string) (TokenSet, erro
 	form.Set("username", username)
 	form.Set("password", password)
 	form.Set("scope", Scope())
-	return requestTokenTenantContext(ctx, form, Authority()+"/organizations/oauth2/v2.0/token")
+	return requestTokenTenantContext(ctx, form, "https://login.microsoftonline.com/organizations/oauth2/v2.0/token")
 }
 
 func requestTokenTenant(form url.Values, endpoint string) (TokenSet, error) {
@@ -135,13 +135,16 @@ func requestTokenTenant(form url.Values, endpoint string) (TokenSet, error) {
 }
 
 func requestTokenTenantContext(ctx context.Context, form url.Values, endpoint string) (TokenSet, error) {
+	if err := ValidateTokenEndpoint(endpoint); err != nil {
+		return TokenSet{}, err
+	}
 	resp, body, err := postAuthForm(ctx, endpoint, form)
 	if err != nil {
 		return TokenSet{}, err
 	}
 	var tr tokenResponse
 	if err := json.Unmarshal(body, &tr); err != nil {
-		return TokenSet{}, fmt.Errorf("decode token response: %w", err)
+return TokenSet{}, fmt.Errorf("decode token response (HTTP %d, body=%q): %w", resp.StatusCode, string(body), err)
 	}
 	if tr.Error != "" {
 		return TokenSet{}, fmt.Errorf("ROPC %s: %s", tr.Error, tr.ErrorDesc)
@@ -160,7 +163,11 @@ func requestToken(form url.Values) (TokenSet, error) {
 }
 
 func requestTokenContext(ctx context.Context, form url.Values) (TokenSet, error) {
-	resp, body, err := postAuthForm(ctx, TokenEndpoint(), form)
+	endpoint := TokenEndpoint()
+	if err := ValidateTokenEndpoint(endpoint); err != nil {
+		return TokenSet{}, err
+	}
+	resp, body, err := postAuthForm(ctx, endpoint, form)
 	if err != nil {
 		return TokenSet{}, err
 	}
