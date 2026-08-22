@@ -10,7 +10,6 @@ import (
 	"log"
 	"m365-copilot2api/internal/auth"
 	"m365-copilot2api/internal/chathub"
-	"m365-copilot2api/internal/outbound"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -322,42 +321,7 @@ func downloadDesignerImage(ctx context.Context, rawURL, accessToken string) ([]b
 	if !isDesignerImageURL(rawURL) {
 		return nil, "", fmt.Errorf("unsupported generated image host")
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
-	if err != nil {
-		return nil, "", err
-	}
-	req.Header.Set("Authorization", "Bearer "+accessToken)
-	req.Header.Set("Accept", "image/*")
-	client := *outbound.HTTPClient()
-	client.CheckRedirect = func(next *http.Request, via []*http.Request) error {
-		if len(via) >= 3 || !isDesignerImageURL(next.URL.String()) {
-			return http.ErrUseLastResponse
-		}
-		return nil
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, "", err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, "", fmt.Errorf("Designer image download HTTP %d", resp.StatusCode)
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxGeneratedImageBytes+1))
-	if err != nil {
-		return nil, "", err
-	}
-	if len(body) > maxGeneratedImageBytes {
-		return nil, "", fmt.Errorf("generated image exceeds %d bytes", maxGeneratedImageBytes)
-	}
-	contentType := resp.Header.Get("Content-Type")
-	if contentType == "" || !strings.HasPrefix(strings.ToLower(contentType), "image/") {
-		contentType = http.DetectContentType(body)
-	}
-	if !strings.HasPrefix(strings.ToLower(contentType), "image/") {
-		return nil, "", fmt.Errorf("Designer returned non-image content")
-	}
-	return body, contentType, nil
+	return chathub.DownloadRemoteImage(ctx, rawURL, maxGeneratedImageBytes, accessToken)
 }
 
 func (s *Server) storeGeneratedImage(data []byte, contentType string) string {
@@ -488,33 +452,11 @@ func downloadImageAsBase64(url string) (b64, contentType string, err error) {
 }
 
 func downloadImageAsBase64WithToken(url, token string) (b64, contentType string, err error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	body, contentType, err := chathub.DownloadRemoteImage(context.Background(), url, chathub.MaxAttachmentBytes, token)
 	if err != nil {
 		return "", "", err
 	}
-	if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return "", "", err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		return "", "", fmt.Errorf("download returned %d", resp.StatusCode)
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 20<<20))
-	if err != nil {
-		return "", "", err
-	}
-	ct := resp.Header.Get("Content-Type")
-	if ct == "" {
-		ct = http.DetectContentType(body)
-	}
-	enc := base64.StdEncoding.EncodeToString(body)
-	return enc, ct, nil
+	return base64.StdEncoding.EncodeToString(body), contentType, nil
 }
 
 func downloadImageAsDataURI(url string) (string, error) {
@@ -528,9 +470,9 @@ func downloadImageAsDataURI(url string) (string, error) {
 func downloadImageAsDataURIWithToken(url, token string) (string, error) {
 	b64, ct, err := downloadImageAsBase64WithToken(url, token)
 	if err != nil {
-		log.Printf("[image-download] failed url=%s token_len=%d err=%v", url[:80], len(token), err)
+		log.Printf("[image-download] failed err=%v", err)
 		return url, nil
 	}
-	log.Printf("[image-download] ok url=%s ct=%s size=%d", url[:80], ct, len(b64))
+	log.Printf("[image-download] ok content_type=%s size=%d", ct, len(b64))
 	return "data:" + ct + ";base64," + b64, nil
 }

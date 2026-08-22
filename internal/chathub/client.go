@@ -58,10 +58,6 @@ const (
 	rs          = "\x1e"
 	defaultTone = "magic"
 	wsBase      = "wss://substrate.office.com/m365Copilot/Chathub"
-	// maxAttachments bounds per-request remote downloads: each image is
-	// base64-encoded and held in memory alongside the multipart body.
-	maxAttachments   = 10
-	maxAttachmentMiB = 10
 )
 
 // Variants mirrored from the verified browser / Python probe.
@@ -115,11 +111,11 @@ type Result struct {
 }
 
 type Client struct {
-	HTTPHeader  http.Header
-	HTTPClient  *http.Client
-	Dialer      *websocket.Dialer
-	Pool        *ConnPool
-	Trace       func(map[string]any)
+	HTTPHeader http.Header
+	HTTPClient *http.Client
+	Dialer     *websocket.Dialer
+	Pool       *ConnPool
+	Trace      func(map[string]any)
 }
 
 func NewClient() *Client {
@@ -181,6 +177,9 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 	}
 	if strings.TrimSpace(req.Text) == "" && len(req.Attachments) == 0 {
 		return Result{}, fmt.Errorf("empty prompt and no attachments")
+	}
+	if err := ValidateAttachments(req.Attachments); err != nil {
+		return Result{}, err
 	}
 	if req.Tone == "" {
 		req.Tone = defaultTone
@@ -475,13 +474,13 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 					}
 					if res, ok := item["result"].(map[string]any); ok {
 						rawResult, _ = res["value"].(string)
-				if msg, ok := res["message"].(string); ok {
-						final = msg
-						if rateLimited(final) {
-							returnConn = false
-							return Result{}, ErrRateLimitNotice
+						if msg, ok := res["message"].(string); ok {
+							final = msg
+							if rateLimited(final) {
+								returnConn = false
+								return Result{}, ErrRateLimitNotice
+							}
 						}
-					}
 					}
 				}
 				// completion frame often follows; keep reading a bit but we already have content
@@ -555,52 +554,28 @@ func buildWSURL(acc Account, sessionID, conversationID, requestID string) (strin
 }
 
 func (c *Client) uploadAttachments(ctx context.Context, acc Account, conversationID string, attachments []Attachment) error {
-	imageCount := 0
+	if err := ValidateAttachments(attachments); err != nil {
+		return err
+	}
 	for i := range attachments {
 		a := &attachments[i]
 		if a.Type != "image" {
 			continue
 		}
-		imageCount++
-		if imageCount > maxAttachments {
-			return fmt.Errorf("too many image attachments: limit is %d", maxAttachments)
-		}
-		// For non-data URLs, download the image first
-		imageData := a.URL
-		if !strings.HasPrefix(a.URL, "data:") {
-			if err := validateRemoteDownloadURL(a.URL); err != nil {
-				return err
-			}
-			req, err := http.NewRequestWithContext(ctx, http.MethodGet, a.URL, nil)
+		imageData := strings.TrimSpace(a.URL)
+		if !strings.HasPrefix(strings.ToLower(imageData), "data:") {
+			body, mimeType, err := DownloadRemoteImage(ctx, imageData, MaxAttachmentBytes, "")
 			if err != nil {
-				continue
-			}
-			resp, err := c.HTTPClient.Do(req)
-			if err != nil {
-				continue
-			}
-			body, err := io.ReadAll(io.LimitReader(resp.Body, maxAttachmentMiB<<20))
-			resp.Body.Close()
-			if err != nil || resp.StatusCode != http.StatusOK {
-				continue
-			}
-			mimeType := resp.Header.Get("Content-Type")
-			if mimeType == "" {
-				mimeType = "image/png"
+				return fmt.Errorf("download image attachment %d: %w", i+1, err)
 			}
 			imageData = "data:" + mimeType + ";base64," + base64.StdEncoding.EncodeToString(body)
 		}
+		_, _, err := decodeImageDataURL(imageData, MaxAttachmentBytes)
+		if err != nil {
+			return err
+		}
 		comma := strings.IndexByte(imageData, ',')
-		if comma < 0 {
-			return fmt.Errorf("invalid image data URL")
-		}
 		encoded := imageData[comma+1:]
-		if strings.Contains(strings.ToLower(imageData[:comma]), ";base64") == false {
-			return fmt.Errorf("image URL is not base64")
-		}
-		if _, err := base64.StdEncoding.DecodeString(encoded); err != nil {
-			return fmt.Errorf("decode image: %w", err)
-		}
 		form := url.Values{}
 		form.Set("scenario", "UploadImage")
 		form.Set("conversationId", conversationID)
