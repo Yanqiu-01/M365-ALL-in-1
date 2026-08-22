@@ -1,7 +1,9 @@
 package chathub
 
 import (
+	"encoding/base64"
 	"encoding/json"
+	"net/url"
 	"regexp"
 	"strings"
 )
@@ -51,12 +53,12 @@ func imageURLs(raw []json.RawMessage) []string {
 }
 
 func isImageURL(s string) bool {
-	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(s)), "data:") {
-		_, _, err := decodeImageDataURL(strings.TrimSpace(s), MaxAttachmentBytes)
+	if strings.HasPrefix(s, "data:image/") {
+		_, err := base64.StdEncoding.DecodeString(strings.SplitN(s, ",", 2)[1])
 		return err == nil
 	}
-	u, err := parseRemoteImageURL(s)
-	if err != nil {
+	u, err := url.Parse(s)
+	if err != nil || u.Scheme != "https" {
 		return false
 	}
 	// Designer-hosted generation URLs carry the extension in the query

@@ -1,3 +1,39 @@
+# M365 Copilot2API Mobile
+
+> ## 关于这个仓库
+>
+> 这是 [HEXUXIU/M365-Copilot2API](https://github.com/HEXUXIU/M365-Copilot2API) 的
+> **Android 分支**：把网关打包成手机可直接安装运行的 APK，并在此基础上做了一批
+> 修复。
+>
+> **源码来历需要说明**：本分支的原始改动源码已丢失，仅剩一个可正常工作的 APK。
+> 当前代码是通过反编译、二进制取证（pclntab 函数表、rodata 字符串）、与上游源码
+> 逐处比对**重建**出来的，并以那个 APK 的运行行为作为唯一基准 —— 而不是以上游
+> 源码为基准。因此部分实现刻意保留了与上游不同的形状。
+>
+> 已修复的主要问题记录在提交历史里，包括：连接复用导致的随机失败、错误码映射
+> 回归、评测任务提示词被压缩、路由决策解析对输出格式过于敏感、工具结果截断导致
+> 模型无法读取完整源码、以及一批评分器误判。
+>
+> 一次只读审计的结论见 [`AUDIT-2.24.23.md`](AUDIT-2.24.23.md)，其中三项已修复，
+> 并列出了仍未验证的部分（沙箱无法运行 `go test -race`，并发安全未经验证）。
+>
+> ### 构建
+>
+> 签名密钥库**不在仓库内**。构建时需自行提供：
+>
+> ```bash
+> # 密钥库路径默认 $HOME/.m365-gateway/m365-gateway-v2.jks，可用 KS 覆盖
+> KS_PASS=你的口令 bash packaging/build-v3-fixed.sh /path/to/base.apk /path/to/out
+> ```
+>
+> 首次运行会自动生成密钥库。**请立刻备份到仓库之外** —— 密钥一旦丢失，后续版本
+> 无法覆盖安装。
+>
+> 免责声明与上游一致，见下文。
+
+---
+
 # M365 Copilot2API
 
 <p align="center">
@@ -90,27 +126,6 @@ M365 Copilot2API 是一个用 Go 编写的自托管网关，把微软 365 Copilo
 - Go 1.23+（`go.mod` 声明的最低版本）
 - Windows / Linux 均可；Windows 上推荐用仓库自带的 `manage.py` 管理生命周期
 
-### 预编译二进制（推荐）
-
-从 [GitHub Releases](https://github.com/HEXUXIU/M365-Copilot2API/releases) 下载对应平台的二进制：
-
-| 平台 | 架构 | 文件 |
-|------|------|------|
-| Linux | x86_64 / arm64 / i386 | `m365-copilot2api-linux-{amd64,arm64,386}` |
-| Windows | x86_64 / arm64 / i386 | `m365-copilot2api-windows-{amd64,arm64,386}.exe` |
-| macOS | x86_64 / arm64 | `m365-copilot2api-darwin-{amd64,arm64}` |
-
-```bash
-# Linux / macOS 示例
-chmod +x m365-copilot2api-linux-amd64
-./m365-copilot2api-linux-amd64
-```
-
-```powershell
-# Windows 示例
-.\m365-copilot2api-windows-amd64.exe
-```
-
 ### 源码编译
 
 ```powershell
@@ -147,7 +162,7 @@ python manage.py stop     # 停止服务
 
 ### Docker 部署
 
-> 官方不提供 Dockerfile。如需容器化部署，可自行基于预编译二进制或源码构建镜像，或在 Discussions 交流社区方案。
+> 由于个人精力有限且不做容器化维护，官方停止提供 Dockerfile / docker-compose 部署。需要容器部署的用户请自行根据原生环境打包，或在 Discussions 交流社区自建的 Docker 方案。
 
 ### 初始化与第一次调用
 
@@ -207,12 +222,12 @@ python manage.py stop     # 停止服务
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
 | `M365_TOOL_PLANNING_MODE` | `router` | 工具规划模式：`router`（网关路由规划）/ `native`（云端原生规划） |
-| `M365_MAX_TOOL_CALLS_PER_TURN` | `1` | 单轮最多并行工具调用数（有副作用操作自动降为串行） |
-| `M365_MAX_TOOL_ROUNDS` | `16` | 单次请求最大工具轮次 |
-| `M365_CONTEXT_WINDOW` | `128000` | 上下文窗口 |
+| `M365_MAX_TOOL_CALLS_PER_TURN` | `32` | 单轮最多并行工具调用数（有副作用操作自动降为串行） |
+| `M365_MAX_TOOL_ROUNDS` | `512` | 单次请求最大工具轮次 |
+| `M365_CONTEXT_WINDOW` | `262144` | 上下文窗口 |
 | `M365_MAX_OUTPUT_TOKENS` | `16384` | 最大输出 Token |
-| `M365_CHAT_TIMEOUT_SECONDS` | `120` | 聊天超时（秒） |
-| `M365_IMAGE_TIMEOUT_SECONDS` | `150` | 图片处理超时（秒） |
+| `M365_CHAT_TIMEOUT_SECONDS` | `600` | 聊天超时（秒） |
+| `M365_IMAGE_TIMEOUT_SECONDS` | `180` | 图片处理超时（秒） |
 
 ### 代理池与认证
 
@@ -221,9 +236,8 @@ python manage.py stop     # 停止服务
 | `M365_PROXY_POOL` | 空 | 代理列表（逗号或换行分隔，支持 http / https / socks5） |
 | `M365_PROXY_INSECURE_TLS` | — | 信任自签代理证书（`1` / `true`） |
 | `M365_PROXY_HEALTH_URL` | 默认探测地址 | 代理健康检查目标 |
-| `M365_BROWSER_CLIENT_ID` / `M365_BROWSER_AUTHORITY` / `M365_BROWSER_REDIRECT_URI` / `M365_BROWSER_SCOPE` | 内置 | 浏览器 PKCE 的 OAuth 配置 |
-| `M365_DEVICE_CLIENT_ID` / `M365_DEVICE_AUTHORITY` / `M365_DEVICE_SCOPE` | 内置 | Device Code 的 OAuth 配置 |
-| `M365_CLIENT_ID` / `M365_AUTHORITY` / `M365_REDIRECT_URI` / `M365_SCOPE` | 内置 | 兼容旧配置；流程专用变量未设置时作为回退 |
+| `M365_CLIENT_ID` | 内置 | Azure 应用 Client ID |
+| `M365_AUTHORITY` / `M365_REDIRECT_URI` / `M365_SCOPE` | 内置 | OAuth 端点自定义覆盖 |
 
 ### 数据文件
 

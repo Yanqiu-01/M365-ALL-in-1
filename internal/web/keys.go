@@ -22,14 +22,6 @@ type apiKeyRecord struct {
 	LastUsedAt *time.Time `json:"lastUsedAt,omitempty"`
 	Revoked    bool       `json:"revoked"`
 }
-
-// apiKeyIdentity is the non-secret identity attached to an authenticated
-// request. Resource ownership must use the stable record ID rather than the
-// caller-supplied secret (or a short prefix that can collide).
-type apiKeyIdentity struct {
-	ID     string
-	Prefix string
-}
 type apiKeyStore struct {
 	mu      sync.Mutex
 	Path    string
@@ -179,32 +171,20 @@ func (s *apiKeyStore) update(id, name string, revoked *bool) (bool, error) {
 	return true, nil
 }
 func (s *apiKeyStore) valid(raw string) bool {
-	_, ok := s.authenticate(raw)
-	return ok
-}
-
-func (s *apiKeyStore) authenticate(raw string) (apiKeyIdentity, bool) {
 	s.mu.Lock()
 	h := keyHash(raw)
-	var identity apiKeyIdentity
+	found := false
 	for i := range s.Keys {
 		if s.Keys[i].Hash == h && !s.Keys[i].Revoked {
 			now := time.Now()
 			s.Keys[i].LastUsedAt = &now
-			identity.ID = s.Keys[i].ID
-			if identity.ID == "" {
-				identity.ID = h[:16]
-			}
-			identity.Prefix = s.Keys[i].Prefix
-			if identity.Prefix == "" {
-				identity.Prefix = redactAPIKey(raw)
-			}
+			found = true
 			break
 		}
 	}
 	s.mu.Unlock()
-	if identity.ID != "" {
+	if found {
 		s.persist.markDirty()
 	}
-	return identity, identity.ID != ""
+	return found
 }

@@ -9,11 +9,16 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 )
 
 func main() {
+	if f := openGatewayLog(); f != nil {
+		defer f.Close()
+		log.SetOutput(f)
+	}
 	web.ApplyStartupSettingsEnv()
 	if err := outbound.ConfigureFromEnv(); err != nil {
 		log.Fatalf("configure outbound proxy: %v", err)
@@ -24,8 +29,6 @@ func main() {
 	}
 	s.InitM365CloudClient()
 	s.StartAutoCleanup()
-	s.StartConvCacheGC()
-	s.RefreshExpiredTokens()
 	listen := "127.0.0.1:4141"
 	if v := os.Getenv("M365_LISTEN"); v != "" {
 		listen = v
@@ -54,4 +57,23 @@ func main() {
 	}
 	web.StopPersistLoop()
 	log.Println("shutdown complete")
+}
+
+func openGatewayLog() *os.File {
+	f, err := os.OpenFile(gatewayLogPath(), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return nil
+	}
+	return f
+}
+
+func gatewayLogPath() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return filepath.Join(".", "m365-gateway.log")
+	}
+	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+		exe = resolved
+	}
+	return filepath.Join(filepath.Dir(exe), "m365-gateway.log")
 }

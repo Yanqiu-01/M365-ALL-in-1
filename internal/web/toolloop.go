@@ -51,60 +51,112 @@ type rejectedToolCall struct {
 func validateDetectedToolCalls(calls []detectedToolCall, tools []map[string]any, choice any) ([]detectedToolCall, []rejectedToolCall) {
 	valid := make([]detectedToolCall, 0, len(calls))
 	rejected := make([]rejectedToolCall, 0)
+	seenCalls := make(map[string]struct{}, len(calls))
+	seenIDs := make(map[string]struct{}, len(calls))
 	for _, call := range calls {
-		fn := toolFunction(call.Name, tools)
+		requestedName := strings.TrimSpace(call.Name)
+		name, fn := declaredTool(requestedName, tools)
 		if fn == nil {
-			rejected = append(rejected, rejectedToolCall{Name: call.Name, Reason: "tool was not declared by the client"})
+			rejected = append(rejected, rejectedToolCall{Name: requestedName, Reason: "tool was not declared by the client"})
 			continue
 		}
+		call.Name = name
 		if !toolChoiceAllows(choice, call.Name) {
 			rejected = append(rejected, rejectedToolCall{Name: call.Name, Reason: "tool_choice does not allow this tool"})
 			continue
 		}
 		args := map[string]any{}
-		if len(call.Arguments) == 0 || string(call.Arguments) == "null" {
-			call.Arguments = json.RawMessage(`{}`)
+		rawArgs := strings.TrimSpace(string(call.Arguments))
+		if rawArgs == "" || rawArgs == "null" {
+			args = map[string]any{}
 		} else if err := json.Unmarshal(call.Arguments, &args); err != nil {
 			rejected = append(rejected, rejectedToolCall{Name: call.Name, Reason: "arguments are not a JSON object"})
 			continue
+		}
+		if args == nil {
+			args = map[string]any{}
 		}
 		if err := schemaValid(args, fn); err != nil {
 			rejected = append(rejected, rejectedToolCall{Name: call.Name, Reason: err.Error()})
 			continue
 		}
+		encoded, err := json.Marshal(args)
+		if err != nil {
+			rejected = append(rejected, rejectedToolCall{Name: call.Name, Reason: "arguments could not be normalized"})
+			continue
+		}
+		call.Arguments = encoded
+		signature := call.Name + "\x00" + string(call.Arguments)
+		if _, duplicate := seenCalls[signature]; duplicate {
+			// SignalR can replay a terminal tool frame. Suppressing an identical
+			// validated call is safer than executing a side effect twice.
+			continue
+		}
+		seenCalls[signature] = struct{}{}
 		if call.ID == "" {
 			call.ID = callID(call.Name, string(call.Arguments), len(valid))
+		} else if _, duplicate := seenIDs[call.ID]; duplicate {
+			call.ID = callID(call.Name, string(call.Arguments), len(valid))
 		}
-		if call.Type == "" {
-			call.Type = toolType(call.Name, tools)
-		}
+		seenIDs[call.ID] = struct{}{}
+		// Type is transport metadata, not an upstream authority. Serialize the
+		// caller-declared type so a fabricated native frame cannot alter it.
+		call.Type = toolType(call.Name, tools)
 		valid = append(valid, call)
 	}
 	return valid, rejected
 }
 
+func requestedToolChoiceName(choice any) string {
+	m, ok := choice.(map[string]any)
+	if !ok {
+		return ""
+	}
+	if f, ok := m["function"].(map[string]any); ok {
+		if n, ok := f["name"].(string); ok {
+			return strings.TrimSpace(n)
+		}
+	}
+	if n, ok := m["name"].(string); ok {
+		return strings.TrimSpace(n)
+	}
+	return ""
+}
+
+// toolChoiceRequiresToolCall reports modes where accepting an empty decision
+// would silently downgrade an explicit client request into ordinary prose.
+func toolChoiceRequiresToolCall(choice any) bool {
+	if requestedToolChoiceName(choice) != "" {
+		return true
+	}
+	s, ok := choice.(string)
+	return ok && strings.EqualFold(strings.TrimSpace(s), "required")
+}
+
 func toolChoiceAllows(choice any, name string) bool {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return false
+	}
 	if choice == nil {
 		return true
 	}
 	if s, ok := choice.(string); ok {
-		return s != "none" && (s != "required" || name != "")
+		switch strings.ToLower(strings.TrimSpace(s)) {
+		case "none":
+			return false
+		case "", "auto", "required":
+			return true
+		default:
+			return true
+		}
 	}
-	if m, ok := choice.(map[string]any); ok {
-		if f, ok := m["function"].(map[string]any); ok {
-			n, _ := f["name"].(string)
-			return n == name
-		}
-		if n, ok := m["name"].(string); ok {
-			return n == name
-		}
+	if requested := requestedToolChoiceName(choice); requested != "" {
+		return requested == name
 	}
 	return true
 }
 
-// callID returns a globally unique tool call id. Content hashes previously
-// collided when the same tool+arguments was invoked again (duplicate tool call
-// id errors from clients), so uniqueness must not depend on call content.
 func callID(name, args string, index int) string {
 	return "call_" + uuid.NewString()
 }
@@ -123,7 +175,6 @@ func extractToolCalls(text string, tools []map[string]any, choice any) ([]detect
 	if arr, ok := raw.([]any); ok {
 		items = arr
 	}
-	allowed := allowedToolNames(tools)
 	out := make([]detectedToolCall, 0, len(items))
 	for i, item := range items {
 		m, ok := item.(map[string]any)
@@ -131,13 +182,15 @@ func extractToolCalls(text string, tools []map[string]any, choice any) ([]detect
 			continue
 		}
 		n, _ := m["name"].(string)
-		if !allowed[n] || !toolChoiceAllows(choice, n) {
+		name, fn := declaredTool(n, tools)
+		if fn == nil || !toolChoiceAllows(choice, name) {
 			continue
 		}
 		a, _ := json.Marshal(m["arguments"])
-		out = append(out, detectedToolCall{ID: callID(n, string(a), i), Type: toolType(n, tools), Name: n, Arguments: a})
+		out = append(out, detectedToolCall{ID: callID(name, string(a), i), Type: toolType(name, tools), Name: name, Arguments: a})
 	}
-	return out, len(out) > 0
+	valid, _ := validateDetectedToolCalls(out, tools, choice)
+	return valid, len(valid) > 0
 }
 
 func validateToolResult(messages []oaiMsg, known map[string]bool) error {
@@ -210,25 +263,6 @@ func isToolRefusal(text string) bool {
 	return false
 }
 
-var contentPolicyPatterns = []string{
-	"很抱歉，我无法响应",
-	"我很抱歉，我无法响应",
-	"i'm sorry, i can't respond",
-	"i'm sorry, i cannot respond",
-}
-
-func isContentPolicyBlock(text string) bool {
-	if len(text) > 300 {
-		return false
-	}
-	low := strings.ToLower(text)
-	for _, p := range contentPolicyPatterns {
-		if strings.Contains(low, strings.ToLower(p)) {
-			return true
-		}
-	}
-	return false
-}
 var sandboxHallucinationPatterns = []string{
 	"I can run that for you",
 	"I'll run that",

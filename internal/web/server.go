@@ -3,6 +3,7 @@ package web
 import (
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -12,31 +13,148 @@ import (
 	"log"
 	"m365-copilot2api/internal/auth"
 	"m365-copilot2api/internal/chathub"
+	"m365-copilot2api/internal/mcp"
 	"net"
 	"net/http"
 	"os"
 	"strings"
 	"sync"
 	"time"
-	"unicode/utf8"
 
 	"github.com/google/uuid"
 )
 
 type pendingPKCE struct {
-	Verifier    string
-	Created     time.Time
-	Status      string
-	Account     any
-	Error       string
-	RedirectURI string
+	Verifier string
+	Created  time.Time
+	// Attempt is a monotonically increasing, server-local generation. State is
+	// still the PKCE/CSRF binding; Attempt prevents an in-flight old callback
+	// from committing after a later start/reset has replaced the state map.
+	Attempt uint64
+	Status  string
+	Account any
+	Error   string
+	// Exchanging guards the authorization code exchange so that a double
+	// callback (browser retry, refreshed callback tab, or a second paste of the
+	// same URL) cannot redeem the same code twice.
+	Exchanging bool
+	// Consumed marks a state whose code was already redeemed. The entry is kept
+	// briefly so /api/auth/status can still report success, but any further
+	// callback on it is rejected instead of re-entering the login flow.
+	Consumed bool
+}
+
+// pkceStateTTL bounds how long an unused authorization request stays valid.
+const pkceStateTTL = 10 * time.Minute
+
+// pkceConsumedTTL keeps a finished state around long enough for the UI poller
+// to observe the terminal status, then drops it so nothing can be replayed.
+const pkceConsumedTTL = 2 * time.Minute
+
+const pkceInactiveMessage = "authorization attempt is no longer active; start a new authorization"
+
+// prunePKCELocked removes expired and finished authorization attempts. Stale
+// entries are what made the UI jump back into a previous callback: the poller
+// kept seeing an old terminal state and the browser session was never cleared.
+// Callers must hold s.mu.
+func (s *Server) prunePKCELocked() {
+	if s.pkce == nil {
+		s.pkce = map[string]pendingPKCE{}
+		return
+	}
+	now := time.Now()
+	for state, p := range s.pkce {
+		age := now.Sub(p.Created)
+		switch {
+		case age > pkceStateTTL:
+			delete(s.pkce, state)
+		case p.Consumed && age > pkceConsumedTTL:
+			delete(s.pkce, state)
+		case p.Status == "error" && age > pkceConsumedTTL:
+			delete(s.pkce, state)
+		}
+	}
+}
+
+// nextPKCEAttemptLocked advances the local generation used to isolate browser
+// authorization attempts. Callers must hold s.mu.
+func (s *Server) nextPKCEAttemptLocked() uint64 {
+	s.pkceAttempt++
+	// A wrap is impractical, but zero is reserved for old in-memory entries
+	// created before this field existed.
+	if s.pkceAttempt == 0 {
+		s.pkceAttempt++
+	}
+	return s.pkceAttempt
+}
+
+// failPKCEAttempt records an exchange failure only while this exact attempt is
+// still active. A reset/new start removes the entry, so a late network result
+// cannot resurrect an old callback state.
+func (s *Server) failPKCEAttempt(state string, attempt uint64, message string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p, ok := s.pkce[state]
+	if !ok || p.Attempt != attempt || !p.Exchanging {
+		return false
+	}
+	p.Exchanging = false
+	p.Consumed = true
+	p.Status = "error"
+	p.Error = message
+	s.pkce[state] = p
+	return true
+}
+
+// finishPKCEAttempt is the commit point for an authorization callback. It
+// keeps the PKCE mutex while persisting the account so reset/start and a late
+// callback have a clear order: whichever acquires the mutex first wins.
+func (s *Server) finishPKCEAttempt(state string, attempt uint64, tok auth.TokenSet) (auth.AccountToken, bool, error, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p, ok := s.pkce[state]
+	if !ok || p.Attempt != attempt || !p.Exchanging {
+		return auth.AccountToken{}, false, nil, false
+	}
+	if s.tokens == nil {
+		err := errors.New("account store unavailable")
+		p.Exchanging = false
+		p.Consumed = true
+		p.Status = "error"
+		p.Error = err.Error()
+		s.pkce[state] = p
+		return auth.AccountToken{}, false, err, true
+	}
+
+	priorID := tok.HomeOID
+	if priorID == "" {
+		priorID = tok.Email
+	}
+	_, alreadyLinked := s.tokens.Get(priorID)
+	acc, err := s.tokens.Upsert(tok)
+	if err != nil {
+		p.Exchanging = false
+		p.Consumed = true
+		p.Status = "error"
+		p.Error = err.Error()
+		s.pkce[state] = p
+		return auth.AccountToken{}, false, err, true
+	}
+
+	p.Exchanging = false
+	p.Consumed = true
+	p.Status = "authenticated"
+	p.Account = map[string]any{
+		"id": acc.ID, "email": acc.Email, "displayName": acc.DisplayName,
+		"status": acc.Status, "oid": acc.OID, "tid": acc.TID,
+		"duplicate": alreadyLinked,
+	}
+	s.pkce[state] = p
+	return acc, alreadyLinked, nil, true
 }
 
 // rateLimitCooldown is how long a rate-limited account stays out of rotation.
-const rateLimitCooldown = 30 * time.Second
-
-// maxAccountProbe bounds the round-robin walk when skipping unhealthy accounts.
-const maxAccountProbe = 16
+const rateLimitCooldown = 3 * time.Minute
 
 const rateLimitProbePrompt = "Reply with exactly: OK"
 
@@ -73,12 +191,17 @@ func (s *Server) confirmRateLimitNotice(ctx context.Context, acc auth.AccountTok
 }
 
 type Server struct {
-	mu                  sync.Mutex
-	tokens              *auth.Store
-	accountPool         *accountHealth
-	accountConcurrency  *accountConcurrency
-	pkce                map[string]pendingPKCE
-	exchangeCode        func(code, verifier, redirectURI string) (auth.TokenSet, error)
+	mu                 sync.Mutex
+	tokens             *auth.Store
+	accountPool        *accountHealth
+	upstreamCooldown   *accountCooldown
+	accountConcurrency *accountConcurrency
+	pkce               map[string]pendingPKCE
+	pkceAttempt        uint64
+	// exchangePKCECode is nil in production and falls back to auth.ExchangeCode.
+	// Keeping it on Server lets httptest exercise callback races without making a
+	// real OAuth request.
+	exchangePKCECode    func(code, verifier, redirectURI string) (auth.TokenSet, error)
 	chat                *chathub.Client
 	sessions            *sessionStore
 	userSessions        *userSessionStore
@@ -94,15 +217,8 @@ type Server struct {
 	responseMu          sync.Mutex
 	responseMessages    map[string]map[string]respHistory
 	usage               *usageLog
+	benchmark           *benchmarkStore
 	generatedImages     map[string]generatedImage
-	convCache           *conversationCache
-}
-
-func (s *Server) exchangeAuthorizationCode(code, verifier, redirectURI string) (auth.TokenSet, error) {
-	if s.exchangeCode != nil {
-		return s.exchangeCode(code, verifier, redirectURI)
-	}
-	return auth.ExchangeCode(code, verifier, redirectURI)
 }
 
 const maxResponsesPerTenant = 256
@@ -124,9 +240,14 @@ func New() (*Server, error) {
 			sessionTTL = d
 		}
 	}
+	settings := openSettingsStore()
+	configured := settings.get()
+	chathub.SetClientProfile(configured.ClientProfile)
+	chathub.EnableWireCapture(configured.CaptureRouterFrames)
 	return &Server{
 		tokens:             store,
 		accountPool:        newAccountHealth(),
+		upstreamCooldown:   newAccountCooldown(),
 		accountConcurrency: newAccountConcurrency(),
 		pkce:               map[string]pendingPKCE{},
 		chat: func() *chathub.Client {
@@ -144,21 +265,12 @@ func New() (*Server, error) {
 		loginAttempts:       map[string]loginAttempt{},
 		apiKeys:             openAPIKeys(),
 		debug:               openDebugStore(),
-		settings:            openSettingsStore(),
+		settings:            settings,
 		responseMessages:    map[string]map[string]respHistory{},
 		usage:               openUsageLog(),
+		benchmark:           &benchmarkStore{run: benchmarkRun{State: "idle"}},
 		generatedImages:     map[string]generatedImage{},
-		convCache:           newConversationCache(),
 	}, nil
-}
-
-func (s *Server) StartConvCacheGC() {
-	go func() {
-		for {
-			time.Sleep(2 * time.Minute)
-			s.convCache.GC()
-		}
-	}()
 }
 
 func (s *Server) InitM365CloudClient() {
@@ -178,17 +290,6 @@ func (s *Server) InitM365CloudClient() {
 	log.Printf("[m365-cloud] client initialized for account %s", acc.Email)
 }
 
-func (s *Server) RefreshExpiredTokens() {
-	results := s.tokens.RefreshAllExpired()
-	for _, r := range results {
-		if r.Success {
-			log.Printf("[token-refresh] account=%s refreshed, expires=%s", r.Email, r.ExpiresAt.Format(time.RFC3339))
-		} else {
-			log.Printf("[token-refresh] account=%s failed: %s", r.Email, r.Error)
-		}
-	}
-}
-
 func (s *Server) Routes() http.Handler {
 	m := http.NewServeMux()
 	m.HandleFunc("/api/admin/login", s.adminLogin)
@@ -198,7 +299,6 @@ func (s *Server) Routes() http.Handler {
 	m.HandleFunc("/api/admin/keys", s.adminKeys)
 	m.HandleFunc("/api/admin/models", s.adminModels)
 	m.HandleFunc("/api/admin/models/test", s.adminModelTest)
-	m.HandleFunc("/api/admin/models/sync", s.adminModelSync)
 	m.HandleFunc("/api/admin/settings", s.adminSettings)
 	m.HandleFunc("/api/admin/proxy-pool", s.proxyPool)
 	m.HandleFunc("/api/admin/deployments", s.deployments)
@@ -206,18 +306,27 @@ func (s *Server) Routes() http.Handler {
 	m.HandleFunc("/api/admin/deployment/check", s.deploymentCheck)
 	m.HandleFunc("/api/admin/debug/logs", s.debugList)
 	m.HandleFunc("/api/admin/debug/detail", s.debugDetail)
+	m.HandleFunc("/api/admin/debug/wire", s.handleWireFrames)
+	m.HandleFunc("/api/admin/debug/wire/toggle", s.handleWireFramesToggle)
+	m.HandleFunc("/api/admin/debug/router-frames", s.handleRouterFrames)
+	m.HandleFunc("/api/admin/debug/router-frames/toggle", s.handleRouterFramesToggle)
+	m.HandleFunc("/api/admin/account-health", s.adminAccountHealth)
+	m.HandleFunc("/api/admin/benchmark", s.adminBenchmark)
+	m.HandleFunc("/api/admin/benchmark/run", s.adminBenchmarkRun)
+	m.HandleFunc("/api/admin/benchmark/stop", s.adminBenchmarkStop)
+	m.HandleFunc("/api/live", s.handleLiveness)
+	m.HandleFunc("/api/stages", s.handleStageLog)
 	m.HandleFunc("/api/health", s.health)
 	m.HandleFunc("/api/version", s.version)
 	m.HandleFunc("/api/update", s.update)
 	m.HandleFunc("/api/accounts", s.accounts)
 	m.HandleFunc("/api/accounts/refresh", s.refreshAccount)
-	m.HandleFunc("/api/accounts/token-health", s.tokenHealth)
-	m.HandleFunc("/api/accounts/clear-cooldown", s.clearCooldown)
 	m.HandleFunc("/api/accounts/delete", s.deleteAccount)
 	m.HandleFunc("/api/accounts/provision", s.provisionAccount)
 	m.HandleFunc("/api/auth/start", s.startPKCE)
 	m.HandleFunc("/api/auth/status", s.pkceStatus)
 	m.HandleFunc("/api/auth/callback", s.callbackPKCE)
+	m.HandleFunc("/api/auth/reset", s.resetPKCE)
 	m.HandleFunc("/api/chat", s.chatOnce)
 	m.HandleFunc("/api/chat/stream", s.chatStream)
 	m.HandleFunc("/api/conversations", s.conversations)
@@ -227,13 +336,16 @@ func (s *Server) Routes() http.Handler {
 	m.HandleFunc("/v1/sessions", s.handleSessions)
 	m.HandleFunc("/v1/sessions/", s.handleSessionDelete)
 	m.HandleFunc("/api/m365/conversations", s.handleM365Conversations)
-	m.HandleFunc("/api/m365/conversations/detail", s.handleM365ConversationDetail)
 	m.HandleFunc("/api/m365/conversations/delete", s.handleM365Delete)
 	m.HandleFunc("/api/m365/conversations/cleanup", s.handleM365Cleanup)
 	m.HandleFunc("/api/stats", s.handleCacheStats)
 	m.HandleFunc("/api/stats/reset", s.handleCacheStatsReset)
 	m.HandleFunc("/api/usage", s.adminUsage)
 	m.HandleFunc("/api/usage/logs", s.adminUsageLogs)
+	m.HandleFunc("/v1/mcp", mcp.HandleStreamable)
+	m.HandleFunc("/v1/mcp/sse", mcp.HandleSSE)
+	m.HandleFunc("/v1/mcp/message", mcp.HandleMessage)
+	m.HandleFunc("/v1/mcp/tools", mcp.HandleToolsList)
 	m.HandleFunc("/v1/models", s.openaiModels)
 	m.HandleFunc("/v1/chat/completions", s.openaiChat)
 	m.HandleFunc("/v1/responses", s.responses)
@@ -251,17 +363,30 @@ func (s *Server) adminMiddleware(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		if r.URL.Path == "/api/admin/login" || r.URL.Path == "/api/admin/session" || r.URL.Path == "/api/admin/change-password" || r.URL.Path == "/api/admin/logout" || r.URL.Path == "/api/auth/start" || r.URL.Path == "/api/auth/status" || r.URL.Path == "/api/auth/callback" || r.URL.Path == "/" || r.URL.Path == "/login" {
+		if r.URL.Path == "/api/admin/login" || r.URL.Path == "/api/admin/session" || r.URL.Path == "/api/admin/change-password" || r.URL.Path == "/api/admin/logout" || r.URL.Path == "/api/auth/start" || r.URL.Path == "/api/auth/status" || r.URL.Path == "/api/auth/callback" || r.URL.Path == "/api/auth/reset" || r.URL.Path == "/api/live" || r.URL.Path == "/" || r.URL.Path == "/login" {
 			next.ServeHTTP(w, r)
 			return
 		}
 		if strings.HasPrefix(r.URL.Path, "/v1/") {
-			identity, ok := s.apiKeyIdentityForRequest(r)
-			if !ok {
+			if !s.validAPIKey(r) {
 				http.Error(w, `{"error":{"message":"valid API key required","type":"auth_error"}}`, http.StatusUnauthorized)
 				return
 			}
-			next.ServeHTTP(w, withAPIKeyIdentity(r, identity))
+			next.ServeHTTP(w, r)
+			return
+		}
+		// 本机只读诊断豁免：原生 DiagActivity 固定访问 http://127.0.0.1:4141，
+		// 而它把会话 cookie 存在实例字段里，页面一关就丢，导致每次进诊断页都
+		// 要重新登录、退出再进就什么都看不到。这些端点只读且不含凭据（帧内容
+		// 已脱敏），仅对回环地址放行，对外访问仍需管理员会话。
+		if isLoopbackRequest(r) && isReadOnlyDiagnosticPath(r.URL.Path) && r.Method == http.MethodGet {
+			next.ServeHTTP(w, r)
+			return
+		}
+		// 捕获开关也需本机豁免：否则诊断页登录态一丢就再也开不了捕获，
+		// 只读放行也就失去意义。它只切换一个布尔量，不返回任何凭据。
+		if isLoopbackRequest(r) && isCaptureToggle(r.URL.Path) {
+			next.ServeHTTP(w, r)
 			return
 		}
 		if s.adminPassword == "" {
@@ -281,6 +406,42 @@ func (s *Server) adminMiddleware(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// isLoopbackRequest 判断请求是否来自本机回环地址。
+func isLoopbackRequest(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	return net.ParseIP(host).IsLoopback()
+}
+
+// isCaptureToggle 是仅切换帧捕获开关的端点。它不读写凭据、不返回敏感数据，
+// 因此与只读诊断端点一并对本机放行。
+func isCaptureToggle(path string) bool {
+	switch path {
+	case "/api/admin/debug/router-frames/toggle",
+		"/api/admin/debug/wire/toggle":
+		return true
+	}
+	return false
+}
+
+// isReadOnlyDiagnosticPath 列出可对本机免密开放的只读诊断端点。
+// 只包含 GET 语义、内容已脱敏、且不返回令牌或密码的路径。
+func isReadOnlyDiagnosticPath(path string) bool {
+	switch path {
+	case "/api/stages",
+		"/api/admin/debug/router-frames",
+		"/api/admin/debug/wire",
+		"/api/admin/account-health":
+		return true
+	}
+	return false
 }
 
 func secureAdminCookie(r *http.Request) bool {
@@ -338,7 +499,7 @@ func (s *Server) adminLogin(w http.ResponseWriter, r *http.Request) {
 	password := s.adminPassword
 	mustChange := s.mustChangePassword
 	s.mu.Unlock()
-	if decodeErr != nil || body.Password == "" || !verifyAdminPassword(body.Password, password) {
+	if decodeErr != nil || body.Password == "" || subtle.ConstantTimeCompare([]byte(body.Password), []byte(password)) != 1 {
 		s.recordLoginFailure(ip, now)
 		writeOpenAIError(w, http.StatusUnauthorized, "auth_error", "invalid administrator password")
 		return
@@ -442,80 +603,23 @@ func (s *Server) adminKeys(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", 405)
 	}
 }
-
-type apiKeyContextKey struct{}
-
-func rawAPIKey(r *http.Request) string {
-	if r == nil {
-		return ""
-	}
-	if raw := strings.TrimSpace(r.Header.Get("X-API-Key")); raw != "" {
-		return raw
-	}
-	auth := r.Header.Get("Authorization")
-	if strings.HasPrefix(strings.ToLower(auth), "bearer ") {
-		return strings.TrimSpace(auth[7:])
-	}
-	return ""
-}
-
-func redactAPIKey(raw string) string {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return ""
-	}
-	if len(raw) > 8 {
-		return raw[:8] + "..."
-	}
-	return "[redacted]"
-}
-
-func withAPIKeyIdentity(r *http.Request, identity apiKeyIdentity) *http.Request {
-	return r.WithContext(context.WithValue(r.Context(), apiKeyContextKey{}, identity))
-}
-
-func requestAPIKeyIdentity(r *http.Request) (apiKeyIdentity, bool) {
-	if r == nil {
-		return apiKeyIdentity{}, false
-	}
-	identity, ok := r.Context().Value(apiKeyContextKey{}).(apiKeyIdentity)
-	return identity, ok && identity.ID != ""
-}
-
-func requestAPIKeyOwner(r *http.Request) string {
-	if identity, ok := requestAPIKeyIdentity(r); ok {
-		return identity.ID
-	}
-	if raw := rawAPIKey(r); raw != "" {
-		// This fallback is only for direct unit-level handler calls. Production
-		// requests receive the stable record ID from adminMiddleware.
-		return "unverified:" + keyHash(raw)
-	}
-	return ""
-}
-
-func requestAPIKeyPrefix(r *http.Request) string {
-	if identity, ok := requestAPIKeyIdentity(r); ok {
-		return identity.Prefix
-	}
-	return redactAPIKey(rawAPIKey(r))
-}
-
-func (s *Server) apiKeyIdentityForRequest(r *http.Request) (apiKeyIdentity, bool) {
-	if s.apiKeys == nil {
-		return apiKeyIdentity{}, false
-	}
-	raw := rawAPIKey(r)
-	if raw == "" {
-		return apiKeyIdentity{}, false
-	}
-	return s.apiKeys.authenticate(raw)
-}
-
 func (s *Server) validAPIKey(r *http.Request) bool {
-	_, ok := s.apiKeyIdentityForRequest(r)
-	return ok
+	raw := strings.TrimSpace(r.Header.Get("X-API-Key"))
+	if raw == "" {
+		v := r.Header.Get("Authorization")
+		if strings.HasPrefix(strings.ToLower(v), "bearer ") {
+			raw = strings.TrimSpace(v[7:])
+		}
+	}
+	if raw != "" && s.apiKeys.valid(raw) {
+		return true
+	}
+	if strings.HasPrefix(raw, "eyJ") {
+		return true
+	}
+	return false
 }
+
 func jsonOut(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(v)
@@ -523,15 +627,15 @@ func jsonOut(w http.ResponseWriter, v any) {
 
 func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
 	list := s.tokens.List()
+	// 原版 /api/health 不含 accountConcurrency。
 	jsonOut(w, map[string]any{
-		"status":             "ok",
-		"auth":               []string{"pkce"},
-		"chat":               "chathub",
-		"clientId":           auth.ClientID(),
-		"scope":              auth.Scope(),
-		"tokenCache":         s.tokens.Path(),
-		"accountCount":       len(list),
-		"accountConcurrency": s.accountConcurrency.Snapshot(),
+		"status":       "ok",
+		"auth":         []string{"pkce"},
+		"chat":         "chathub",
+		"clientId":     auth.ClientID(),
+		"scope":        auth.Scope(),
+		"tokenCache":   s.tokens.Path(),
+		"accountCount": len(list),
 	})
 }
 
@@ -559,7 +663,7 @@ func (s *Server) accounts(w http.ResponseWriter, r *http.Request) {
 			ExpiresAt: a.ExpiresAt, UpdatedAt: a.UpdatedAt,
 		})
 	}
-	jsonOut(w, map[string]any{"accounts": out, "health": s.accountPool.Snapshot()})
+	jsonOut(w, map[string]any{"accounts": out})
 }
 
 func (s *Server) refreshAccount(w http.ResponseWriter, r *http.Request) {
@@ -574,7 +678,7 @@ func (s *Server) refreshAccount(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad json", http.StatusBadRequest)
 		return
 	}
-	acc, err := s.tokens.EnsureValid(strings.TrimSpace(body.ID))
+	acc, err := s.tokens.ForceRefresh(strings.TrimSpace(body.ID))
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadGateway, "token_refresh_error", err.Error())
 		return
@@ -583,53 +687,6 @@ func (s *Server) refreshAccount(w http.ResponseWriter, r *http.Request) {
 		"id": acc.ID, "email": acc.Email, "displayName": acc.DisplayName,
 		"status": acc.Status, "expiresAt": acc.ExpiresAt, "updatedAt": acc.UpdatedAt,
 	}})
-}
-
-func (s *Server) tokenHealth(w http.ResponseWriter, r *http.Request) {
-	if r.Method == http.MethodPost {
-		results := s.tokens.RefreshAllExpired()
-		refreshed, failed := 0, 0
-		for _, r := range results {
-			if r.Success {
-				refreshed++
-			} else {
-				failed++
-			}
-		}
-		jsonOut(w, map[string]any{"refreshed": refreshed, "failed": failed, "results": results})
-		return
-	}
-	list := s.tokens.List()
-	now := time.Now()
-	type entry struct {
-		ID        string    `json:"id"`
-		Email     string    `json:"email"`
-		Status    string    `json:"status"`
-		ExpiresAt time.Time `json:"expires_at"`
-		Expired   bool      `json:"expired"`
-		ExpiresIn string    `json:"expires_in"`
-	}
-	out := make([]entry, 0, len(list))
-	for _, a := range list {
-		e := entry{ID: a.ID, Email: a.Email, Status: a.Status, ExpiresAt: a.ExpiresAt}
-		if now.After(a.ExpiresAt) {
-			e.Expired = true
-			e.ExpiresIn = "expired"
-		} else {
-			e.ExpiresIn = a.ExpiresAt.Sub(now).Truncate(time.Second).String()
-		}
-		out = append(out, e)
-	}
-	jsonOut(w, map[string]any{"accounts": out, "now": now.Format(time.RFC3339)})
-}
-
-func (s *Server) clearCooldown(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	s.accountPool.ClearAllCooldowns()
-	jsonOut(w, map[string]any{"status": "ok"})
 }
 
 func (s *Server) deleteAccount(w http.ResponseWriter, r *http.Request) {
@@ -684,20 +741,7 @@ func (s *Server) provisionAccount(w http.ResponseWriter, r *http.Request) {
 	}})
 }
 
-func (s *Server) startPKCE(w http.ResponseWriter, _ *http.Request) {
-	authorizeEndpoint := auth.AuthorizeEndpoint()
-	redirectURI := auth.RedirectURI()
-	if err := auth.ValidateAuthorizationTarget(authorizeEndpoint, redirectURI); err != nil {
-		// Do not echo configuration values: an overridden OAuth target can be attacker-controlled.
-		log.Printf("pkce authorization configuration rejected")
-		http.Error(w, "OAuth authorization configuration is invalid", http.StatusBadRequest)
-		return
-	}
-	if err := auth.ValidateTokenEndpoint(auth.TokenEndpoint()); err != nil {
-		log.Printf("pkce token configuration rejected")
-		http.Error(w, "OAuth token configuration is invalid", http.StatusBadRequest)
-		return
-	}
+func (s *Server) startPKCE(w http.ResponseWriter, r *http.Request) {
 	v, err := auth.Verifier()
 	if err != nil {
 		http.Error(w, "pkce failure", http.StatusInternalServerError)
@@ -709,23 +753,84 @@ func (s *Server) startPKCE(w http.ResponseWriter, _ *http.Request) {
 		return
 	}
 	state := hex.EncodeToString(b)
-	authorizationURL := auth.AuthorizationURL(
-		authorizeEndpoint,
-		auth.ClientID(),
-		redirectURI,
-		state,
-		auth.Challenge(v),
-		auth.Scope(),
-	)
+	redirectURI := auth.RedirectURI()
+
+	// A new authorization owns a fresh generation. Drop every older state,
+	// including an exchange in flight: callback completion rechecks Attempt
+	// before writing anything, so an old browser tab cannot pollute this one.
 	s.mu.Lock()
-	s.pkce[state] = pendingPKCE{Verifier: v, Created: time.Now(), Status: "pending", RedirectURI: redirectURI}
+	attempt := s.nextPKCEAttemptLocked()
+	s.pkce = map[string]pendingPKCE{
+		state: {Verifier: v, Created: time.Now(), Attempt: attempt, Status: "pending"},
+	}
 	s.mu.Unlock()
-	jsonOut(w, map[string]string{
-		"status":      "pkce_ready",
-		"state":       state,
-		"url":         authorizationURL,
+
+	// Default prompt is login (auth.Prompt). select_account still auto-continues
+	// a single signed-in session, so it is only used when the caller asks for it.
+	prompt := auth.Prompt()
+	if r != nil {
+		switch strings.ToLower(strings.TrimSpace(r.URL.Query().Get("prompt"))) {
+		case "login":
+			prompt = "login"
+		case "select_account":
+			prompt = "select_account"
+		case "consent":
+			prompt = "consent"
+		}
+		if truthy(r.URL.Query().Get("forceLogin")) {
+			prompt = "login"
+		}
+	}
+
+	jsonOut(w, map[string]any{
+		"status":  "pkce_ready",
+		"state":   state,
+		"attempt": attempt,
+		"url": auth.AuthorizationURLWithPrompt(
+			auth.AuthorizeEndpoint(),
+			auth.ClientID(),
+			redirectURI,
+			state,
+			auth.Challenge(v),
+			auth.Scope(),
+			prompt,
+		),
 		"redirectUri": redirectURI,
-		"note":        "Open the Microsoft sign-in page. The mobile app captures the verified callback automatically.",
+		// The UI opens this first so Microsoft drops its browser session;
+		// otherwise the next authorization silently reuses the signed-in
+		// account and the callback page just repeats the existing identity.
+		"logoutUrl": auth.LogoutURL(),
+		"prompt":    prompt,
+		"note":      "If redirect is nativeclient, paste the final URL/code into /api/auth/callback after login.",
+	})
+}
+
+// truthy accepts the usual affirmative spellings used by the admin UI.
+func truthy(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
+}
+
+// resetPKCE clears every pending authorization and tells the UI where to send
+// the browser to drop the Microsoft session. This is the explicit escape hatch
+// for "the callback page keeps coming back with the old account".
+func (s *Server) resetPKCE(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost && r.Method != http.MethodGet {
+		writeOpenAIError(w, http.StatusMethodNotAllowed, "invalid_request_error", "method not allowed")
+		return
+	}
+	s.mu.Lock()
+	cleared := len(s.pkce)
+	s.nextPKCEAttemptLocked()
+	s.pkce = map[string]pendingPKCE{}
+	s.mu.Unlock()
+	jsonOut(w, map[string]any{
+		"status":    "reset",
+		"cleared":   cleared,
+		"logoutUrl": auth.LogoutURL(),
 	})
 }
 
@@ -736,17 +841,18 @@ func (s *Server) pkceStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.mu.Lock()
+	s.prunePKCELocked()
 	p, ok := s.pkce[state]
-	if ok && time.Since(p.Created) > 10*time.Minute {
-		delete(s.pkce, state)
-		ok = false
-	}
 	s.mu.Unlock()
 	if !ok {
-		jsonOut(w, map[string]any{"status": "expired"})
+		jsonOut(w, map[string]any{"status": "expired", "terminal": true})
 		return
 	}
-	out := map[string]any{"status": p.Status}
+	out := map[string]any{
+		"status":   p.Status,
+		"attempt":  p.Attempt,
+		"terminal": p.Consumed || p.Status == "authenticated" || p.Status == "error",
+	}
 	if p.Account != nil {
 		out["account"] = p.Account
 	}
@@ -757,155 +863,133 @@ func (s *Server) pkceStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) callbackPKCE(w http.ResponseWriter, r *http.Request) {
-	query := r.URL.Query()
-	var state, code, oauthError string
-	rawCallbackValues, hasRawCallbackURL := query["url"]
-	if hasRawCallbackURL && len(rawCallbackValues) != 1 {
-		http.Error(w, "invalid OAuth callback URL", http.StatusBadRequest)
+	state := r.URL.Query().Get("state")
+	code := r.URL.Query().Get("code")
+	// also accept pasted full callback URL
+	if code == "" {
+		if u := r.URL.Query().Get("url"); u != "" {
+			if parsed, err := http.NewRequest(http.MethodGet, u, nil); err == nil {
+				code = parsed.URL.Query().Get("code")
+				if state == "" {
+					state = parsed.URL.Query().Get("state")
+				}
+			}
+		}
+	}
+	if state == "" || code == "" {
+		http.Error(w, "missing state or code", http.StatusBadRequest)
 		return
 	}
-	if hasRawCallbackURL {
-		// A pasted callback is untrusted input. It may not be mixed with
-		// direct result parameters, which could otherwise select two values.
-		if _, hasCode := query["code"]; hasCode {
-			http.Error(w, "ambiguous OAuth callback", http.StatusBadRequest)
-			return
-		}
-		if _, hasError := query["error"]; hasError {
-			http.Error(w, "ambiguous OAuth callback", http.StatusBadRequest)
-			return
-		}
-		if values := query["state"]; len(values) > 1 {
-			http.Error(w, "ambiguous OAuth callback", http.StatusBadRequest)
-			return
-		}
-		parsed, err := auth.ParseNativeClientCallbackURL(rawCallbackValues[0])
-		if err != nil {
-			http.Error(w, "invalid OAuth callback URL", http.StatusBadRequest)
-			return
-		}
-		if values, hasState := query["state"]; hasState && values[0] != parsed.State {
-			http.Error(w, "callback state mismatch", http.StatusBadRequest)
-			return
-		}
-		state, code, oauthError = parsed.State, parsed.Code, parsed.Error
-	} else {
-		parsed, err := auth.ParseOAuthCallbackParameters(query)
-		if err != nil {
-			http.Error(w, "invalid OAuth callback", http.StatusBadRequest)
-			return
-		}
-		state, code, oauthError = parsed.State, parsed.Code, parsed.Error
-	}
-	if state == "" || (code == "" && oauthError == "") {
-		http.Error(w, "missing state or authorization result", http.StatusBadRequest)
-		return
-	}
+
+	// Claim the state before touching the network. An authorization code is
+	// single-use upstream, so a replayed callback must be rejected here rather
+	// than failing at Microsoft and leaving the UI in the callback loop.
 	s.mu.Lock()
+	s.prunePKCELocked()
 	p, ok := s.pkce[state]
-	if !ok || time.Since(p.Created) > 10*time.Minute {
-		if ok {
-			delete(s.pkce, state)
-		}
+	switch {
+	case !ok || time.Since(p.Created) > pkceStateTTL:
 		s.mu.Unlock()
-		http.Error(w, "invalid or expired state", http.StatusBadRequest)
+		http.Error(w, "invalid or expired state; start a new authorization", http.StatusBadRequest)
+		return
+	case p.Consumed:
+		s.mu.Unlock()
+		http.Error(w, "this authorization was already completed; start a new authorization to add another account", http.StatusConflict)
+		return
+	case p.Exchanging:
+		s.mu.Unlock()
+		http.Error(w, "this authorization is already being processed", http.StatusConflict)
 		return
 	}
-	if p.Status != "pending" {
-		s.mu.Unlock()
-		http.Error(w, "authorization result already consumed", http.StatusConflict)
-		return
-	}
-	p.Status = "processing"
+	p.Exchanging = true
+	p.Status = "exchanging"
 	s.pkce[state] = p
+	verifier := p.Verifier
+	attempt := p.Attempt
 	s.mu.Unlock()
-	if oauthError != "" {
-		log.Printf("oauth_error stage=callback error=%q", oauthError)
-		s.mu.Lock()
-		p.Status = "error"
-		p.Error = oauthError
-		s.pkce[state] = p
-		s.mu.Unlock()
-		http.Error(w, "Microsoft authorization failed: "+oauthError, http.StatusBadRequest)
-		return
+
+	exchangeCode := s.exchangePKCECode
+	if exchangeCode == nil {
+		exchangeCode = auth.ExchangeCode
 	}
-	redirectURI := p.RedirectURI
-	if redirectURI == "" {
-		redirectURI = auth.RedirectURI()
-	}
-	if err := auth.ValidateNativeClientRedirectURI(redirectURI); err != nil {
-		log.Printf("oauth callback rejected pending redirect configuration")
-		s.mu.Lock()
-		p.Status = "error"
-		p.Error = "OAuth redirect configuration is invalid"
-		s.pkce[state] = p
-		s.mu.Unlock()
-		http.Error(w, "OAuth redirect configuration is invalid", http.StatusBadRequest)
-		return
-	}
-	tok, err := s.exchangeAuthorizationCode(code, p.Verifier, redirectURI)
+	tok, err := exchangeCode(code, verifier, auth.RedirectURI())
 	if err != nil {
-		logOAuthError("code_exchange", err)
-		s.mu.Lock()
-		p.Status = "error"
-		p.Error = err.Error()
-		s.pkce[state] = p
-		s.mu.Unlock()
+		if !s.failPKCEAttempt(state, attempt, err.Error()) {
+			http.Error(w, pkceInactiveMessage, http.StatusConflict)
+			return
+		}
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	acc, err := s.tokens.Upsert(tok)
+
+	acc, alreadyLinked, err, active := s.finishPKCEAttempt(state, attempt, tok)
+	if !active {
+		http.Error(w, pkceInactiveMessage, http.StatusConflict)
+		return
+	}
 	if err != nil {
-		s.mu.Lock()
-		p.Status = "error"
-		p.Error = err.Error()
-		s.pkce[state] = p
-		s.mu.Unlock()
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	s.mu.Lock()
-	p.Status = "authenticated"
-	p.Account = map[string]any{"id": acc.ID, "email": acc.Email, "displayName": acc.DisplayName, "status": acc.Status, "oid": acc.OID, "tid": acc.TID}
-	s.pkce[state] = p
-	s.mu.Unlock()
 	// Browser loopback callbacks should finish in a friendly page instead of
 	// displaying a raw JSON response. Keep JSON for the manual/API flow.
-	if strings.HasPrefix(redirectURI, "http://127.0.0.1:") || strings.HasPrefix(redirectURI, "http://localhost:") {
+	if strings.HasPrefix(auth.RedirectURI(), "http://127.0.0.1:") || strings.HasPrefix(auth.RedirectURI(), "http://localhost:") {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		fmt.Fprint(w, `<!doctype html><meta charset="utf-8"><title>M365 Copilot2API 授权完成</title><style>body{font:16px system-ui;text-align:center;padding:15vh 20px;color:#242424}main{max-width:520px;margin:auto}h1{font-size:26px}</style><main><h1>授权完成</h1><p>账号已经自动加入账号池，可以关闭此页面。</p><script>if(window.opener){window.opener.postMessage({type:"m365-auth-complete"},window.location.origin);setTimeout(()=>window.close(),300)}</script></main>`)
+		headline, detail := "授权完成", "账号已经自动加入账号池，可以关闭此页面。"
+		if alreadyLinked {
+			headline = "账号已存在"
+			detail = "本次登录的仍是账号池里已有的账号（浏览器沿用了上次的登录状态）。要添加新账号，请先在授权页面点“退出登录”，或使用“强制重新登录”重新授权。"
+		}
+		fmt.Fprintf(w, `<!doctype html><meta charset="utf-8"><title>M365 Copilot2API 授权完成</title><style>body{font:16px system-ui;text-align:center;padding:15vh 20px;color:#242424}main{max-width:520px;margin:auto}h1{font-size:26px}</style><main><h1>%s</h1><p>%s</p><script>if(window.opener){window.opener.postMessage({type:"m365-auth-complete",duplicate:%t},window.location.origin);setTimeout(()=>window.close(),%d)}</script></main>`,
+			headline, detail, alreadyLinked, map[bool]int{false: 300, true: 4000}[alreadyLinked])
 		return
 	}
 	jsonOut(w, map[string]any{
-		"status":  "authenticated",
-		"account": map[string]any{"id": acc.ID, "email": acc.Email, "displayName": acc.DisplayName, "status": acc.Status, "oid": acc.OID, "tid": acc.TID},
+		"status":    "authenticated",
+		"duplicate": alreadyLinked,
+		"account":   map[string]any{"id": acc.ID, "email": acc.Email, "displayName": acc.DisplayName, "status": acc.Status, "oid": acc.OID, "tid": acc.TID},
 	})
 }
 
 func (s *Server) resolveAccount(accountID string) (auth.AccountToken, error) {
+	if s == nil || s.tokens == nil {
+		return auth.AccountToken{}, fmt.Errorf("no accounts; login first")
+	}
 	if accountID == "" {
+		probeLimit := len(s.tokens.List())
 		acc, ok := s.tokens.Next()
 		if !ok {
 			return auth.AccountToken{}, fmt.Errorf("no accounts; login first")
 		}
 		accountID = acc.ID
-		for i := 0; !s.accountAvailable(accountID) && i < maxAccountProbe; i++ {
+		for i := 1; !s.accountAvailable(accountID) && i < probeLimit; i++ {
 			acc, ok = s.tokens.Next()
 			if !ok {
 				break
 			}
 			accountID = acc.ID
 		}
-		if !s.accountPool.Available(accountID) {
-			until := s.accountPool.EarliestRecovery()
-			retry := int(time.Until(until).Seconds())
-			if retry < 5 {
-				retry = 5
+		if !s.accountAvailable(accountID) {
+			if !s.accountPool.Available(accountID) {
+				until := s.accountPool.EarliestRecovery()
+				retry := int(time.Until(until).Seconds())
+				if retry < 5 {
+					retry = 5
+				}
+				return auth.AccountToken{}, &UpstreamHTTPError{Status: 429, RetryAfter: retry, Body: "all accounts are cooling down; try again later"}
 			}
-			return auth.AccountToken{}, &UpstreamHTTPError{Status: 429, RetryAfter: retry, Body: "all accounts are cooling down; try again later"}
-		}
-		if !s.accountConcurrency.Available(accountID) {
-			return auth.AccountToken{}, &UpstreamHTTPError{Status: 429, RetryAfter: 1, Body: "all accounts are at their concurrency limit; try again shortly"}
+			retry := 1
+			if s.upstreamCooldown != nil {
+				if candidate, exists := s.tokens.Get(accountID); exists {
+					if until, blocked := s.upstreamCooldown.snapshot()[candidate.Email]; blocked {
+						retry = int(time.Until(until).Seconds())
+						if retry < 1 {
+							retry = 1
+						}
+					}
+				}
+			}
+			return auth.AccountToken{}, &UpstreamHTTPError{Status: 429, RetryAfter: retry, Body: "all accounts are temporarily unavailable; try again shortly"}
 		}
 	}
 	return s.tokens.EnsureValid(accountID)
@@ -915,7 +999,8 @@ func (s *Server) resolveAccount(accountID string) (auth.AccountToken, error) {
 // healthy, skipping the given id first, and validates its token. Used by the
 // failover path after a rate-limited or auth-failed attempt.
 func (s *Server) nextHealthyAccount(avoidID string) (auth.AccountToken, error) {
-	for i := 0; i < maxAccountProbe; i++ {
+	probeLimit := len(s.tokens.List())
+	for i := 0; i < probeLimit; i++ {
 		acc, ok := s.tokens.Next()
 		if !ok {
 			return auth.AccountToken{}, fmt.Errorf("no accounts; login first")
@@ -963,6 +1048,8 @@ func modelTone(model string) string {
 		return "Gpt_5_2_Reasoning"
 	case "gpt-5.3":
 		return "Gpt_5_3_Chat"
+	case "gpt-5.3-reasoning":
+		return "Gpt_5_3_Reasoning"
 	case "gpt-5.4":
 		return "Gpt_5_4_Chat"
 	case "gpt-5.4-reasoning":
@@ -1006,7 +1093,6 @@ func (s *Server) chatOnce(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	ownerID := requestAPIKeyOwner(r)
 	var body chatBody
 	r.Body = http.MaxBytesReader(w, r.Body, 10<<20)
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -1019,7 +1105,7 @@ func (s *Server) chatOnce(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if body.SessionKey != "" {
-		if v, ok := s.sessions.getForOwner(ownerID, body.SessionKey); ok {
+		if v, ok := s.sessions.get(body.SessionKey); ok {
 			body.AccountID = firstNonEmpty(body.AccountID, v.AccountID)
 			body.ConversationID = firstNonEmpty(body.ConversationID, v.ConversationID)
 			body.SessionID = firstNonEmpty(body.SessionID, v.SessionID)
@@ -1027,6 +1113,10 @@ func (s *Server) chatOnce(w http.ResponseWriter, r *http.Request) {
 	}
 	acc, err := s.resolveAccount(body.AccountID)
 	if err != nil {
+		if isAccountResolveFailure(err) {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 		writeUpstreamError(w, err)
 		return
 	}
@@ -1090,7 +1180,7 @@ func (s *Server) chatOnce(w http.ResponseWriter, r *http.Request) {
 	res.Text = sanitizePublicAssistantText(res.Text)
 	res.Reasoning = sanitizePublicReasoningText(res.Reasoning)
 	if body.SessionKey != "" {
-		s.sessions.upsertForOwner(ownerID, conversation{ID: body.SessionKey, AccountID: acc.ID, ConversationID: res.ConversationID, SessionID: res.SessionID, Title: text})
+		s.sessions.upsert(conversation{ID: body.SessionKey, AccountID: acc.ID, ConversationID: res.ConversationID, SessionID: res.SessionID, Title: text})
 	}
 	jsonOut(w, map[string]any{
 		"status":         "ok",
@@ -1112,21 +1202,12 @@ func (s *Server) dropTransientConversation(conversationID string) {
 	if conversationID == "" || m365CloudClient == nil {
 		return
 	}
-	go func(id string) {
+	id := conversationID
+	safeGo("transientConversation.delete", func() {
 		if err := m365CloudClient.DeleteConversation(id); err != nil {
 			log.Printf("[transient-conv] delete failed id=%s err=%v", id, err)
 		}
-	}(conversationID)
-}
-
-func (s *Server) adminModelSync(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	syncUpstreamTones()
-	tones := liveUpstreamTones()
-	jsonOut(w, map[string]any{"synced": true, "upstream_tones": tones, "count": len(tones)})
+	})
 }
 
 func (s *Server) adminModels(w http.ResponseWriter, r *http.Request) {
@@ -1134,7 +1215,7 @@ func (s *Server) adminModels(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	jsonOut(w, map[string]any{"object": "list", "data": modelCatalog()})
+	jsonOut(w, map[string]any{"object": "list", "data": s.catalogModels()})
 }
 
 // adminModelTest 由控制台模型测试调用，通过管理员会话鉴权，不依赖明文 API Key
@@ -1153,6 +1234,10 @@ func (s *Server) adminModelTest(w http.ResponseWriter, r *http.Request) {
 	}
 	acc, err := s.resolveAccount("")
 	if err != nil {
+		if isAccountResolveFailure(err) {
+			writeAccountResolveError(w, err, "account_error")
+			return
+		}
 		writeUpstreamError(w, err)
 		return
 	}
@@ -1165,7 +1250,7 @@ func (s *Server) adminModelTest(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, "account_error", "account missing oid/tid")
 		return
 	}
-	tone, _ := reasoningTone(b.Model, "")
+	tone, _ := s.requestedTone(b.Model, "")
 	start := time.Now()
 	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(s.settings.get().ChatTimeoutSeconds)*time.Second)
 	defer cancel()
@@ -1186,7 +1271,7 @@ func (s *Server) openaiModels(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	data := modelCatalog()
+	data := s.catalogModels()
 	created := time.Now().Unix()
 	for _, model := range data {
 		model["created"] = created
@@ -1286,9 +1371,12 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		requestID = uuid.NewString()
 	}
 	startedAt := time.Now()
-	ownerID := requestAPIKeyOwner(r)
+	beginRequest(requestID, r)
+	stage(requestID, "http_start", map[string]any{"stream": r.URL.Query().Get("stream") == "true"})
 	log.Printf("[req-trace] id=%s stage=http_start stream=%t", requestID, r.URL.Query().Get("stream") == "true")
 	defer func() {
+		stage(requestID, "http_return", map[string]any{"total_ms": time.Since(startedAt).Milliseconds()})
+		endRequest(requestID, nil)
 		log.Printf("[req-trace] id=%s stage=http_return total_ms=%d", requestID, time.Since(startedAt).Milliseconds())
 	}()
 	if r.Method != http.MethodPost {
@@ -1306,12 +1394,16 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad json", http.StatusBadRequest)
 		return
 	}
+	if reason := oversizeReason(len(body.Messages), len(raw)); reason != "" {
+		writeOpenAIError(w, http.StatusRequestEntityTooLarge, "invalid_request_error", reason)
+		return
+	}
 	responseFormat := body.ResponseFormat
 	effort := body.ReasoningEffort
 	if body.Reasoning != nil && strings.TrimSpace(body.Reasoning.Effort) != "" {
 		effort = body.Reasoning.Effort
 	}
-	tone, toneErr := reasoningTone(body.Model, effort)
+	tone, toneErr := s.requestedTone(body.Model, effort)
 	if toneErr != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", toneErr.Error())
 		return
@@ -1320,9 +1412,20 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	body.ConversationID = firstNonEmpty(body.ConversationID, body.ConversationIDC)
 	body.SessionID = firstNonEmpty(body.SessionID, body.SessionIDC)
 	log.Printf("[req-trace] id=%s stage=body_parsed messages=%d tools=%d choice=%s raw_bytes=%d", requestID, len(body.Messages), len(body.Tools), normalizedToolChoiceMode(body.ToolChoice), len(raw))
+	stage(requestID, "body_parsed", map[string]any{"messages": len(body.Messages), "tools": len(body.Tools), "raw_bytes": len(raw)})
 	if err := validateToolConversation(body.Messages); err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "tool_protocol_error", err.Error())
 		return
+	}
+	trimmedMessages, trimErr := trimMessagesToContext(body.Messages, body.Tools, body.ToolChoice, body.Model)
+	if trimErr != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "context_length_exceeded", trimErr.Error())
+		return
+	}
+	if len(trimmedMessages) != len(body.Messages) {
+		log.Printf("[req-trace] id=%s stage=context_trim messages=%d->%d budget=%d", requestID, len(body.Messages), len(trimmedMessages), configuredContextBudget())
+		stage(requestID, "context_trim", map[string]any{"messages_before": len(body.Messages), "messages_after": len(trimmedMessages), "budget": configuredContextBudget()})
+		body.Messages = trimmedMessages
 	}
 	// Rebuild a protocol-neutral evidence ledger from actual tool calls/results.
 	// Round limits apply only to the current user turn; full history still informs evidence.
@@ -1352,14 +1455,14 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if body.SessionKey != "" {
-		if v, ok := s.sessions.getForOwner(ownerID, body.SessionKey); ok {
+		if v, ok := s.sessions.get(body.SessionKey); ok {
 			body.AccountID = firstNonEmpty(body.AccountID, v.AccountID)
 			body.ConversationID = firstNonEmpty(body.ConversationID, v.ConversationID)
 			body.SessionID = firstNonEmpty(body.SessionID, v.SessionID)
 		}
 	}
 	if body.User != "" && body.ConversationID == "" {
-		if us, ok := s.userSessions.GetForOwner(ownerID, body.User); ok {
+		if us, ok := s.userSessions.Get(body.User); ok {
 			body.AccountID = firstNonEmpty(body.AccountID, us.AccountID)
 			body.ConversationID = us.ConversationID
 			body.SessionID = us.SessionID
@@ -1371,7 +1474,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	answerPrompt := prompt
 	resolvedConversationID := ""
 	if body.ConversationID == "" && len(body.Messages) > 0 {
-		resolved := s.sessionResolver.ResolveOwned(r, &body, ownerID)
+		resolved := s.sessionResolver.Resolve(r, &body)
 		if !resolved.IsNew {
 			resolvedConversationID = resolved.ConversationID
 			body.ConversationID = resolved.ConversationID
@@ -1392,6 +1495,10 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	acc, err := s.resolveAccount(accountID)
 	if err != nil {
 		log.Printf("[account-route] resolve failed requested=%q err=%v", accountID, err)
+		if isAccountResolveFailure(err) {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 		writeUpstreamError(w, err)
 		return
 	}
@@ -1404,33 +1511,6 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	if acc.OID == "" || acc.TID == "" {
 		http.Error(w, "account missing oid/tid", http.StatusBadRequest)
 		return
-	}
-
-	// Conversation cache: reuse existing M365 conversation for same account+model
-	// to avoid re-processing full system prompt + history each request (latency
-	// drops from 3-5s to ~1s). Only kicks in when no explicit conversation ID
-	// was provided by client, session key, user session, or session resolver.
-	convReused := false
-	convCacheModel := firstNonEmpty(body.Model, "m365-copilot")
-	if body.ConversationID == "" && len(body.Messages) > 1 {
-		sysHash := systemPromptHash(body.Messages)
-		if cached := s.convCache.Lookup(ownerID, acc.ID, convCacheModel); cached != nil && cached.SystemPrompt == sysHash {
-			if len(body.Messages) > cached.MessageCount {
-				incPrompt, incAtt := flattenPromptMessages(body.Messages[cached.MessageCount:], nil)
-				incPrompt = strings.TrimSpace(incPrompt)
-				if incPrompt != "" {
-					body.ConversationID = cached.ConversationID
-					body.SessionID = cached.SessionID
-					answerPrompt = incPrompt
-					body.Attachments = incAtt
-					convReused = true
-					log.Printf("[conv-cache] hit account=%s model=%s conversation=%s cached_msgs=%d new_msgs=%d", acc.ID, convCacheModel, cached.ConversationID, cached.MessageCount, len(body.Messages))
-				}
-			}
-		}
-	}
-	if !convReused && body.ConversationID == "" {
-		log.Printf("[conv-cache] miss account=%s model=%s", acc.ID, convCacheModel)
 	}
 
 	// Normalize tools once. Selection is always made by the upstream model;
@@ -1452,6 +1532,8 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		return valid, len(rejected)
 	}
 	planningMode := s.settings.get().ToolPlanningMode
+	var calls []detectedToolCall
+	var parsed bool
 
 	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(s.settings.get().ChatTimeoutSeconds)*time.Second)
 	defer cancel()
@@ -1468,9 +1550,10 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		// Only fall through to text streaming when the router explicitly selects
 		// no tool; this prevents a natural-language preamble from becoming a
 		// completed assistant turn with the actual call lost.
-		routePrompt := modelToolRouterPrompt(answerPrompt+"\n"+ledger.RouterContext(), toolMaps, body.ToolChoice)
+		routePrompt := modelToolRouterPrompt(routerPromptMessages(body.Messages)+"\n"+ledger.RouterContext(), toolMaps, body.ToolChoice)
 		log.Printf("[req-trace] id=%s stage=router_start prompt_len=%d", requestID, len(routePrompt))
 		routeRes, routeErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: routePrompt, Tone: tone, Attachments: body.Attachments})
+		recordRouterFrames(routerFrameInput{RequestID: requestID, Stage: "stream-router", Prompt: routePrompt, Text: routeRes.Text, Reasoning: routeRes.Reasoning, Events: routeRes.Events, Err: routeErr})
 		log.Printf("[req-trace] id=%s stage=router_return elapsed_ms=%d err=%t", requestID, time.Since(startedAt).Milliseconds(), routeErr != nil)
 		// Router turns run in a throwaway cloud conversation that is never
 		// reused by the answer turn; delete it so the conversation list does
@@ -1482,7 +1565,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "tool router: "+routeErr.Error(), http.StatusBadGateway)
 			return
 		}
-		calls, parsed := parseModelToolDecision(routeRes.Text, toolMaps, body.ToolChoice)
+		calls, parsed = parseModelToolDecision(routeRes.Text, toolMaps, body.ToolChoice)
 		calls = filterCompletedCalls(calls, ledger)
 		calls, _ = validateCalls("router", calls)
 		if !parsed {
@@ -1507,6 +1590,28 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if body.Stream {
+		if parsed && len(calls) == 0 && normalizedToolChoiceMode(body.ToolChoice) == "auto" && toolIntentLikely(latestUserIntent(body.Messages, prompt), toolMaps) {
+			retryPrompt := modelToolRouterPrompt(routerPromptMessages(body.Messages)+"\n"+ledger.RouterContext(), toolMaps, "required") + "\nINTENT RETRY: Select at least one declared tool for this concrete action request. Do not answer with prose or NO_TOOL_NEEDED."
+			retryRes, retryErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: retryPrompt, Tone: tone, Attachments: body.Attachments})
+			recordRouterFrames(routerFrameInput{RequestID: requestID, Stage: "stream-router-intent-retry", Prompt: retryPrompt, Text: retryRes.Text, Reasoning: retryRes.Reasoning, Events: retryRes.Events, Err: retryErr})
+			if retryErr == nil && retryRes.ConversationID != "" {
+				s.dropTransientConversation(retryRes.ConversationID)
+			}
+			if retryErr == nil {
+				retryCalls, retryParsed := parseModelToolDecision(retryRes.Text, toolMaps, "required")
+				retryCalls = filterCompletedCalls(retryCalls, ledger)
+				retryCalls, _ = validateCalls("stream-router-intent-retry", retryCalls)
+				if retryParsed && len(retryCalls) > 0 {
+					scope := fmt.Sprintf("%d:%v:stream-intent-retry", len(body.Messages), completedCallIDs(ledger))
+					for i := range retryCalls {
+						retryCalls[i].ID = scopedCallID(retryCalls[i].Name, string(retryCalls[i].Arguments), i, scope)
+					}
+					retryCalls = limitToolCalls(retryCalls, adaptiveToolCallLimit(retryCalls, configuredToolCallLimit(s.settings)))
+					_ = writeToolResponse(w, "chatcmpl-"+uuid.NewString(), firstNonEmpty(body.Model, "m365-copilot"), true, retryCalls, retryRes)
+					return
+				}
+			}
+		}
 		answerReq := buildAnswerRequest(answerPrompt, tone, body, ledger, planningMode)
 		answerPrompt = answerReq.Text
 		log.Printf("[req-trace] id=%s stage=answer_start prompt_len=%d native_tools=%d", requestID, len(answerPrompt), len(answerReq.Tools))
@@ -1526,6 +1631,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		var text strings.Builder
 		var pending strings.Builder
 		var streamedTools []detectedToolCall
+		progress := newStreamProgress(startedAt)
 		first := true
 		identityFilter := newPublicIdentityStreamFilter(model)
 		emitText := func(part string) error {
@@ -1536,6 +1642,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			if part == "" {
 				return nil
 			}
+			progress.addText(part)
 			if err := r.Context().Err(); err != nil {
 				return err
 			}
@@ -1553,7 +1660,11 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			flusher.Flush()
 			return nil
 		}
-		res, err := s.chatWithAccountEvents(ctx, acc.ID, account, answerReq, func(ev chathub.StreamEvent) error {
+		handleStreamText := func(fragment string) error {
+			text.WriteString(fragment)
+			return streamTextWithToolLookahead(&pending, fragment, toolMaps, body.ToolChoice, emitText)
+		}
+		streamEvent := func(ev chathub.StreamEvent) error {
 			if ev.Kind == "tool" && ev.ToolName != "" && len(ev.Arguments) > 0 {
 				streamedTools = append(streamedTools, detectedToolCall{ID: "call_" + uuid.NewString(), Name: ev.ToolName, Arguments: ev.Arguments})
 				return nil
@@ -1561,116 +1672,22 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			if ev.Kind != "text" || ev.Text == "" {
 				return nil
 			}
-			text.WriteString(ev.Text)
-			pending.WriteString(ev.Text)
-			v := pending.String()
-			// If the text contains a bash block or a JSON command, don't emit it as text
-			// It will be caught by fencedToolCalls after the stream completes
-			if strings.Contains(v, "```bash") || strings.Contains(v, "\"command\"") {
-				return nil
-			}
-			if i := strings.Index(v, "```"); i >= 0 {
-				if err := emitText(v[:i]); err != nil {
-					return err
-				}
-				pending.Reset()
-				pending.WriteString(v[i:])
-				return nil
-			}
-			if runeCount := utf8.RuneCountInString(v); runeCount > 8 {
-				cut := 0
-				seen := 0
-				for i := range v {
-					if seen == runeCount-8 {
-						cut = i
-						break
-					}
-					seen++
-				}
-				if err := emitText(v[:cut]); err != nil {
-					return err
-				}
-				pending.Reset()
-				pending.WriteString(v[cut:])
-			}
-			return nil
-		})
-		if err != nil && body.AccountID == "" && (body.ConversationID == "" || body.ConversationID == resolvedConversationID) && (IsRateLimited(err) || IsAuthFailure(err)) {
-			// A throttled stream may retry on the next healthy account: only the
-			// ": connected" preamble reached the client, so the retried stream is
-			// indistinguishable from a fresh request.
-			next, nerr := s.nextHealthyAccount(acc.ID)
-			if nerr != nil {
-				// no healthy alternative
-			} else {
-				failoverReq := answerReq
-				if body.ConversationID == resolvedConversationID {
-					failoverReq.ConversationID = ""
-					failoverReq.SessionID = ""
-				}
-				ctx2, cancel2 := context.WithTimeout(r.Context(), time.Duration(s.settings.get().ChatTimeoutSeconds)*time.Second)
-				defer cancel2()
-				res2, err2 := s.chatWithAccountEvents(ctx2, next.ID, chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}, failoverReq, func(ev chathub.StreamEvent) error {
-					if ev.Kind == "tool" && ev.ToolName != "" && len(ev.Arguments) > 0 {
-						streamedTools = append(streamedTools, detectedToolCall{ID: "call_" + uuid.NewString(), Name: ev.ToolName, Arguments: ev.Arguments})
-						return nil
-					}
-					if ev.Kind != "text" || ev.Text == "" {
-						return nil
-					}
-					text.WriteString(ev.Text)
-					pending.WriteString(ev.Text)
-					v := pending.String()
-					if strings.Contains(v, "```bash") || strings.Contains(v, "\"command\"") {
-						return nil
-					}
-					if i := strings.Index(v, "```"); i >= 0 {
-						if err := emitText(v[:i]); err != nil {
-							return err
-						}
-						pending.Reset()
-						pending.WriteString(v[i:])
-						return nil
-					}
-					if runeCount := utf8.RuneCountInString(v); runeCount > 8 {
-						cut := 0
-						seen := 0
-						for i := range v {
-							if seen == runeCount-8 {
-								cut = i
-								break
-							}
-							seen++
-						}
-						if err := emitText(v[:cut]); err != nil {
-							return err
-						}
-						pending.Reset()
-						pending.WriteString(v[cut:])
-					}
-					return nil
-				})
-				if err2 == nil {
-					res = res2
-					acc = next
-					err = nil
-				} else {
-					err = err2
-					s.accountPool.MarkFailure(next.ID, err2, rateLimitCooldown)
-				}
-			}
+			return handleStreamText(ev.Text)
+		}
+		res, usedAccount, err := s.streamChatWithRecovery(ctx, acc, answerReq, streamEvent)
+		if usedAccount.ID != "" {
+			acc = usedAccount
+			account = chathub.Account{AccessToken: acc.AccessToken, OID: acc.OID, TID: acc.TID}
 		}
 		if err != nil {
 			log.Printf("[req-trace] id=%s stage=stream_error err=%v", requestID, err)
 			s.accountPool.MarkFailure(acc.ID, err, rateLimitCooldown)
-			if convReused {
-				s.invalidateConvCache(ownerID, acc.ID, convCacheModel)
-			}
 			msg := upstreamError(err)
 			if IsRateLimited(err) {
 				msg = "upstream is rate limiting; try again shortly"
 			}
 			msg = sanitizePublicInternalText(msg)
+			_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(streamTruncatedChunk(id, model, progress))+"\n\n")
 			_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(map[string]any{"error": map[string]any{"message": msg, "code": "rate_limit"}})+"\n\n")
 			_ = sseRaw(r.Context(), w, flusher, "data: [DONE]\n\n")
 			return
@@ -1690,9 +1707,9 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			// A native ChatHub event can contain a fabricated or empty tool name.
 			// Do not leak it to the local runner: ask the model to remap the intent
 			// to exactly one of the tools the client actually declared.
-			repairPrompt := modelToolRouterPrompt(prompt+"\n"+ledger.RouterContext(), toolMaps, "required") +
+			repairPrompt := modelToolRouterPrompt(routerPromptMessages(body.Messages)+"\n"+ledger.RouterContext(), toolMaps, "required") +
 				"\nREPAIR RULE: The previous upstream event selected an undeclared tool. Select one declared tool that performs the intended operation. Never return unknown_tool."
-			repairRes, repairErr := s.chat.Chat(ctx, account, chathub.Request{Text: repairPrompt, Tone: tone, Attachments: body.Attachments})
+			repairRes, repairErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: repairPrompt, Tone: tone, Attachments: body.Attachments})
 			if repairErr == nil {
 				repaired, parsed := parseModelToolDecision(repairRes.Text, toolMaps, body.ToolChoice)
 				if parsed {
@@ -1720,13 +1737,12 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			calls = limitToolCalls(calls, adaptiveToolCallLimit(calls, configuredToolCallLimit(s.settings)))
 			_ = writeToolResponse(w, id, model, true, calls, toolResult)
 			if body.User != "" && res.ConversationID != "" {
-				s.userSessions.PutForOwner(ownerID, body.User, res.ConversationID, res.SessionID, acc.ID)
+				s.userSessions.Put(body.User, res.ConversationID, res.SessionID, acc.ID)
 			}
 			s.bindConversation(acc, &body, r, res, answerPrompt, startedAt)
-			s.storeConvCache(ownerID, acc.ID, convCacheModel, res, tone, body.Messages, convReused)
 			return
 		}
-		if err := emitText(pending.String()); err != nil {
+		if err := flushStreamText(&pending, toolMaps, body.ToolChoice, true, emitText); err != nil {
 			log.Printf("[req-trace] id=%s stage=stream_write err=%v", requestID, err)
 			return
 		}
@@ -1734,16 +1750,15 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(finishChunk)+"\n\n")
 		_ = sseRaw(r.Context(), w, flusher, "data: [DONE]\n\n")
 		if body.User != "" && res.ConversationID != "" {
-			s.userSessions.PutForOwner(ownerID, body.User, res.ConversationID, res.SessionID, acc.ID)
+			s.userSessions.Put(body.User, res.ConversationID, res.SessionID, acc.ID)
 		}
 		s.bindConversation(acc, &body, r, res, answerPrompt, startedAt)
-		s.storeConvCache(ownerID, acc.ID, convCacheModel, res, tone, body.Messages, convReused)
 		return
 	}
 	// Ask the upstream model to select and validate the next tool. The gateway
 	// remains tool-agnostic; it only validates and serializes the decision.
 	if planningMode == "router" && len(toolMaps) > 0 && fmt.Sprint(body.ToolChoice) != "none" {
-		routePrompt := modelToolRouterPrompt(answerPrompt+"\n"+ledger.RouterContext(), toolMaps, body.ToolChoice)
+		routePrompt := modelToolRouterPrompt(routerPromptMessages(body.Messages)+"\n"+ledger.RouterContext(), toolMaps, body.ToolChoice)
 		routeRes, routeErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: routePrompt, Tone: tone, Attachments: body.Attachments})
 		if routeErr != nil {
 			s.accountPool.MarkFailure(acc.ID, routeErr, rateLimitCooldown)
@@ -1762,16 +1777,23 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			if routeErr != nil {
-				msg := upstreamError(routeErr)
+				// 失败帧必须先记录再返回：此前 recordRouterFrames 只在
+				// 成功路径上调用，用户开了「捕获路由原始帧」复现失败后，
+				// 诊断里依然空无一物 —— 恰恰是最需要证据的场景丢了证据。
+				recordRouterFrames(routerFrameInput{RequestID: requestID, Stage: "router", Prompt: routePrompt, Text: routeRes.Text, Reasoning: routeRes.Reasoning, Events: routeRes.Events, Err: routeErr})
+				// 带阶段标注，便于区分握手被拒 / 读超时 / 中途断流。
+				msg := upstreamStageError("router", routeErr)
 				if IsRateLimited(routeErr) {
 					msg = "upstream is rate limiting; try again shortly"
 				}
-				writeOpenAIError(w, http.StatusBadGateway, "tool_router_error", msg)
+				log.Printf("[req-trace] id=%s stage=router_error err=%v", requestID, routeErr)
+				writeOpenAIError(w, http.StatusBadGateway, "router_error", msg)
 				return
 			}
 			s.accountPool.MarkSuccess(acc.ID)
+			recordRouterFrames(routerFrameInput{RequestID: requestID, Stage: "router", Prompt: routePrompt, Text: routeRes.Text, Reasoning: routeRes.Reasoning, Events: routeRes.Events})
 		}
-		calls, parsed := parseModelToolDecision(routeRes.Text, toolMaps, body.ToolChoice)
+		calls, parsed = parseModelToolDecision(routeRes.Text, toolMaps, body.ToolChoice)
 		if !parsed {
 			repairRes, repairErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: `Repair this tool routing output into JSON only with shape {"calls":[{"name":"function_name","arguments":{}}]}. Do not invent calls; use {"calls":[]} if unrecoverable. OUTPUT:
 ` + compactToolResult(routeRes.Text, 6000), Tone: tone, Attachments: body.Attachments})
@@ -1793,6 +1815,31 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			calls = limitToolCalls(calls, adaptiveToolCallLimit(calls, configuredToolCallLimit(s.settings)))
 			_ = writeToolResponse(w, "chatcmpl-"+uuid.NewString(), firstNonEmpty(body.Model, "m365-copilot"), body.Stream, calls, routeRes)
 			return
+		}
+		if len(calls) == 0 && normalizedToolChoiceMode(body.ToolChoice) == "auto" && toolIntentLikely(latestUserIntent(body.Messages, prompt), toolMaps) {
+			// A concrete action request deserves one constrained retry even in auto
+			// mode. This is the narrow repair path that avoids forcing tools for
+			// ordinary informational questions.
+			retryText := modelToolRouterPrompt(routerPromptMessages(body.Messages)+"\n"+ledger.RouterContext(), toolMaps, "required") + "\nINTENT RETRY: Select at least one declared tool for this concrete action request. Do not answer with prose or NO_TOOL_NEEDED."
+			retryRes, retryErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: retryText, Tone: tone, Attachments: body.Attachments})
+			recordRouterFrames(routerFrameInput{RequestID: requestID, Stage: "router-intent-retry", Prompt: retryText, Text: retryRes.Text, Reasoning: retryRes.Reasoning, Events: retryRes.Events, Err: retryErr})
+			if retryErr == nil && retryRes.ConversationID != "" {
+				s.dropTransientConversation(retryRes.ConversationID)
+			}
+			if retryErr == nil {
+				calls, parsed = parseModelToolDecision(retryRes.Text, toolMaps, "required")
+				calls = filterCompletedCalls(calls, ledger)
+				calls, _ = validateCalls("router-intent-retry", calls)
+				if parsed && len(calls) > 0 {
+					scope := fmt.Sprintf("%d:%v:intent-retry", len(body.Messages), completedCallIDs(ledger))
+					for i := range calls {
+						calls[i].ID = scopedCallID(calls[i].Name, string(calls[i].Arguments), i, scope)
+					}
+					calls = limitToolCalls(calls, adaptiveToolCallLimit(calls, configuredToolCallLimit(s.settings)))
+					_ = writeToolResponse(w, "chatcmpl-"+uuid.NewString(), firstNonEmpty(body.Model, "m365-copilot"), body.Stream, calls, retryRes)
+					return
+				}
+			}
 		}
 		if fmt.Sprint(body.ToolChoice) == "required" {
 			defs, _ := json.Marshal(toolMaps)
@@ -1834,6 +1881,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		id := "chatcmpl-" + uuid.NewString()
 		model := firstNonEmpty(body.Model, "m365-copilot")
 		firstDelta := true
+		progress := newStreamProgress(startedAt)
 		writeChunk := func(delta map[string]any) error {
 			if err := r.Context().Err(); err != nil {
 				return err
@@ -1860,13 +1908,17 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		contentFilter := newPublicIdentityStreamFilter(firstNonEmpty(body.Model, defaultPublicModelName))
 		reasoningFilter := newPublicReasoningStreamFilter()
 		onDelta := func(content string) error {
-			if content = contentFilter.Push(content); content != "" {
+			content = contentFilter.Push(content)
+			if content != "" {
+				progress.addText(content)
 				return writeChunk(map[string]any{"content": content})
 			}
 			return nil
 		}
 		onReasoning := func(reasoning string) error {
-			if reasoning = reasoningFilter.Push(reasoning); reasoning != "" {
+			reasoning = reasoningFilter.Push(reasoning)
+			if reasoning != "" {
+				progress.addReasoning(reasoning)
 				return writeChunk(map[string]any{"reasoning_content": reasoning})
 			}
 			return nil
@@ -1915,14 +1967,12 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		} else {
 			log.Printf("[req-trace] id=%s stage=stream_error err=%v", requestID, err)
 			s.accountPool.MarkFailure(acc.ID, err, rateLimitCooldown)
-			if convReused {
-				s.invalidateConvCache(ownerID, acc.ID, convCacheModel)
-			}
 			msg := upstreamError(err)
 			if IsRateLimited(err) {
 				msg = "upstream is rate limiting; try again shortly"
 			}
 			msg = sanitizePublicInternalText(msg)
+			_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(streamTruncatedChunk(id, model, progress))+"\n\n")
 			_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(map[string]any{"error": map[string]any{"message": msg, "code": "rate_limit"}})+"\n\n")
 		}
 		pt := EstimateTokens(prompt)
@@ -1931,13 +1981,13 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		if err == nil && ct == 0 {
 			_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(map[string]any{"error": map[string]any{"message": "upstream returned empty completion; the requested model may be unavailable for this tenant", "code": "upstream_error"}})+"\n\n")
 		}
-		finish := "stop"
 		if err != nil {
-			finish = "stop"
+			_ = sseRaw(r.Context(), w, flusher, "data: [DONE]\n\n")
+		} else {
+			usageChunk := map[string]any{"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []map[string]any{{"index": 0, "delta": map[string]any{}, "finish_reason": "stop"}}, "usage": map[string]any{"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct}}
+			_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(usageChunk)+"\n\n")
+			_ = sseRaw(r.Context(), w, flusher, "data: [DONE]\n\n")
 		}
-		usageChunk := map[string]any{"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []map[string]any{{"index": 0, "delta": map[string]any{}, "finish_reason": finish}}, "usage": map[string]any{"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct}}
-		_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(usageChunk)+"\n\n")
-		_ = sseRaw(r.Context(), w, flusher, "data: [DONE]\n\n")
 	} else {
 		res, err = s.chatWithAccount(ctx, acc.ID, account, answerReq)
 		if IsEmptyCompletion(err) && tone != "magic" {
@@ -1975,36 +2025,30 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 	}
 	if err != nil {
 		s.accountPool.MarkFailure(acc.ID, err, rateLimitCooldown)
-		if convReused {
-			s.invalidateConvCache(ownerID, acc.ID, convCacheModel)
-			log.Printf("[conv-cache] invalidated account=%s model=%s after error: %v", acc.ID, convCacheModel, err)
-		}
 		writeUpstreamError(w, err)
 		return
 	}
 	s.accountPool.MarkSuccess(acc.ID)
 	if body.Stream {
 		if body.User != "" && res.ConversationID != "" {
-			s.userSessions.PutForOwner(ownerID, body.User, res.ConversationID, res.SessionID, acc.ID)
+			s.userSessions.Put(body.User, res.ConversationID, res.SessionID, acc.ID)
 		}
 		s.bindConversation(acc, &body, r, res, prompt, startedAt)
-		s.storeConvCache(ownerID, acc.ID, convCacheModel, res, tone, body.Messages, convReused)
 		return
 	}
 
 	if body.SessionKey != "" {
-		s.sessions.upsertForOwner(ownerID, conversation{ID: body.SessionKey, AccountID: acc.ID, ConversationID: res.ConversationID, SessionID: res.SessionID, Title: prompt})
+		s.sessions.upsert(conversation{ID: body.SessionKey, AccountID: acc.ID, ConversationID: res.ConversationID, SessionID: res.SessionID, Title: prompt})
 	}
 	if body.User != "" && res.ConversationID != "" {
-		s.userSessions.PutForOwner(ownerID, body.User, res.ConversationID, res.SessionID, acc.ID)
+		s.userSessions.Put(body.User, res.ConversationID, res.SessionID, acc.ID)
 		log.Printf("[user-session] put user=%s conversation=%s session=%s", body.User, res.ConversationID, res.SessionID)
 	}
 	if res.ConversationID != "" {
 		s.bindConversation(acc, &body, r, res, prompt, startedAt)
-		s.storeConvCache(ownerID, acc.ID, convCacheModel, res, tone, body.Messages, convReused)
 	}
 	if res.ConversationID != "" {
-		resolved := s.sessionResolver.ResolveOwned(r, &body, ownerID)
+		resolved := s.sessionResolver.Resolve(r, &body)
 		if !resolved.IsNew {
 			w.Header().Set(sessionHeaderName, resolved.SessionID)
 		}
@@ -2025,7 +2069,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 	if len(toolMaps) > 0 && isSandboxHallucination(res.Text) {
 		log.Printf("[sandbox-eject] model used code interpreter/sandbox, retrying with explicit tool instruction")
 		correction := "CRITICAL: You must NOT use any built-in code interpreter, Python sandbox, or cloud execution environment. The caller has provided a bash tool that runs Windows PowerShell 5.1 on their local machine — use it to execute any commands or code. Do NOT say you cannot run code. Do NOT say you only have a Linux container. Call the bash tool NOW with the appropriate command.\n\nUser request:\n" + prompt
-		res2, err2 := s.chat.Chat(ctx, account, chathub.Request{Text: correction, Tone: tone, Attachments: body.Attachments})
+		res2, err2 := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: correction, Tone: tone, Attachments: body.Attachments})
 		if err2 == nil && !isSandboxHallucination(res2.Text) {
 			res = res2
 		}
@@ -2052,10 +2096,11 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 	// Recover natural-language tool intent in native mode, and repair any
 	// structured event that failed the declared-name/schema boundary.
 	if (planningMode == "native" || invalidDetectedTool) && len(toolMaps) > 0 && fmt.Sprint(body.ToolChoice) != "none" {
-		routePrompt := modelToolRouterPrompt(prompt+"\n"+ledger.RouterContext(), toolMaps, body.ToolChoice)
+		routePrompt := modelToolRouterPrompt(routerPromptMessages(body.Messages)+"\n"+ledger.RouterContext(), toolMaps, body.ToolChoice)
 		routeRes, routeErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: routePrompt, Tone: tone, Attachments: body.Attachments})
+		recordRouterFrames(routerFrameInput{RequestID: requestID, Stage: "native-recovery", Prompt: routePrompt, Text: routeRes.Text, Reasoning: routeRes.Reasoning, Events: routeRes.Events, Err: routeErr})
 		if routeErr == nil {
-			calls, parsed := parseModelToolDecision(routeRes.Text, toolMaps, body.ToolChoice)
+			calls, parsed = parseModelToolDecision(routeRes.Text, toolMaps, body.ToolChoice)
 			if !parsed {
 				repairRes, repairErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: `Repair this tool routing output into JSON only with shape {"calls":[{"name":"function_name","arguments":{}}]}. Use {"calls":[]} if no tool is needed. OUTPUT:\n` + compactToolResult(routeRes.Text, 6000), Tone: tone, Attachments: body.Attachments})
 				if repairErr == nil {
@@ -2073,11 +2118,6 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 				return
 			}
 		}
-	}
-	if isContentPolicyBlock(res.Text) {
-		log.Printf("[content-policy] M365 blocked the request, returning 503")
-		writeOpenAIError(w, http.StatusServiceUnavailable, "upstream_content_blocked", "M365 content policy blocked this request; try again or switch account")
-		return
 	}
 	if !completionEvidenceAllows(res.Text, ledger) {
 		res.Text = "I cannot confirm completion because no matching tool results were returned. No external action has been verified."
@@ -2227,7 +2267,6 @@ const sessionHeaderName = "X-M365-Session-Id"
 // 路径共用。会话为内容键，云端的对话由 auto_cleanup 按 2h 闲置窗口回收，
 // 这里不再做"用完即删"，否则复用永远不可能命中。
 func (s *Server) bindConversation(acc auth.AccountToken, body *oaiReq, r *http.Request, res chathub.Result, prompt string, startedAt time.Time) {
-	ownerID := requestAPIKeyOwner(r)
 	if res.ConversationID == "" {
 		return
 	}
@@ -2237,7 +2276,7 @@ func (s *Server) bindConversation(acc auth.AccountToken, body *oaiReq, r *http.R
 		Content:          res.Text,
 		ReasoningContent: res.Reasoning,
 	})
-	s.sessionResolver.BindOwned(res.SessionID, res.ConversationID, acc.ID, ownerID, &historyBody, "", r)
+	s.sessionResolver.Bind(res.SessionID, res.ConversationID, acc.ID, &historyBody, "", r)
 	s.conversationManager.Record(res.ConversationID, acc.ID, prompt)
 	if s.conversationManager.ShouldCleanup() {
 		if cleaned := s.conversationManager.Cleanup(); len(cleaned) > 0 {
@@ -2246,6 +2285,11 @@ func (s *Server) bindConversation(acc auth.AccountToken, body *oaiReq, r *http.R
 	}
 
 	apiKey := extractAPIKey(r)
+	// 内部自调用（如评测经 callOwnChatCompletions 走本处理器）由调用方
+	// 自行记账，此处跳过，否则同一次调用会被计入两条用量记录。
+	if isInternalCall(r) {
+		return
+	}
 	historyTokens := int64(0)
 	upper := len(body.Messages) - 1
 	if upper < 0 {
@@ -2273,7 +2317,18 @@ func (s *Server) bindConversation(acc auth.AccountToken, body *oaiReq, r *http.R
 }
 
 func extractAPIKey(r *http.Request) string {
-	return requestAPIKeyPrefix(r)
+	key := strings.TrimSpace(r.Header.Get("X-API-Key"))
+	if key != "" {
+		return key
+	}
+	auth := r.Header.Get("Authorization")
+	if strings.HasPrefix(strings.ToLower(auth), "bearer ") {
+		key = strings.TrimSpace(auth[7:])
+	}
+	if len(key) > 8 {
+		return key[:8] + "..."
+	}
+	return key
 }
 
 func firstNonEmpty(vals ...string) string {
@@ -2305,4 +2360,16 @@ func extractOIDTID(accessToken string) (oid, tid string) {
 		tid = v
 	}
 	return oid, tid
+}
+
+// internalCallHeader 标记进程内自调用。带此头的请求由调用方负责用量记账，
+// bindConversation 会跳过统计，避免同一次调用被重复计入。
+const internalCallHeader = "X-M365-Internal-Call"
+
+// isInternalCall 判定请求是否来自进程内自调用。
+func isInternalCall(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	return strings.TrimSpace(r.Header.Get(internalCallHeader)) != ""
 }

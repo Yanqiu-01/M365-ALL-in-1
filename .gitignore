@@ -1,56 +1,41 @@
-# Local credentials and runtime state
+# 签名密钥库与任何私钥：绝不入库。
+# 密钥库保存在仓库外，构建时通过 KS 环境变量指定路径。
+packaging/keys/
+*.jks
+*.keystore
+*.p12
+*.pfx
+*.pem
+*.key
+
+# 构建产物
+*.apk
+*.idsig
+*.so
+/out/
+/build/
+
+# 本地环境
 .env
 .env.*
-!.env.example
-accounts.json
-*.token
-*.tokens
-*.har
-cookies*.txt
-/tmp/
+*.local
 
-# Build artifacts
-/m365-copilot2api
-/m365-copilot2api.exe
-/m365-copilot2api.exe.rollback
-/bin/
-/dist/
-*.out
-*.log
-# Python/runtime artifacts
-__pycache__/
-*.py[cod]
-# IDE/OS
+# 编辑器与系统
+.DS_Store
+*.swp
 .idea/
 .vscode/
-.DS_Store
-# Local runtime and diagnostic artifacts
-/debug-logs.jsonl
-/server
-/m365-copilot2api.next
-/m365-copilot2api.service
-/m365-copilot2api.rollback*
-/m365-copilot2api.exe~
-/data/
-/secrets/
-.runtime-backups/
-backups/
-runtime.pid
-conversations.json
+
+# Go
+/vendor/
+*.test
+*.out
+
+# Local runtime state and build artifacts
+.codebase-memory/
+debug-logs.jsonl
 sessions.json
-test-results.jsonl
-server.log
-server-error.log
-*.pid
-
-# Local agent memory (machine-specific notes)
-AGENTS.md
-
-# WIP build during this session
-/m365-copilot2api.new*
-
-*.exe
-*.exe~
-*.bak*
-_wip_backup_*
-*.dll
+conversations.json
+server.exe
+*.log
+*.err

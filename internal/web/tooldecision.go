@@ -4,16 +4,40 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"strings"
 )
 
 func toolFunction(name string, tools []map[string]any) map[string]any {
+	_, fn := declaredTool(name, tools)
+	return fn
+}
+
+// declaredTool resolves a model-supplied name to one declared by the caller.
+// Exact names win. A unique case-insensitive match is accepted because some
+// upstream frames normalize function names, but ambiguous spellings are never
+// guessed. The returned name is always the caller-declared spelling.
+func declaredTool(name string, tools []map[string]any) (string, map[string]any) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "", nil
+	}
+	var matchedName string
+	var matched map[string]any
 	for _, t := range tools {
 		f, _ := t["function"].(map[string]any)
-		if n, _ := f["name"].(string); n == name {
-			return f
+		n, _ := f["name"].(string)
+		n = strings.TrimSpace(n)
+		if n == name {
+			return n, f
+		}
+		if n != "" && strings.EqualFold(n, name) {
+			if matched != nil && matchedName != n {
+				return "", nil
+			}
+			matchedName, matched = n, f
 		}
 	}
-	return nil
+	return matchedName, matched
 }
 
 func schemaValid(args map[string]any, fn map[string]any) error {

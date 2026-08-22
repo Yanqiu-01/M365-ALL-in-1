@@ -62,6 +62,57 @@ func extractToolFields(m map[string]any) (string, json.RawMessage) {
 
 func eventRaw(v any) json.RawMessage { b, _ := json.Marshal(v); return b }
 
+// toolEventKey gives native tool events a stable per-request identity. ChatHub
+// can expose the same call both as a nested object and as an entry in
+// messages[], so both paths share this key before events reach callers.
+func toolEventKey(name string, args json.RawMessage) string {
+	return name + "|" + string(args)
+}
+
+func markToolEventSeen(seen map[string]bool, event StreamEvent) bool {
+	if event.Kind != "tool" || event.ToolName == "" || len(event.Arguments) == 0 {
+		return false
+	}
+	key := toolEventKey(event.ToolName, event.Arguments)
+	if seen[key] {
+		return true
+	}
+	seen[key] = true
+	return false
+}
+
+// emitUpdateEvents is the only ChatHub update-path emitter for native tool
+// events. extractToolEvents sees tools anywhere in the update argument, while
+// classifyUpdateMessages sees messages[] again; the shared seen set prevents a
+// single native call from reaching the handler twice.
+func emitUpdateEvents(arg map[string]any, messages []any, seenTools map[string]bool, onEvent StreamHandler) error {
+	if onEvent == nil {
+		return nil
+	}
+	for _, event := range extractToolEvents(arg, seenTools) {
+		if err := onEvent(event); err != nil {
+			return err
+		}
+	}
+	for _, event := range classifyUpdateMessages(messages) {
+		// reasoning is emitted by reasoningPump from the raw frame, not from
+		// messages[], so it remains single-delivery.
+		if event.Kind == "reasoning" {
+			continue
+		}
+		if markToolEventSeen(seenTools, event) {
+			continue
+		}
+		event.Raw = eventRaw(arg)
+		if event.Kind != "text" {
+			if err := onEvent(event); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // extractToolEvents walks the complete SignalR update argument. ChatHub often
 // places native plugin calls outside messages[], so looking only at messages
 // loses the call after the assistant's preamble.
@@ -77,10 +128,9 @@ func extractToolEvents(v any, seen map[string]bool) []StreamEvent {
 		case map[string]any:
 			name, args := extractToolFields(z)
 			if name != "" && len(args) > 0 {
-				key := name + "|" + string(args)
-				if !seen[key] {
-					seen[key] = true
-					out = append(out, StreamEvent{Kind: "tool", ToolName: name, Arguments: args, Raw: eventRaw(z)})
+				event := StreamEvent{Kind: "tool", ToolName: name, Arguments: args, Raw: eventRaw(z)}
+				if !markToolEventSeen(seen, event) {
+					out = append(out, event)
 				}
 			}
 			for _, child := range z {

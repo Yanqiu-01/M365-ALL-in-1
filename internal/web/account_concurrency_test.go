@@ -54,4 +54,20 @@ func TestAccountConcurrencyUsesDocumentedDefault(t *testing.T) {
 	if limiter.limit != defaultAccountConcurrency {
 		t.Fatalf("limit = %d, want %d", limiter.limit, defaultAccountConcurrency)
 	}
+	if limiter.limit != 64 {
+		t.Fatalf("default account concurrency = %d, want 64", limiter.limit)
+	}
+}
+
+func TestAccountConcurrencyRejectsUnsafeConfiguredValues(t *testing.T) {
+	for _, raw := range []string{"128", "129", "0", "-1", "bad"} {
+		t.Setenv("M365_ACCOUNT_DEFAULT_CONCURRENCY", raw)
+		limiter := newAccountConcurrency()
+		if raw == "128" && limiter.limit != 128 {
+			t.Fatalf("configured upper bound = %d, want 128", limiter.limit)
+		}
+		if raw != "128" && limiter.limit != defaultAccountConcurrency {
+			t.Fatalf("invalid value %q yielded %d, want default %d", raw, limiter.limit, defaultAccountConcurrency)
+		}
+	}
 }

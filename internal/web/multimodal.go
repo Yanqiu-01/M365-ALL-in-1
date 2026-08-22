@@ -10,15 +10,6 @@ import (
 func parseContent(c any) (string, []chathub.Attachment) {
 	var text strings.Builder
 	var files []chathub.Attachment
-	appendFile := func(a chathub.Attachment) {
-		// Retain one over-limit sentinel so the unchanged caller can pass the
-		// aggregate to chathub.ValidateAttachments, while bounding per-message
-		// parsing work for requests containing an excessive number of parts.
-		if len(files) <= chathub.MaxAttachments {
-			a.URL = strings.TrimSpace(a.URL)
-			files = append(files, a)
-		}
-	}
 	if s, ok := c.(string); ok {
 		return s, nil
 	}
@@ -38,7 +29,7 @@ func parseContent(c any) (string, []chathub.Attachment) {
 			text.WriteString(v)
 		}
 		if direct, ok := m["image_url"].(string); ok && direct != "" {
-			appendFile(chathub.Attachment{Type: "image", URL: direct, MimeType: "image/*"})
+			files = append(files, chathub.Attachment{Type: "image", URL: direct, MimeType: "image/*"})
 		}
 		switch typ {
 		case "text", "input_text", "output_text":
@@ -50,7 +41,7 @@ func parseContent(c any) (string, []chathub.Attachment) {
 					if d, ok := u["detail"].(string); ok {
 						a.Detail = d
 					}
-					appendFile(a)
+					files = append(files, a)
 				}
 			}
 		case "input_image", "image":
@@ -64,17 +55,17 @@ func parseContent(c any) (string, []chathub.Attachment) {
 				u = stringValue(raw, "url", "data", "source")
 			}
 			if u != "" {
-				appendFile(chathub.Attachment{Type: "image", URL: u, MimeType: "image/*"})
+				files = append(files, chathub.Attachment{Type: "image", URL: u, MimeType: "image/*"})
 			}
 		case "input_file", "file":
 			u := stringValue(m, "file_data", "file_url", "url", "source", "file_id")
 			if u != "" || stringValue(m, "filename", "name") != "" {
-				appendFile(chathub.Attachment{Type: "file", URL: u, Name: stringValue(m, "filename", "name"), MimeType: stringValue(m, "mime_type", "mimeType", "content_type")})
+				files = append(files, chathub.Attachment{Type: "file", URL: u, Name: stringValue(m, "filename", "name"), MimeType: stringValue(m, "mime_type", "mimeType", "content_type")})
 			}
 		case "input_audio", "audio":
 			u := stringValue(m, "data", "audio_url", "url", "source")
 			if u != "" {
-				appendFile(chathub.Attachment{Type: "audio", URL: u, MimeType: stringValue(m, "mime_type", "mimeType", "format", "content_type")})
+				files = append(files, chathub.Attachment{Type: "audio", URL: u, MimeType: stringValue(m, "mime_type", "mimeType", "format", "content_type")})
 			}
 		}
 	}

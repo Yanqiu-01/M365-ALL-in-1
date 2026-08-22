@@ -43,6 +43,7 @@ func openDebugStore() *debugStore {
 	}
 	return &debugStore{path: p}
 }
+
 var sensitiveKeys = map[string]bool{
 	"api_key": true, "apikey": true, "apiKey": true, "authorization": true,
 	"access_token": true, "accessToken": true, "refresh_token": true, "refreshToken": true,
@@ -195,16 +196,14 @@ func (s *Server) debugMiddleware(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		logLevel := currentSettings().LogLevel
-		if logLevel == "silent" || debugLevelRank(logLevel) > debugLevelRank("debug") {
-			next.ServeHTTP(w, r)
+		in, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxDebugRequestBytes))
+		if err != nil {
+			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
 			return
 		}
-		var in []byte
-		if r.Body != nil && r.ContentLength > 0 && r.ContentLength < maxDebugCaptureBytes {
-			in, _ = io.ReadAll(io.LimitReader(r.Body, maxDebugCaptureBytes))
-			r.Body = io.NopCloser(io.MultiReader(bytes.NewReader(in), r.Body))
-		}
+		// Forward the complete body; redactBody applies the smaller capture
+		// limit only when writing the debug record.
+		r.Body = io.NopCloser(bytes.NewReader(in))
 		cw := &captureWriter{ResponseWriter: w}
 		start := time.Now()
 		next.ServeHTTP(cw, r)

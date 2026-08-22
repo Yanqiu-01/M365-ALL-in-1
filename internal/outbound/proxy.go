@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -18,9 +19,32 @@ import (
 )
 
 const (
-	EnvProxy            = "M365_OUTBOUND_PROXY"
-	proxyConnectTimeout = 30 * time.Second
+	EnvProxy                       = "M365_OUTBOUND_PROXY"
+	EnvOutboundMaxIdleConns        = "M365_OUTBOUND_MAX_IDLE_CONNS"
+	EnvOutboundMaxIdleConnsPerHost = "M365_OUTBOUND_MAX_IDLE_CONNS_PER_HOST"
+	EnvOutboundMaxConnsPerHost     = "M365_OUTBOUND_MAX_CONNS_PER_HOST"
+	EnvOutboundHTTPTimeoutSeconds  = "M365_OUTBOUND_HTTP_TIMEOUT_SECONDS"
+	EnvOutboundMaxWebSockets       = "M365_OUTBOUND_MAX_WEBSOCKETS_PER_PROXY"
+
+	defaultOutboundMaxIdleConns        = 512
+	defaultOutboundMaxIdleConnsPerHost = 128
+	defaultOutboundMaxConnsPerHost     = 128
+	defaultOutboundHTTPTimeoutSeconds  = 45
+	defaultOutboundMaxWebSockets       = 64
 )
+
+func outboundIntEnv(name string, fallback, min, max int) int {
+	raw := strings.TrimSpace(os.Getenv(name))
+	value, err := strconv.Atoi(raw)
+	if err != nil || value < min || value > max {
+		return fallback
+	}
+	return value
+}
+
+func outboundWebSocketLimit() int {
+	return outboundIntEnv(EnvOutboundMaxWebSockets, defaultOutboundMaxWebSockets, 1, 128)
+}
 
 type Clients struct {
 	HTTP      *http.Client
@@ -34,35 +58,31 @@ var (
 )
 
 func directClients() *Clients {
-	tlsCache := tls.NewLRUClientSessionCache(32)
-	httpTLSConf := &tls.Config{ClientSessionCache: tlsCache}
-	wsTLSConf := &tls.Config{ClientSessionCache: tlsCache, NextProtos: []string{"http/1.1"}}
-	dnsResolver := &net.Resolver{
-		PreferGo: true,
-		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-			d := net.Dialer{Timeout: 5 * time.Second}
-			return d.DialContext(ctx, "udp", "1.1.1.1:53")
-		},
+	maxIdle := outboundIntEnv(EnvOutboundMaxIdleConns, defaultOutboundMaxIdleConns, 1, 4096)
+	maxIdlePerHost := outboundIntEnv(EnvOutboundMaxIdleConnsPerHost, defaultOutboundMaxIdleConnsPerHost, 1, 1024)
+	if maxIdlePerHost > maxIdle {
+		maxIdlePerHost = maxIdle
 	}
+	maxConnsPerHost := outboundIntEnv(EnvOutboundMaxConnsPerHost, defaultOutboundMaxConnsPerHost, 1, 512)
+	httpTimeout := time.Duration(outboundIntEnv(EnvOutboundHTTPTimeoutSeconds, defaultOutboundHTTPTimeoutSeconds, 5, 300)) * time.Second
 	t := &http.Transport{
-		Proxy: nil,
-		DialContext: (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second, Resolver: dnsResolver}).DialContext,
-		MaxIdleConns:          100,
+		Proxy:                 nil,
+		DialContext:           (&net.Dialer{Timeout: 15 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		MaxIdleConns:          maxIdle,
+		MaxIdleConnsPerHost:   maxIdlePerHost,
+		MaxConnsPerHost:       maxConnsPerHost,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
-		ResponseHeaderTimeout: 30 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 		ForceAttemptHTTP2:     true,
-		TLSClientConfig:       httpTLSConf,
 	}
 	return &Clients{
-		HTTP: &http.Client{Transport: t},
+		HTTP: &http.Client{Transport: t, Timeout: httpTimeout},
 		WebSocket: &websocket.Dialer{
 			HandshakeTimeout: 20 * time.Second,
-			ReadBufferSize:   256 * 1024,
-			WriteBufferSize:  16 * 1024,
+			ReadBufferSize:   1024 * 1024,
+			WriteBufferSize:  64 * 1024,
 			NetDialContext:   t.DialContext,
-			TLSClientConfig:  wsTLSConf,
 		},
 	}
 }
@@ -184,7 +204,10 @@ func New(raw string) (*Clients, error) {
 	switch strings.ToLower(u.Scheme) {
 	case "http":
 		c.HTTP.Transport.(*http.Transport).Proxy = http.ProxyURL(u)
-		c.WebSocket.Proxy = http.ProxyURL(u)
+		// Keep proxy selection in NetDialContext so a shared Dialer can use a
+		// different pool exit for every WebSocket connection.
+		c.WebSocket.Proxy = nil
+		c.WebSocket.NetDialContext = httpProxyDialer{proxyURL: u}.DialContext
 	case "https":
 		// Do not use Transport.Proxy here: Go's standard transport performs its
 		// own proxy TLS handshake and bypasses our IP-certificate compatibility.
@@ -202,24 +225,68 @@ func New(raw string) (*Clients, error) {
 		if e != nil {
 			return nil, fmt.Errorf("configure SOCKS5 proxy: %w", e)
 		}
-		contextDialer, ok := d.(proxy.ContextDialer)
-		if !ok {
-			return nil, fmt.Errorf("configured SOCKS5 dialer does not support context cancellation")
-		}
-		c.HTTP.Transport.(*http.Transport).DialContext = contextDialer.DialContext
-		c.WebSocket.NetDialContext = contextDialer.DialContext
+		x := socksContextDialer{dialer: d}
+		c.HTTP.Transport.(*http.Transport).DialContext = x.DialContext
+		c.WebSocket.NetDialContext = x.DialContext
 	default:
 		return nil, fmt.Errorf("outbound proxy scheme %q is unsupported; use socks5, http, or https", u.Scheme)
 	}
 	return c, nil
 }
 
-type httpsProxyDialer struct{ proxyURL *url.URL }
+type httpProxyDialer struct{ proxyURL *url.URL }
 
-func (d httpsProxyDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+func (d httpProxyDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	if network != "tcp" {
+		return nil, fmt.Errorf("HTTP proxy only supports tcp, got %q", network)
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	proxyAddress := d.proxyURL.Host
+	if d.proxyURL.Port() == "" {
+		proxyAddress = net.JoinHostPort(d.proxyURL.Hostname(), "80")
+	}
+	conn, err := (&net.Dialer{Timeout: 15 * time.Second, KeepAlive: 30 * time.Second}).DialContext(ctx, network, proxyAddress)
+	if err != nil {
+		return nil, err
+	}
+	deadline := time.Now().Add(20 * time.Second)
+	if value, ok := ctx.Deadline(); ok && value.Before(deadline) {
+		deadline = value
+	}
+	if err := conn.SetDeadline(deadline); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	defer conn.SetDeadline(time.Time{})
+	req := &http.Request{Method: http.MethodConnect, URL: &url.URL{Opaque: address}, Host: address, Header: make(http.Header)}
+	if d.proxyURL.User != nil {
+		pw, _ := d.proxyURL.User.Password()
+		req.SetBasicAuth(d.proxyURL.User.Username(), pw)
+	}
+	if err := req.Write(conn); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	reader := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(reader, req)
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		conn.Close()
+		return nil, fmt.Errorf("HTTP proxy CONNECT %s: %s", address, resp.Status)
+	}
+	resp.Body.Close()
+	return &bufferedConn{Conn: conn, reader: reader}, nil
+}
+
+type httpsProxyDialer struct{ proxyURL *url.URL }
+
+func (d httpsProxyDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
 	if network != "tcp" {
 		return nil, fmt.Errorf("HTTPS proxy only supports tcp, got %q", network)
 	}
@@ -227,24 +294,18 @@ func (d httpsProxyDialer) DialContext(ctx context.Context, network, address stri
 	if d.proxyURL.Port() == "" {
 		a = net.JoinHostPort(d.proxyURL.Hostname(), "443")
 	}
-	raw, e := (&net.Dialer{Timeout: proxyConnectTimeout}).DialContext(ctx, network, a)
+	raw, e := (&net.Dialer{}).DialContext(ctx, network, a)
 	if e != nil {
 		return nil, e
 	}
+	// Proxy endpoints commonly present a certificate for their hostname while users
+	// configure an IP address. This option affects only the TLS hop to the proxy;
+	// target-site certificate verification remains enabled.
 	insecureProxyTLS := os.Getenv("M365_PROXY_INSECURE_TLS") == "1" || os.Getenv("M365_PROXY_INSECURE_TLS") == "true" || net.ParseIP(d.proxyURL.Hostname()) != nil
 	conn := tls.Client(raw, &tls.Config{ServerName: d.proxyURL.Hostname(), MinVersion: tls.VersionTLS12, InsecureSkipVerify: insecureProxyTLS}) // #nosec G402 -- explicitly scoped to configured proxy TLS
-	deadline := time.Now().Add(proxyConnectTimeout)
-	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
-		deadline = ctxDeadline
-	}
-	if e = conn.SetDeadline(deadline); e != nil {
-		_ = raw.Close()
-		return nil, e
-	}
-	stopContextClose := context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Now()) })
-	defer stopContextClose()
+
 	if e = conn.HandshakeContext(ctx); e != nil {
-		_ = conn.Close()
+		raw.Close()
 		return nil, e
 	}
 	q := &http.Request{Method: http.MethodConnect, URL: &url.URL{Opaque: address}, Host: address, Header: make(http.Header)}
@@ -253,44 +314,19 @@ func (d httpsProxyDialer) DialContext(ctx context.Context, network, address stri
 		q.SetBasicAuth(d.proxyURL.User.Username(), pw)
 	}
 	if e = q.Write(conn); e != nil {
-		_ = conn.Close()
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return nil, ctxErr
-		}
+		conn.Close()
 		return nil, e
 	}
 	rd := bufio.NewReader(conn)
 	resp, e := http.ReadResponse(rd, q)
 	if e != nil {
-		closeResponseBody(resp)
-		_ = conn.Close()
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return nil, ctxErr
-		}
+		conn.Close()
 		return nil, e
-	}
-	if resp == nil {
-		_ = conn.Close()
-		return nil, fmt.Errorf("HTTPS proxy CONNECT %s returned no response", address)
 	}
 	if resp.StatusCode != http.StatusOK {
-		closeResponseBody(resp)
-		_ = conn.Close()
+		resp.Body.Close()
+		conn.Close()
 		return nil, fmt.Errorf("HTTPS proxy CONNECT %s: %s", address, resp.Status)
-	}
-	if ctxErr := ctx.Err(); ctxErr != nil {
-		_ = conn.Close()
-		return nil, ctxErr
-	}
-	if !stopContextClose() {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			_ = conn.Close()
-			return nil, ctxErr
-		}
-	}
-	if e = conn.SetDeadline(time.Time{}); e != nil {
-		_ = conn.Close()
-		return nil, e
 	}
 	return &bufferedConn{Conn: conn, reader: rd}, nil
 }
@@ -301,3 +337,31 @@ type bufferedConn struct {
 }
 
 func (c *bufferedConn) Read(p []byte) (int, error) { return c.reader.Read(p) }
+
+type socksContextDialer struct{ dialer proxy.Dialer }
+
+func (d socksContextDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	ch := make(chan struct {
+		c net.Conn
+		e error
+	}, 1)
+	go func() {
+		c, e := d.dialer.Dial(network, address)
+		ch <- struct {
+			c net.Conn
+			e error
+		}{c, e}
+	}()
+	select {
+	case r := <-ch:
+		return r.c, r.e
+	case <-ctx.Done():
+		go func() {
+			r := <-ch
+			if r.c != nil {
+				r.c.Close()
+			}
+		}()
+		return nil, ctx.Err()
+	}
+}

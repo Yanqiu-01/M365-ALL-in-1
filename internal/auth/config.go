@@ -12,9 +12,6 @@ const DefaultRedirectURI = "https://login.microsoftonline.com/common/oauth2/nati
 const DefaultScope = "openid profile offline_access https://substrate.office.com/sydney/M365Chat.Read https://substrate.office.com/sydney/sydney.readwrite"
 
 func ClientID() string {
-	if v := os.Getenv("M365_BROWSER_CLIENT_ID"); v != "" {
-		return v
-	}
 	if v := os.Getenv("M365_CLIENT_ID"); v != "" {
 		return v
 	}
@@ -22,9 +19,6 @@ func ClientID() string {
 }
 
 func Authority() string {
-	if v := os.Getenv("M365_BROWSER_AUTHORITY"); v != "" {
-		return v
-	}
 	if v := os.Getenv("M365_AUTHORITY"); v != "" {
 		return v
 	}
@@ -32,9 +26,6 @@ func Authority() string {
 }
 
 func RedirectURI() string {
-	if v := os.Getenv("M365_BROWSER_REDIRECT_URI"); v != "" {
-		return v
-	}
 	if v := os.Getenv("M365_REDIRECT_URI"); v != "" {
 		return v
 	}
@@ -42,39 +33,6 @@ func RedirectURI() string {
 }
 
 func Scope() string {
-	if v := os.Getenv("M365_BROWSER_SCOPE"); v != "" {
-		return v
-	}
-	if v := os.Getenv("M365_SCOPE"); v != "" {
-		return v
-	}
-	return DefaultScope
-}
-
-func DeviceClientID() string {
-	if v := os.Getenv("M365_DEVICE_CLIENT_ID"); v != "" {
-		return v
-	}
-	if v := os.Getenv("M365_CLIENT_ID"); v != "" {
-		return v
-	}
-	return FOCIClientID
-}
-
-func DeviceAuthority() string {
-	if v := os.Getenv("M365_DEVICE_AUTHORITY"); v != "" {
-		return v
-	}
-	if v := os.Getenv("M365_AUTHORITY"); v != "" {
-		return v
-	}
-	return DefaultAuthority
-}
-
-func DeviceScope() string {
-	if v := os.Getenv("M365_DEVICE_SCOPE"); v != "" {
-		return v
-	}
 	if v := os.Getenv("M365_SCOPE"); v != "" {
 		return v
 	}
@@ -99,12 +57,31 @@ func DeviceCodeEndpoint() string {
 	if v := os.Getenv("M365_DEVICE_ENDPOINT"); v != "" {
 		return v
 	}
-	return DeviceAuthority() + "/oauth2/v2.0/devicecode"
+	return Authority() + "/oauth2/v2.0/devicecode"
 }
 
-func DeviceTokenEndpoint() string {
-	if v := os.Getenv("M365_DEVICE_TOKEN_ENDPOINT"); v != "" {
+// DefaultPrompt forces a fresh Microsoft login. prompt=select_account still
+// auto-continues a single signed-in browser session, so switching accounts
+// would immediately hit the nativeclient callback with the previous identity.
+const DefaultPrompt = "login"
+
+// Prompt resolves the OAuth prompt parameter. An explicit M365_PROMPT still
+// wins (including "none", which AuthorizationURLWithPrompt drops on purpose),
+// so existing deployments keep their behaviour.
+func Prompt() string {
+	if v, ok := os.LookupEnv("M365_PROMPT"); ok {
 		return v
 	}
-	return DeviceAuthority() + "/oauth2/v2.0/token"
+	return DefaultPrompt
+}
+
+// LogoutURL clears the Microsoft browser session before a new authorization so
+// that switching accounts is possible. post_logout_redirect_uri is omitted
+// because it must be registered on the app; Microsoft then shows its own
+// "signed out" page, which the popup closes on its own.
+func LogoutURL() string {
+	if v := os.Getenv("M365_LOGOUT_ENDPOINT"); v != "" {
+		return v
+	}
+	return Authority() + "/oauth2/v2.0/logout"
 }

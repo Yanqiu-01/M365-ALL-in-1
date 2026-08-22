@@ -1,6 +1,8 @@
 package web
 
-import "testing"
+import (
+	"testing"
+)
 
 func TestToolPlanningModeDefaultsToRouter(t *testing.T) {
 	for _, raw := range []string{"", "router", "ROUTER", "unexpected"} {

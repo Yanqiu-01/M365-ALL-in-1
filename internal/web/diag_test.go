@@ -1,0 +1,168 @@
+package web
+
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+)
+
+func resetDiagForTest(t *testing.T) {
+	t.Helper()
+	diagMu.Lock()
+	if diagFile != nil {
+		_ = diagFile.Close()
+	}
+	diagFile = nil
+	diagOnce = sync.Once{}
+	diagMu.Unlock()
+	inflight = sync.Map{}
+	chatSlotsMu.Lock()
+	chatSlots = nil
+	chatSlotN = 0
+	chatSlotsMu.Unlock()
+	t.Cleanup(func() {
+		diagMu.Lock()
+		if diagFile != nil {
+			_ = diagFile.Close()
+		}
+		diagFile = nil
+		diagOnce = sync.Once{}
+		diagMu.Unlock()
+		inflight = sync.Map{}
+		chatSlotsMu.Lock()
+		chatSlots = nil
+		chatSlotN = 0
+		chatSlotsMu.Unlock()
+	})
+}
+
+func TestDiagAPKConfiguration(t *testing.T) {
+	resetDiagForTest(t)
+	t.Setenv("M365_DATA_DIR", "/tmp/m365-data")
+	t.Setenv("M365_STAGE_LOG", "")
+	if diagEnabled() {
+		t.Fatal("unset stage log should be disabled")
+	}
+	if got, want := diagPath(), filepath.Join("/tmp/m365-data", "server-stages.log"); got != want {
+		t.Fatalf("diagPath()=%q want %q", got, want)
+	}
+	for _, value := range []string{"0", "no", "off", "false"} {
+		t.Setenv("M365_STAGE_LOG", value)
+		if diagEnabled() {
+			t.Fatalf("%q should disable stage logs", value)
+		}
+	}
+	t.Setenv("M365_STAGE_LOG", "yes")
+	if !diagEnabled() {
+		t.Fatal("yes should enable stage logs")
+	}
+	t.Setenv("M365_STAGE_LOG_MAX_BYTES", "1234")
+	if got := diagMaxBytes(); got != 1234 {
+		t.Fatalf("diagMaxBytes=%d", got)
+	}
+	t.Setenv("M365_STAGE_LOG_MAX_BYTES", "bad")
+	if got := diagMaxBytes(); got != defaultDiagMaxBytes {
+		t.Fatalf("default diagMaxBytes=%d", got)
+	}
+}
+
+func TestStageTracksInflightAndWritesBoundedLog(t *testing.T) {
+	resetDiagForTest(t)
+	dir := t.TempDir()
+	t.Setenv("M365_DATA_DIR", dir)
+	t.Setenv("M365_STAGE_LOG", "1")
+	t.Setenv("M365_STAGE_LOG_MAX_BYTES", "512")
+
+	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	beginRequest("request-1", r)
+	stage("request-1", "body_parsed", map[string]any{"raw_bytes": 42})
+	items := inflightSnapshot()
+	if len(items) != 1 || items[0].ID != "request-1" || items[0].Stage != "body_parsed" {
+		t.Fatalf("inflight=%#v", items)
+	}
+	endRequest("request-1", nil)
+	if got := inflightSnapshot(); len(got) != 0 {
+		t.Fatalf("inflight after end=%#v", got)
+	}
+	data, err := os.ReadFile(diagPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"stage":"body_parsed"`) || len(data) > 512 {
+		t.Fatalf("stage log=%q (%d bytes)", data, len(data))
+	}
+}
+
+func TestGlobalChatSlotsAPKLimitAndCancellation(t *testing.T) {
+	resetDiagForTest(t)
+	t.Setenv("M365_MAX_CONCURRENT_CHATS", "1")
+	if got := maxConcurrentChats(); got != 1 {
+		t.Fatalf("maxConcurrentChats=%d", got)
+	}
+	first, err := acquireChatSlot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if _, err := acquireChatSlot(ctx); err == nil {
+		t.Fatal("second slot acquisition should wait for release")
+	}
+	first()
+	second, err := acquireChatSlot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	second()
+}
+
+func TestLivenessAndStageHandlers(t *testing.T) {
+	resetDiagForTest(t)
+	t.Setenv("M365_STAGE_LOG", "0")
+	s := &Server{}
+	live := httptest.NewRecorder()
+	s.handleLiveness(live, httptest.NewRequest(http.MethodGet, "/api/live", nil))
+	// 原 APK 实测 /api/live: status "alive" + chat 计数对象。
+	if live.Code != http.StatusOK || !strings.Contains(live.Body.String(), `"status":"alive"`) || !strings.Contains(live.Body.String(), `"chat":{`) {
+		t.Fatalf("liveness=%d %s", live.Code, live.Body.String())
+	}
+	for _, key := range []string{`"active"`, `"limit"`, `"peak"`, `"rejected"`, `"total"`, `"sysBytes"`, `"numGC"`, `"uptimeSeconds"`, `"stageLogPath"`} {
+		if !strings.Contains(live.Body.String(), key) {
+			t.Errorf("liveness missing %s: %s", key, live.Body.String())
+		}
+	}
+	stages := httptest.NewRecorder()
+	s.handleStageLog(stages, httptest.NewRequest(http.MethodGet, "/api/stages", nil))
+	// 原 APK 实测 /api/stages: {lines, path} + 未创建时的 note。
+	if stages.Code != http.StatusOK || !strings.Contains(stages.Body.String(), `"lines"`) || !strings.Contains(stages.Body.String(), `"path"`) {
+		t.Fatalf("stages=%d %s", stages.Code, stages.Body.String())
+	}
+	if strings.Contains(stages.Body.String(), `"enabled"`) || strings.Contains(stages.Body.String(), `"max_bytes"`) {
+		t.Errorf("stages must not expose upstream-only fields: %s", stages.Body.String())
+	}
+}
+
+func TestGlobalChatSlotsUseHigherDefaultAndConfiguredUpperBound(t *testing.T) {
+	resetDiagForTest(t)
+	t.Setenv("M365_MAX_CONCURRENT_CHATS", "")
+	if got := maxConcurrentChats(); got != defaultMaxConcurrentChats {
+		t.Fatalf("default maxConcurrentChats=%d, want %d", got, defaultMaxConcurrentChats)
+	}
+	for _, raw := range []string{"128", "129", "0", "bad"} {
+		t.Setenv("M365_MAX_CONCURRENT_CHATS", raw)
+		got := maxConcurrentChats()
+		if raw == "128" && got != 128 {
+			t.Fatalf("configured upper bound=%d, want 128", got)
+		}
+		if raw != "128" && got != defaultMaxConcurrentChats {
+			t.Fatalf("invalid value %q yielded %d, want default %d", raw, got, defaultMaxConcurrentChats)
+		}
+	}
+}

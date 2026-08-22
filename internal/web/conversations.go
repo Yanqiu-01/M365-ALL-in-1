@@ -60,10 +60,9 @@ func (s *Server) conversationCleanup(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
-	ownerID := requestAPIKeyOwner(r)
 	switch r.Method {
 	case http.MethodGet:
-		sessions := s.sessionResolver.ListSessionsForOwner(ownerID)
+		sessions := s.sessionResolver.ListSessions()
 		jsonOut(w, map[string]any{
 			"object": "list",
 			"data":   sessions,
@@ -73,7 +72,7 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 			SessionID string `json:"session_id"`
 		}
 		json.NewDecoder(r.Body).Decode(&body)
-		sess, ok := s.sessionResolver.GetSessionForOwner(ownerID, body.SessionID)
+		sess, ok := s.sessionResolver.GetSession(body.SessionID)
 		if !ok {
 			jsonOut(w, map[string]any{
 				"object":     "session",
@@ -103,9 +102,8 @@ func (s *Server) handleCacheStats(w http.ResponseWriter, r *http.Request) {
 	}
 	stats := cacheStats.GetStats()
 	jsonOut(w, map[string]any{
-		"object":     "cache_stats",
-		"stats":      stats,
-		"conv_cache": s.convCache.Stats(),
+		"object": "cache_stats",
+		"stats":  stats,
 	})
 }
 
@@ -178,39 +176,6 @@ func (s *Server) handleM365Conversations(w http.ResponseWriter, r *http.Request)
 		response["warning"] = cloudErr.Error()
 	}
 	jsonOut(w, response)
-}
-
-func (s *Server) handleM365ConversationDetail(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	conversationID := strings.TrimSpace(r.URL.Query().Get("id"))
-	if conversationID == "" {
-		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "conversation id is required")
-		return
-	}
-	session, found := s.sessionResolver.GetConversation(conversationID)
-	if !found {
-		writeOpenAIError(w, http.StatusNotFound, "conversation_not_found", "conversation history is not available")
-		return
-	}
-	accountEmail := ""
-	if account, ok := s.tokens.Get(session.AccountID); ok {
-		accountEmail = account.Email
-	}
-	jsonOut(w, map[string]any{
-		"object":         "conversation",
-		"conversationId": session.ConversationID,
-		"sessionId":      session.SessionID,
-		"accountId":      session.AccountID,
-		"accountEmail":   accountEmail,
-		"chatName":       conversationTitle(session.ContextHistory),
-		"createdAt":      session.CreatedAt,
-		"updatedAt":      session.LastUsedAt,
-		"messageCount":   len(session.ContextHistory),
-		"messages":       session.ContextHistory,
-	})
 }
 
 func conversationTitle(messages []oaiMsg) string {
@@ -312,7 +277,7 @@ func (s *Server) handleSessionDelete(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "session_id required", http.StatusBadRequest)
 		return
 	}
-	if s.sessionResolver.DeleteSessionForOwner(requestAPIKeyOwner(r), sessionID) {
+	if s.sessionResolver.DeleteSession(sessionID) {
 		jsonOut(w, map[string]any{"status": "deleted", "session_id": sessionID})
 	} else {
 		http.Error(w, "session not found", http.StatusNotFound)

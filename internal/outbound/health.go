@@ -3,7 +3,6 @@ package outbound
 import (
 	"context"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"net/url"
@@ -57,24 +56,14 @@ func (p *Pool) Check(ctx context.Context, raw string) (time.Duration, error) {
 	resp, err := e.clients.HTTP.Do(req)
 	lat := time.Since(start)
 	if err != nil {
-		closeResponseBody(resp)
 		p.mark(raw, err)
 		p.setHealth(raw, "unreachable")
 		log.Printf("proxy health failed proxy=%s target=%s latency=%s err=%v", redactProxy(raw), target, lat, err)
 		return lat, err
 	}
-	if resp == nil {
-		err = fmt.Errorf("proxy health returned no response")
-		p.mark(raw, err)
-		p.setHealth(raw, "unreachable")
-		return lat, err
-	}
-	if resp.Body != nil {
-		defer resp.Body.Close()
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
-	}
 	status := resp.Status
 	code := resp.StatusCode
+	resp.Body.Close()
 	p.mark(raw, nil)
 	if code >= 500 {
 		p.setHealth(raw, "upstream_error")

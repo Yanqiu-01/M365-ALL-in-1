@@ -1,4 +1,4 @@
-﻿package web
+package web
 
 import (
 	"fmt"
@@ -175,6 +175,46 @@ func TestNextHealthyAccount(t *testing.T) {
 	}
 	if _, err := s.nextHealthyAccount(""); err == nil {
 		t.Fatal("nextHealthyAccount must fail when no healthy account remains")
+	}
+}
+
+func TestAccountRotationScansEntireLargePool(t *testing.T) {
+	dir := t.TempDir()
+	store, err := auth.OpenStore(filepath.Join(dir, "accounts.json"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	health := newAccountHealth()
+	for i := 1; i <= 20; i++ {
+		id := fmt.Sprintf("large-%02d", i)
+		_, err := store.Upsert(auth.TokenSet{
+			HomeOID: id, Email: id + "@example.invalid",
+			AccessToken: "token-" + id, RefreshToken: "refresh-" + id,
+			ExpiresAt: time.Now().Add(time.Hour),
+		})
+		if err != nil {
+			t.Fatalf("upsert %s: %v", id, err)
+		}
+		if i < 20 {
+			health.MarkFailure(id, &UpstreamHTTPError{Status: 429}, 10*time.Minute)
+		}
+	}
+
+	s := &Server{tokens: store, accountPool: health, accountConcurrency: newAccountConcurrency()}
+	resolved, err := s.resolveAccount("")
+	if err != nil {
+		t.Fatalf("resolveAccount large pool: %v", err)
+	}
+	if resolved.ID != "large-20" {
+		t.Fatalf("resolveAccount selected %q, want large-20", resolved.ID)
+	}
+
+	failedOver, err := s.nextHealthyAccount("")
+	if err != nil {
+		t.Fatalf("nextHealthyAccount large pool: %v", err)
+	}
+	if failedOver.ID != "large-20" {
+		t.Fatalf("nextHealthyAccount selected %q, want large-20", failedOver.ID)
 	}
 }
 

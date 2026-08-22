@@ -1,4 +1,4 @@
-﻿package web
+package web
 
 import (
 	"errors"
@@ -167,13 +167,6 @@ func (h *accountHealth) Snapshot() map[string]map[string]any {
 		}
 	}
 	return out
-}
-
-func (h *accountHealth) ClearAllCooldowns() {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	h.cooldown = map[string]time.Time{}
-	h.authFail = map[string]bool{}
 }
 
 // EarliestRecovery returns the earliest time at which any account may become

@@ -27,7 +27,17 @@ tool[call_x]: 2026-07-18`, testTools(), "auto")
 
 func TestParseModelToolDecisionRejectsBadSchema(t *testing.T) {
 	calls, ok := parseModelToolDecision("```json\n{\"calls\":[{\"name\":\"get_weather\",\"arguments\":{\"city\":2}}]}\n```", testTools(), "auto")
-	if !ok || len(calls) != 0 {
-		t.Fatalf("calls=%v ok=%v", calls, ok)
+	if ok || len(calls) != 0 {
+		t.Fatalf("invalid final envelope must enter repair path: calls=%v ok=%v", calls, ok)
+	}
+}
+
+func TestModelToolRouterPromptMakesNamedChoiceMandatory(t *testing.T) {
+	p := modelToolRouterPrompt("Read the configuration.", testTools(), map[string]any{
+		"type":     "function",
+		"function": map[string]any{"name": "get_weather"},
+	})
+	if !strings.Contains(p, `explicitly requires the declared tool "get_weather"`) || !strings.Contains(p, "never return NO_TOOL_NEEDED") {
+		t.Fatalf("named tool requirement missing: %s", p)
 	}
 }

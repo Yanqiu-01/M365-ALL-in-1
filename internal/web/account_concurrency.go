@@ -8,9 +8,13 @@ import (
 	"sync"
 
 	"m365-copilot2api/internal/chathub"
+	"m365-copilot2api/internal/outbound"
 )
 
-const defaultAccountConcurrency = 8
+const (
+	defaultAccountConcurrency = 64
+	maxAccountConcurrency     = 128
+)
 
 type accountConcurrency struct {
 	mu       sync.Mutex
@@ -22,7 +26,7 @@ type accountConcurrency struct {
 func newAccountConcurrency() *accountConcurrency {
 	limit := defaultAccountConcurrency
 	if raw := strings.TrimSpace(os.Getenv("M365_ACCOUNT_DEFAULT_CONCURRENCY")); raw != "" {
-		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed >= 1 && parsed <= maxAccountConcurrency {
 			limit = parsed
 		}
 	}
@@ -86,32 +90,83 @@ func (c *accountConcurrency) Snapshot() map[string]any {
 }
 
 func (s *Server) accountAvailable(accountID string) bool {
-	return s.accountPool.Available(accountID) && s.accountConcurrency.Available(accountID)
+	if !s.accountPool.Available(accountID) || !s.accountConcurrency.Available(accountID) {
+		return false
+	}
+	if s.upstreamCooldown == nil || s.tokens == nil {
+		return true
+	}
+	account, ok := s.tokens.Get(accountID)
+	return !ok || !s.upstreamCooldown.blocked(account.Email)
+}
+
+// recordUpstreamCooldown applies the APK's email-keyed backoff only to an
+// early retryable transport close. Ordinary application errors continue to be
+// tracked by accountHealth at their existing call sites.
+func (s *Server) recordUpstreamCooldown(accountID string, err error) {
+	if s == nil || s.upstreamCooldown == nil || s.tokens == nil {
+		return
+	}
+	account, ok := s.tokens.Get(accountID)
+	if !ok || account.Email == "" {
+		return
+	}
+	if err == nil {
+		s.upstreamCooldown.clear(account.Email)
+		return
+	}
+	if isEarlyUpstreamClose(err) {
+		s.upstreamCooldown.penalise(account.Email)
+	}
 }
 
 func (s *Server) chatWithAccount(ctx context.Context, accountID string, account chathub.Account, request chathub.Request) (chathub.Result, error) {
+	ctx = outbound.WithAccountAffinity(ctx, accountID)
+	globalRelease, err := acquireChatSlotOrError(ctx)
+	if err != nil {
+		return chathub.Result{}, err
+	}
+	defer globalRelease()
 	release, err := s.accountConcurrency.Acquire(ctx, accountID)
 	if err != nil {
 		return chathub.Result{}, err
 	}
 	defer release()
-	return s.chat.Chat(ctx, account, request)
+	result, err := s.chat.Chat(ctx, account, request)
+	s.recordUpstreamCooldown(accountID, err)
+	return result, err
 }
 
 func (s *Server) chatWithAccountEvents(ctx context.Context, accountID string, account chathub.Account, request chathub.Request, onEvent func(chathub.StreamEvent) error) (chathub.Result, error) {
+	ctx = outbound.WithAccountAffinity(ctx, accountID)
+	globalRelease, err := acquireChatSlotOrError(ctx)
+	if err != nil {
+		return chathub.Result{}, err
+	}
+	defer globalRelease()
 	release, err := s.accountConcurrency.Acquire(ctx, accountID)
 	if err != nil {
 		return chathub.Result{}, err
 	}
 	defer release()
-	return s.chat.ChatWithEvents(ctx, account, request, onEvent)
+	result, err := s.chat.ChatWithEvents(ctx, account, request, onEvent)
+	s.recordUpstreamCooldown(accountID, err)
+	return result, err
 }
 
 func (s *Server) chatWithAccountReasoning(ctx context.Context, accountID string, account chathub.Account, request chathub.Request, onDelta, onReasoning func(string) error) (chathub.Result, error) {
+	ctx = outbound.WithAccountAffinity(ctx, accountID)
+	globalRelease, err := acquireChatSlotOrError(ctx)
+	if err != nil {
+		return chathub.Result{}, err
+	}
+	defer globalRelease()
 	release, err := s.accountConcurrency.Acquire(ctx, accountID)
 	if err != nil {
 		return chathub.Result{}, err
 	}
 	defer release()
-	return s.chat.ChatWithReasoning(ctx, account, request, onDelta, onReasoning)
+	result, err := s.chat.ChatWithReasoning(ctx, account, request, onDelta, onReasoning)
+	s.recordUpstreamCooldown(accountID, err)
+	return result, err
 }

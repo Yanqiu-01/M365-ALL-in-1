@@ -12,7 +12,6 @@ import (
 
 type conversation struct {
 	ID             string    `json:"id"`
-	OwnerID        string    `json:"ownerId,omitempty"`
 	AccountID      string    `json:"accountId"`
 	ConversationID string    `json:"conversationId"`
 	SessionID      string    `json:"sessionId"`
@@ -65,54 +64,25 @@ func (s *sessionStore) list() []conversation {
 	return out
 }
 
-func scopedOwnerKey(ownerID, id string) string {
-	if ownerID == "" {
-		return id
-	}
-	return ownerID + "\x00" + id
-}
-
 func (s *sessionStore) get(id string) (conversation, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if v, ok := s.data[id]; ok {
-		return v, true
-	}
-	for _, v := range s.data {
-		if v.ID == id {
-			return v, true
-		}
-	}
-	return conversation{}, false
-}
-
-func (s *sessionStore) getForOwner(ownerID, id string) (conversation, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	v, ok := s.data[scopedOwnerKey(ownerID, id)]
-	if !ok || (ownerID != "" && v.OwnerID != ownerID) {
-		return conversation{}, false
-	}
-	return v, true
+	v, ok := s.data[id]
+	return v, ok
 }
 
 func (s *sessionStore) upsert(v conversation) conversation {
-	return s.upsertForOwner("", v)
-}
-
-func (s *sessionStore) upsertForOwner(ownerID string, v conversation) conversation {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if v.ID == "" {
 		v.ID = uuid.NewString()
 	}
-	v.OwnerID = ownerID
 	now := time.Now().UTC()
 	if v.CreatedAt.IsZero() {
 		v.CreatedAt = now
 	}
 	v.UpdatedAt = now
-	s.data[scopedOwnerKey(ownerID, v.ID)] = v
+	s.data[v.ID] = v
 	s.persist.markDirty()
 	return v
 }
@@ -120,33 +90,10 @@ func (s *sessionStore) upsertForOwner(ownerID string, v conversation) conversati
 func (s *sessionStore) delete(id string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.data[id]; ok {
-		delete(s.data, id)
-		s.persist.markDirty()
-		return true
-	}
-	deleted := false
-	for key, v := range s.data {
-		if v.ID == id {
-			delete(s.data, key)
-			deleted = true
-		}
-	}
-	if deleted {
-		s.persist.markDirty()
-	}
-	return deleted
-}
-
-func (s *sessionStore) deleteForOwner(ownerID, id string) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	key := scopedOwnerKey(ownerID, id)
-	v, ok := s.data[key]
-	if !ok || (ownerID != "" && v.OwnerID != ownerID) {
+	if _, ok := s.data[id]; !ok {
 		return false
 	}
-	delete(s.data, key)
+	delete(s.data, id)
 	s.persist.markDirty()
 	return true
 }
@@ -206,36 +153,23 @@ func (s *userSessionStore) evictLocked() {
 	}
 }
 
-func userSessionKey(ownerID, user string) string {
-	return scopedOwnerKey(ownerID, user)
-}
-
 func (s *userSessionStore) Get(user string) (userSession, bool) {
-	return s.GetForOwner("", user)
-}
-
-func (s *userSessionStore) GetForOwner(ownerID, user string) (userSession, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.evictLocked()
-	key := userSessionKey(ownerID, user)
-	v, ok := s.data[key]
+	v, ok := s.data[user]
 	if ok {
 		v.LastUsedAt = time.Now().UTC()
-		s.data[key] = v
+		s.data[user] = v
 		s.persist.markDirty()
 	}
 	return v, ok
 }
 
 func (s *userSessionStore) Put(user, conversationID, sessionID, accountID string) {
-	s.PutForOwner("", user, conversationID, sessionID, accountID)
-}
-
-func (s *userSessionStore) PutForOwner(ownerID, user, conversationID, sessionID, accountID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.data[userSessionKey(ownerID, user)] = userSession{
+	s.data[user] = userSession{
 		ConversationID: conversationID,
 		SessionID:      sessionID,
 		AccountID:      accountID,
@@ -245,13 +179,9 @@ func (s *userSessionStore) PutForOwner(ownerID, user, conversationID, sessionID,
 }
 
 func (s *userSessionStore) Delete(user string) {
-	s.DeleteForOwner("", user)
-}
-
-func (s *userSessionStore) DeleteForOwner(ownerID, user string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	delete(s.data, userSessionKey(ownerID, user))
+	delete(s.data, user)
 	s.persist.markDirty()
 }
 
