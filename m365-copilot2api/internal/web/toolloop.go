@@ -240,6 +240,26 @@ var toolRefusalPatterns = []string{
 	"/mnt/data",
 	"current execution environment has changed",
 	"linux sandbox",
+	// 2026-08-24: the model asserted "the tools actually provided to me this
+	// turn still contain no PowerShell, Read, Glob ... only isolated container
+	// tools, and that container does not map C:\ or E:\". It names the declared
+	// tools while denying they were declared, so a match on tool names alone is
+	// not enough -- these phrasings keyed on "what I was given this turn".
+	"提供给我的工具",
+	"提供给我的工具中",
+	"实际提供给我",
+	"本轮实际提供",
+	"仍没有 PowerShell",
+	"只有隔离的容器工具",
+	"隔离的容器工具",
+	"未映射",
+	"不能自行连接",
+	"未开放的工具",
+	"tools actually provided",
+	"tools provided to me",
+	"no tools were provided",
+	"not among the tools",
+	"isolated container",
 	"linux container",
 	"running in a container",
 	"cannot modify source code",
@@ -276,6 +296,26 @@ var sandboxHallucinationPatterns = []string{
 	"/mnt/data",
 	"linux container",
 	"linux sandbox",
+	// 2026-08-24: the model asserted "the tools actually provided to me this
+	// turn still contain no PowerShell, Read, Glob ... only isolated container
+	// tools, and that container does not map C:\ or E:\". It names the declared
+	// tools while denying they were declared, so a match on tool names alone is
+	// not enough -- these phrasings keyed on "what I was given this turn".
+	"提供给我的工具",
+	"提供给我的工具中",
+	"实际提供给我",
+	"本轮实际提供",
+	"仍没有 PowerShell",
+	"只有隔离的容器工具",
+	"隔离的容器工具",
+	"未映射",
+	"不能自行连接",
+	"未开放的工具",
+	"tools actually provided",
+	"tools provided to me",
+	"no tools were provided",
+	"not among the tools",
+	"isolated container",
 	"cloud sandbox",
 	"execution environment has changed",
 	"cannot access the Windows path",
@@ -285,6 +325,16 @@ var sandboxHallucinationPatterns = []string{
 	"I don't have SSH access tools",
 	"I don't have any tools",
 	"none of which can reach",
+	// 同上：模型用「本轮提供给我的工具里没有」来否认已声明的工具。
+	"提供给我的工具",
+	"实际提供给我",
+	"只有隔离的容器工具",
+	"隔离的容器工具",
+	"未映射",
+	"未开放的工具",
+	"tools actually provided",
+	"tools provided to me",
+	"isolated container",
 }
 
 func isSandboxHallucination(text string) bool {
