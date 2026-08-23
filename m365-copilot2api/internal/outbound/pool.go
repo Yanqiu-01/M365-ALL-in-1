@@ -2,10 +2,15 @@ package outbound
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -15,6 +20,20 @@ import (
 const maxWebSocketDialAttempts = 2
 
 var errNoWebSocketProxyAvailable = errors.New("no untried websocket proxy available")
+
+// Selection tiers. An exit is ranked by tier first and by score second, so a
+// healthy slow exit always beats a fast one that is failing.
+const (
+	tierLive = iota
+	tierSuspect
+	tierEvicted
+)
+
+// probeSample is one round of the quality guard for one exit.
+type probeSample struct {
+	pass    bool
+	latency time.Duration
+}
 
 type poolEntry struct {
 	raw              string
@@ -26,7 +45,60 @@ type poolEntry struct {
 	lastError        string
 	health           string
 	activeWebSockets int
+
+	// Quality-guard state. The zero value is a live exit with no samples, which
+	// keeps a freshly configured pool routable before the first probe lands.
+	state                string
+	consecutiveFailures  int
+	consecutiveSuccesses int
+	window               []probeSample
+	score                float64
+	medianLatency        time.Duration
+	wsOK                 bool
+	backoff              time.Duration
+	nextProbe            time.Time
 }
+
+// stateName normalises the empty zero value to live.
+func (e *poolEntry) stateName() string {
+	if e.state == "" {
+		return stateLive
+	}
+	return e.state
+}
+
+// tier classifies an exit for selection. A cooldown set by mark() - that is, by a
+// real user request failing - counts as evicted for ranking purposes: it is the
+// signal that live traffic just broke on this exit.
+func (e *poolEntry) tier(now time.Time) int {
+	switch {
+	case e.stateName() == stateEvicted:
+		return tierEvicted
+	case now.Before(e.cooldown):
+		return tierEvicted
+	case e.stateName() == stateSuspect:
+		return tierSuspect
+	default:
+		return tierLive
+	}
+}
+
+// id is a stable identifier derived from the host:port of the exit. It never
+// contains credentials, so it is safe to hand to a browser and to accept back on
+// a delete request.
+func (e *poolEntry) id() string {
+	return proxyEntryID(e.raw)
+}
+
+func proxyEntryID(raw string) string {
+	key := strings.TrimSpace(raw)
+	if u, err := url.Parse(key); err == nil && u.Host != "" {
+		key = strings.ToLower(u.Scheme) + "://" + strings.ToLower(u.Host)
+	}
+	sum := sha256.Sum256([]byte(key))
+	return hex.EncodeToString(sum[:])[:12]
+}
+
 type Pool struct {
 	mu        sync.Mutex
 	entries   []*poolEntry
@@ -65,21 +137,53 @@ func (p *Pool) pickLocked() *poolEntry {
 	if len(p.entries) == 0 {
 		return nil
 	}
-	now := time.Now()
-	for i := 0; i < len(p.entries); i++ {
-		e := p.entries[(p.next+i)%len(p.entries)]
-		if now.Before(e.cooldown) {
+	return p.bestLocked(time.Now(), func(*poolEntry) bool { return true })
+}
+
+// bestLocked implements the selection policy: always the best exit available.
+//
+// Entries are ranked by tier (live, then suspect, then evicted/cooling) and by
+// score inside a tier, descending; ties keep configuration order so the choice is
+// deterministic. There is deliberately no rotation. Round-robin used to hand an
+// equal share of traffic to slow and half-dead exits, and it made a session bounce
+// between a fast and a slow egress; the guard's score is what decides now.
+//
+// A suspect exit is therefore only reached when no live exit is eligible, which is
+// the "fall back only when there is nothing healthy" rule. An evicted exit is last
+// resort: with entries in the pool, returning nil would either hang the WebSocket
+// waiter or silently leak the operator's own IP by dialing Microsoft directly, so
+// an evicted exit is still preferable while the guard keeps re-probing it.
+func (p *Pool) bestLocked(now time.Time, eligible func(*poolEntry) bool) *poolEntry {
+	var best *poolEntry
+	bestTier := tierEvicted
+	for _, e := range p.entries {
+		if eligible != nil && !eligible(e) {
 			continue
 		}
-		p.next = (p.next + i + 1) % len(p.entries)
-		return e
+		tier := e.tier(now)
+		if best == nil || tier < bestTier || (tier == bestTier && e.score > best.score) {
+			best, bestTier = e, tier
+		}
 	}
-	e := p.entries[p.next%len(p.entries)]
-	p.next = (p.next + 1) % len(p.entries)
-	return e
+	return best
 }
+
+// hasLiveLocked reports whether any exit is currently in the live tier. It is what
+// makes "suspect exits are a fallback only" observable to the guard and to tests.
+func (p *Pool) hasLiveLocked(now time.Time) bool {
+	for _, e := range p.entries {
+		if e.tier(now) == tierLive {
+			return true
+		}
+	}
+	return false
+}
+
 func (p *Pool) pickSticky(accountID string) *poolEntry {
-	if accountID == "" || p == nil {
+	if p == nil {
+		return nil
+	}
+	if accountID == "" {
 		return p.pick()
 	}
 	p.mu.Lock()
@@ -87,10 +191,12 @@ func (p *Pool) pickSticky(accountID string) *poolEntry {
 	if p.sticky == nil {
 		p.sticky = map[string]string{}
 	}
+	now := time.Now()
 	if raw, ok := p.sticky[accountID]; ok {
-		now := time.Now()
 		for _, entry := range p.entries {
-			if entry.raw == raw && !now.Before(entry.cooldown) {
+			// Affinity is honoured only while the bound exit is healthy: an account
+			// pinned to a failing exit would otherwise never fail over.
+			if entry.raw == raw && entry.tier(now) == tierLive {
 				return entry
 			}
 		}
@@ -129,6 +235,10 @@ func (p *Pool) markFor(accountID, raw string, err error) {
 	p.mark(raw, err)
 }
 
+// mark records the outcome of real user traffic. It keeps the backoff behaviour it
+// always had; eviction is the quality guard's job (see guard.go), because a probe
+// result is a controlled measurement while a request failure can also mean the
+// upstream, not the exit, is broken.
 func (p *Pool) mark(raw string, err error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -271,6 +381,9 @@ func (p *Pool) acquireWebSocket(ctx context.Context, accountID string, excluded 
 	}
 }
 
+// pickStickyWebSocketLocked selects the WebSocket exit. The per-exit concurrency
+// budget (maxWebSockets) is the only reason the best exit is skipped: it is a hard
+// capacity limit, so the next best score takes over until a slot frees up.
 func (p *Pool) pickStickyWebSocketLocked(accountID string, excluded map[*poolEntry]struct{}) *poolEntry {
 	if len(p.entries) == 0 {
 		return nil
@@ -280,6 +393,12 @@ func (p *Pool) pickStickyWebSocketLocked(accountID string, excluded map[*poolEnt
 		limit = defaultOutboundMaxWebSockets
 	}
 	now := time.Now()
+	eligible := func(entry *poolEntry) bool {
+		if _, skip := excluded[entry]; skip {
+			return false
+		}
+		return entry.activeWebSockets < limit
+	}
 	if accountID != "" {
 		if p.sticky == nil {
 			p.sticky = map[string]string{}
@@ -289,26 +408,14 @@ func (p *Pool) pickStickyWebSocketLocked(accountID string, excluded map[*poolEnt
 				if entry.raw != raw {
 					continue
 				}
-				if _, skip := excluded[entry]; !skip && entry.activeWebSockets < limit && !now.Before(entry.cooldown) {
+				if eligible(entry) && entry.tier(now) == tierLive {
 					return entry
 				}
 			}
 			delete(p.sticky, accountID)
 		}
 	}
-	start := p.next % len(p.entries)
-	for pass := 0; pass < 2; pass++ {
-		for i := 0; i < len(p.entries); i++ {
-			index := (start + i) % len(p.entries)
-			entry := p.entries[index]
-			if _, skip := excluded[entry]; skip || entry.activeWebSockets >= limit || (pass == 0 && now.Before(entry.cooldown)) {
-				continue
-			}
-			p.next = (index + 1) % len(p.entries)
-			return entry
-		}
-	}
-	return nil
+	return p.bestLocked(now, eligible)
 }
 
 func (p *Pool) hasUntriedWebSocketLocked(excluded map[*poolEntry]struct{}) bool {
@@ -340,15 +447,42 @@ func (c *pooledConn) Close() error {
 	c.once.Do(c.release)
 	return err
 }
+
+// List reports pool status for the admin API and the dashboard.
+//
+// The url field is redacted here, at the source: it used to carry the proxy
+// password verbatim into the browser (visible in the devtools network tab and in
+// the settings response). Deleting by url keeps working because RemoveProxy accepts
+// the redacted form as well as the raw one (see sameProxyURL); the id field is a
+// credential-free alternative for the same purpose.
+//
+// Every pre-existing key is preserved with its original name and type. The guard
+// fields are additions only.
 func (p *Pool) List() []map[string]any {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	out := make([]map[string]any, 0, len(p.entries))
 	for _, e := range p.entries {
-		out = append(out, map[string]any{"url": e.raw, "failures": e.failures, "cooldownUntil": e.cooldown, "lastCheck": e.lastCheck, "latencyMs": e.latency.Milliseconds(), "lastError": e.lastError, "health": e.health, "activeWebSockets": e.activeWebSockets, "maxWebSockets": p.wsLimit})
+		lastCheckedAt := ""
+		if !e.lastCheck.IsZero() {
+			lastCheckedAt = e.lastCheck.Format(time.RFC3339)
+		}
+		out = append(out, map[string]any{
+			"url": redactProxyDisplay(e.raw), "failures": e.failures, "cooldownUntil": e.cooldown,
+			"lastCheck": e.lastCheck, "latencyMs": e.latency.Milliseconds(), "lastError": e.lastError,
+			"health": e.health, "activeWebSockets": e.activeWebSockets, "maxWebSockets": p.wsLimit,
+			"id": e.id(), "state": e.stateName(), "score": roundScore(e.score),
+			"medianLatencyMs": e.medianLatency.Milliseconds(), "wsOk": e.wsOK,
+			"lastCheckedAt": lastCheckedAt, "consecutiveFailures": e.consecutiveFailures,
+		})
 	}
 	return out
 }
+
+func roundScore(v float64) float64 {
+	return float64(int64(v*1000+0.5)) / 1000
+}
+
 // rawURLs returns the exits verbatim, credentials included. Reserved for the
 // settings persistence path and for internal add/remove bookkeeping, both of
 // which need a URL that can actually be dialed again.
@@ -364,6 +498,8 @@ func (p *Pool) rawURLs() []string {
 
 // ListRedacted is List with the password of every exit masked. Use it for
 // anything that leaves the process: an API response, a log line, a template.
+// List already redacts; this stays as the explicit spelling for callers that want
+// the guarantee at the call site.
 func (p *Pool) ListRedacted() []map[string]any {
 	items := p.List()
 	for _, item := range items {
@@ -372,6 +508,34 @@ func (p *Pool) ListRedacted() []map[string]any {
 		}
 	}
 	return items
+}
+
+// RawURLForID resolves the credential-free id from List back to a dialable URL.
+// It lets the admin UI delete an exit without ever holding its password.
+func (p *Pool) RawURLForID(id string) string {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return ""
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, e := range p.entries {
+		if e.id() == id {
+			return e.raw
+		}
+	}
+	return ""
+}
+
+// ProxyRawURLForID resolves the credential-free id from the status view back to a
+// dialable URL on the active pool. It exists so the admin API can delete an exit by
+// id, without the browser ever having to hold the proxy password.
+func ProxyRawURLForID(id string) string {
+	p := CurrentPool()
+	if p == nil {
+		return ""
+	}
+	return p.RawURLForID(id)
 }
 
 func (p *Pool) Remove(raw string) {
@@ -431,23 +595,15 @@ func (t *poolRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) {
 	return resp, err
 }
 
+// pickDifferent returns the best exit other than previous, so a retry moves to the
+// runner-up by score instead of to the next slot in a rotation.
 func (p *Pool) pickDifferent(previous *poolEntry) *poolEntry {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if len(p.entries) < 2 {
 		return nil
 	}
-	now := time.Now()
-	for i := 0; i < len(p.entries); i++ {
-		index := (p.next + i) % len(p.entries)
-		entry := p.entries[index]
-		if entry == previous || now.Before(entry.cooldown) {
-			continue
-		}
-		p.next = (index + 1) % len(p.entries)
-		return entry
-	}
-	return nil
+	return p.bestLocked(time.Now(), func(entry *poolEntry) bool { return entry != previous })
 }
 
 func (p *Pool) bindSticky(accountID, raw string) {
@@ -472,4 +628,115 @@ func safeRetryMethod(r *http.Request) bool {
 	default:
 		return false
 	}
+}
+
+// applyProbe folds one probe round into the quality state of an exit and advances
+// the state machine. It is the only place state, score and the sliding window are
+// written, so the transitions live in exactly one function.
+func (p *Pool) applyProbe(e *poolEntry, result probeResult, now time.Time, timing guardTiming) {
+	if e == nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	e.lastCheck = now
+	e.latency = result.l2Latency
+	e.health = result.health
+	e.wsOK = result.wsOK
+	e.lastError = ""
+	if result.err != nil {
+		e.lastError = result.err.Error()
+	}
+
+	e.window = append(e.window, probeSample{pass: result.pass, latency: result.l2Latency})
+	if len(e.window) > timing.window {
+		e.window = e.window[len(e.window)-timing.window:]
+	}
+
+	if result.pass {
+		e.consecutiveFailures = 0
+		e.consecutiveSuccesses++
+		if e.stateName() != stateEvicted || e.consecutiveSuccesses >= timing.restoreAfter {
+			e.state = stateLive
+			e.backoff = 0
+		}
+	} else {
+		e.consecutiveSuccesses = 0
+		e.consecutiveFailures++
+		switch {
+		case e.consecutiveFailures >= timing.evictAfter:
+			e.state = stateEvicted
+			if e.backoff <= 0 {
+				e.backoff = timing.base
+			} else {
+				e.backoff *= 2
+			}
+			if e.backoff > timing.maxBackoff {
+				e.backoff = timing.maxBackoff
+			}
+		default:
+			e.state = stateSuspect
+			e.backoff = 0
+		}
+	}
+
+	passes, attempts, median := windowStats(e.window)
+	e.medianLatency = median
+	e.score = guardScore(passes, attempts, median, e.wsOK)
+	e.nextProbe = now.Add(e.probeIntervalLocked(timing))
+}
+
+// probeIntervalLocked is the per-state probe cadence: live exits every base
+// interval, suspect exits twice as often to resolve the ambiguity quickly, evicted
+// exits on an exponential backoff.
+func (e *poolEntry) probeIntervalLocked(timing guardTiming) time.Duration {
+	switch e.stateName() {
+	case stateEvicted:
+		if e.backoff > 0 {
+			return e.backoff
+		}
+		return timing.base
+	case stateSuspect:
+		return timing.suspect
+	default:
+		return timing.base
+	}
+}
+
+func windowStats(window []probeSample) (passes, attempts int, median time.Duration) {
+	latencies := make([]time.Duration, 0, len(window))
+	for _, sample := range window {
+		attempts++
+		if sample.pass {
+			passes++
+		}
+		if sample.latency > 0 {
+			latencies = append(latencies, sample.latency)
+		}
+	}
+	if len(latencies) > 0 {
+		sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
+		median = latencies[len(latencies)/2]
+	}
+	return passes, attempts, median
+}
+
+// dueForProbe returns the exits whose next probe is due. A never-probed exit is
+// always due, so the first sweep after startup covers the whole pool.
+//
+// Being a routing fallback and being probed are separate concerns: a suspect exit
+// only carries traffic when nothing is live, yet it is probed on the faster suspect
+// cadence precisely so it gets re-qualified or evicted quickly.
+func (p *Pool) dueForProbe(now time.Time, timing guardTiming) []*poolEntry {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	due := make([]*poolEntry, 0, len(p.entries))
+	for _, e := range p.entries {
+		if !e.nextProbe.IsZero() && e.nextProbe.After(now) {
+			continue
+		}
+		due = append(due, e)
+	}
+	return due
 }

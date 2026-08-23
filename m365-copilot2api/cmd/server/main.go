@@ -44,6 +44,10 @@ func main() {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	// Background patrol over the egress pool. It owns no goroutine beyond ctx:
+	// waitForProxyGuard blocks until the patrol has actually returned, so nothing
+	// outlives main.
+	waitForProxyGuard := outbound.StartProxyGuard(ctx)
 	go func() {
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -55,6 +59,10 @@ func main() {
 	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
 	}
+	// The listener has returned, so stop the signal context and wait for the
+	// patrol goroutine to finish before the process exits.
+	stop()
+	waitForProxyGuard()
 	web.StopPersistLoop()
 	log.Println("shutdown complete")
 }
