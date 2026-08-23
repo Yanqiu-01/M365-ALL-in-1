@@ -19,16 +19,19 @@
   --font-sans:"LXGW WenKai","霞鹜文楷","LXGW WenKai Medium","霞鹜文楷 Medium",-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei","PingFang SC","Hiragino Sans GB","Noto Sans SC","Source Han Sans SC",system-ui,"Helvetica Neue",Arial,sans-serif;
   --font-mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Cascadia Mono","Liberation Mono","Microsoft YaHei Mono",monospace;
 
-  /* 字号比例尺：10 / 11 / 12 / 13 / 14 / 17 / 20 / 26 / 32 */
-  --fs-micro:10px;   /* 全大写眉标，仅配 letter-spacing 使用 */
-  --fs-caption:11px; /* 辅助说明、表头 */
-  --fs-sm:12px;      /* 次要正文 */
-  --fs-base:13px;    /* 界面正文基准 */
-  --fs-md:14px;      /* 长段落正文 */
-  --fs-lg:17px;      /* 卡片/弹窗标题 */
-  --fs-xl:20px;      /* 页面标题 */
-  --fs-2xl:26px;     /* 指标数字 */
-  --fs-3xl:32px;     /* 登录页主标题 */
+  /* 字号比例尺：11 / 12 / 13 / 15 / 16 / 19 / 23 / 29 / 35
+     每一级都乘 --fs-scale —— 顶栏「字号」滑块只改这一个令牌，全站文字等比缩放。
+     区间 0.9–1.5，由 <head> 早期脚本与 app 脚本共同维护（localStorage 持久化）。 */
+  --fs-scale:1;
+  --fs-micro:calc(11px * var(--fs-scale));   /* 全大写眉标，仅配 letter-spacing 使用 */
+  --fs-caption:calc(12px * var(--fs-scale)); /* 辅助说明、表头 */
+  --fs-sm:calc(13px * var(--fs-scale));      /* 次要正文 */
+  --fs-base:calc(15px * var(--fs-scale));    /* 界面正文基准 */
+  --fs-md:calc(16px * var(--fs-scale));      /* 长段落正文 */
+  --fs-lg:calc(19px * var(--fs-scale));      /* 卡片/弹窗标题 */
+  --fs-xl:calc(23px * var(--fs-scale));      /* 页面标题 */
+  --fs-2xl:calc(29px * var(--fs-scale));     /* 指标数字 */
+  --fs-3xl:calc(35px * var(--fs-scale));     /* 登录页主标题 */
 
   /* 行高与字间距 */
   --lh-tight:1.25;
@@ -40,11 +43,11 @@
   --tr-caps:0.08em;
   --tr-wide:0.04em;
 
-  /* 字重：与系统字体实际可用字重对齐，不做 750 之类的插值 */
-  --fw-normal:400;
-  --fw-medium:500;
-  --fw-semi:600;
-  --fw-bold:700;
+  /* 字重：整体加粗一档，正文即 600，层级靠 600 / 700 / 800 三段区分 */
+  --fw-normal:600;
+  --fw-medium:600;
+  --fw-semi:700;
+  --fw-bold:800;
 
   /* 间距：严格 4px 栅格 */
   --sp-1:4px;  --sp-2:8px;  --sp-3:12px; --sp-4:16px;
@@ -69,9 +72,9 @@
   --sidebar-rail:64px;
   --topbar-h:52px;
 
-  /* --- 莲纹 / 博丽结界 调色板（照抄参考主题令牌，不另发明色值）------------
+  /* --- 调色板（照抄参考主题令牌，不另发明色值）----------------------------
      ink 墨 / paper 纸 / jade 玉青 / vermilion 朱红 / gold 金 / blue 靛
-     结构色是玉青（侧栏、表头、当前态），朱红只给危险与错误，金只给强调与印章。 */
+     结构色是玉青（侧栏、表头、当前态），朱红只给危险与错误，金只给强调。 */
   --ink:#143638;
   --ink-strong:#082c2e;
   --paper:#f4f0d8;
@@ -87,7 +90,7 @@
   --gold:#c58c2f;
   --blue:#397b9f;
 
-  /* 侧栏（博丽结界）与印章：始终是深玉青底 + 纸色字，两套主题共用一套值，
+  /* 侧栏：始终是深玉青底 + 纸色字，两套主题共用一套值，
      因此这些令牌不在 dark 段里重复覆盖。 */
   --rail-bg:
     repeating-linear-gradient(0deg,transparent 0 23px,rgba(255,253,232,0.045) 23px 24px),
@@ -101,15 +104,12 @@
   --rail-hover:rgba(255,253,232,0.1);
   --rail-active-bg:rgba(255,250,222,0.95);
   --rail-active-text:#082c2e;
-  --seal-bg:#b3262a;
-  --seal-line:rgba(255,250,220,0.78);
-  --seal-text:#fffdf0;
 
   /* 通知条底色：两套主题同用深色底 + 纸色字，避免深色下白字压浅底 */
   --notice-ok-bg:#196845;
   --notice-err-bg:#a92620;
 
-  /* 页面底：纸色渐变 + 极淡玉青细格 + 右下角「结界」同心环（背景层，非元素） */
+  /* 页面底：纸色渐变 + 极淡玉青细格 + 右下角同心环（背景层，非元素） */
   --page-bg:
     radial-gradient(circle at 100% 100%,rgba(207,61,53,0.04) 0 41.6vmin,transparent 42vmin),
     repeating-radial-gradient(circle at 100% 100%,transparent 0 5.6vmin,rgba(13,75,73,0.032) 5.6vmin 5.75vmin),
@@ -318,8 +318,8 @@ code,kbd,pre,samp,.mono{font-family:var(--font-mono)}
   backdrop-filter:blur(2px);z-index:39;border:0;padding:0;display:none;cursor:pointer}
 .scrim.open{display:block;animation:fadeIn var(--dur-fast) ease}
 
-/* 侧栏＝「博丽结界」：深玉青底 + 细结界格纹，两套主题共用（令牌不随明暗切换）。
-   装饰只在这里集中（结界印章、格纹、右下同心环），正文区保持素净。 */
+/* 侧栏：深玉青底 + 细格纹，两套主题共用（令牌不随明暗切换）。
+   装饰只在这里集中（格纹、右下同心环），正文区保持素净。 */
 .sidebar{
   width:var(--sidebar-w);flex-shrink:0;
   background-color:var(--rail-solid);
@@ -332,28 +332,17 @@ code,kbd,pre,samp,.mono{font-family:var(--font-mono)}
   box-shadow:inset -1px 0 0 rgba(5,48,49,0.4),6px 0 24px rgba(3,44,45,0.14);
   transition:transform var(--dur) var(--ease-out);
 }
-/* 结界印章：侧栏右上角朱红竖排方章，是全页唯一的「印」 */
-.barrier-seal{
-  position:absolute;top:var(--sp-5);right:var(--sp-3);z-index:1;
-  display:grid;width:30px;justify-items:center;gap:2px;padding:6px 2px;
-  color:var(--seal-text);background:var(--seal-bg);
-  border:1px solid var(--seal-line);
-  box-shadow:inset 0 0 0 2px rgba(113,23,22,0.3);
-  transform:rotate(3deg);pointer-events:none;user-select:none;
-  font-size:var(--fs-caption);line-height:1.1;letter-spacing:0;
-}
-.barrier-seal b{font-size:var(--fs-sm);font-weight:var(--fw-bold);writing-mode:vertical-rl}
 .logo{display:flex;align-items:center;gap:var(--sp-2);
   font-size:var(--fs-lg);font-weight:var(--fw-bold);letter-spacing:var(--tr-tight);
-  line-height:var(--lh-tight);padding:0 42px var(--sp-2) var(--sp-2);
+  line-height:var(--lh-tight);padding:0 var(--sp-2) var(--sp-2);
   color:var(--rail-text-strong)}
-/* 品牌下的东方眉标：一条金线 + 中英对照 */
-.logo-sub{display:block;padding:0 42px var(--sp-4) var(--sp-2);
+/* 品牌副标题：一条金线 + 中英对照 */
+.logo-sub{display:block;padding:0 var(--sp-2) var(--sp-4);
   color:var(--rail-muted);font-size:var(--fs-caption);letter-spacing:var(--tr-wide);
   line-height:var(--lh-snug)}
 .logo-sub::before{content:"";display:block;width:26px;height:1px;
   margin-bottom:5px;background:var(--gold)}
-/* 品牌标记：结界符印（朱红外框 + 纸心 + 十字），替掉原四色方块 */
+/* 品牌标记：朱红外框 + 纸心 + 十字，替掉原四色方块 */
 .logo-mark{position:relative;width:22px;height:26px;flex-shrink:0;display:block;
   border:2px solid var(--vermilion);background:var(--paper-bright)}
 .logo-mark span{display:block;position:absolute;background:var(--vermilion)}
@@ -362,11 +351,10 @@ code,kbd,pre,samp,.mono{font-family:var(--font-mono)}
 .logo-mark span:nth-child(3){left:3px;right:3px;bottom:5px;height:1px;background:var(--gold)}
 .logo-mark span:nth-child(4){display:none}
 
-/* 分区标题：金色菱点 + 细分隔线（克制的装饰，只出现在分区标题上） */
+/* 分组标签：只有文字 + 右侧细分隔线 */
 .nav-label{font-size:var(--fs-micro);font-weight:var(--fw-bold);text-transform:uppercase;
   letter-spacing:var(--tr-caps);color:var(--rail-muted);padding:0 var(--sp-2);
   margin:var(--sp-4) 0 var(--sp-1);display:flex;align-items:center;gap:7px}
-.nav-label::before{content:"\25c6";color:var(--gold);font-size:8px;flex:none}
 .nav-label::after{content:"";flex:1;height:1px;background:var(--rail-line)}
 .nav{display:flex;flex-direction:column;gap:2px}
 .nav button{
@@ -382,7 +370,7 @@ code,kbd,pre,samp,.mono{font-family:var(--font-mono)}
   border-color:rgba(255,253,232,0.18)}
 .nav button:hover .ico{color:var(--rail-text-strong)}
 .nav button:active{background:rgba(255,253,232,0.16)}
-/* 当前态：纸色符卡贴在玉青上，左侧朱红指示条 */
+/* 当前态：纸色卡片贴在玉青上，左侧朱红指示条 */
 .nav button.active{background:var(--rail-active-bg);color:var(--rail-active-text);
   font-weight:var(--fw-semi);border-color:rgba(255,255,240,0.7);
   box-shadow:0 4px 12px rgba(3,38,39,0.22)}
@@ -397,13 +385,14 @@ code,kbd,pre,samp,.mono{font-family:var(--font-mono)}
 
 .main{flex:1;min-width:0;display:flex;flex-direction:column;transition:background .3s ease}
 
-/* 顶栏：纸面玻璃 + 底缘符卡三色状态条（朱红 / 金 / 玉青） */
+/* 顶栏：纸面玻璃 + 底缘三色状态条（朱红 / 金 / 玉青）。
+   高度用 min-height —— 字号放大到 1.5 时顶栏跟着长高，而不是裁掉文字。 */
 .topbar{
-  height:var(--topbar-h);background:var(--surface);
+  min-height:var(--topbar-h);background:var(--surface);
   -webkit-backdrop-filter:blur(20px) saturate(180%);backdrop-filter:blur(20px) saturate(180%);
   border-bottom:1px solid var(--line);
   display:flex;align-items:center;justify-content:space-between;gap:var(--sp-3);
-  padding:0 var(--sp-7);position:sticky;top:0;z-index:10;
+  padding:var(--sp-1) var(--sp-7);position:sticky;top:0;z-index:10;
   transition:background .3s ease,border-color .3s ease;
 }
 .topbar::after{content:"";position:absolute;left:0;right:0;bottom:-1px;height:2px;
@@ -413,13 +402,17 @@ code,kbd,pre,samp,.mono{font-family:var(--font-mono)}
 .topbar-left{display:flex;align-items:center;gap:var(--sp-3);min-width:0}
 .topbar h1{font-size:var(--fs-md);font-weight:var(--fw-semi);letter-spacing:var(--tr-snug);
   color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-/* header 状态条：符卡就绪标记，纯装饰（不承载状态语义，故 aria-hidden） */
+/* header 标记：三色装饰条，纯装饰（不承载状态语义，故 aria-hidden） */
 .topbar-mark{flex:none;width:20px;height:2px;background:var(--vermilion);
   box-shadow:7px -4px 0 -0.5px var(--gold),7px 4px 0 -0.5px var(--jade-700)}
-.topbar-spell{flex:none;color:var(--muted);font-size:var(--fs-micro);font-weight:var(--fw-bold);
-  letter-spacing:var(--tr-caps);text-transform:uppercase;
-  padding-left:var(--sp-2);border-left:1px solid var(--line)}
 .topbar-right{display:flex;align-items:center;gap:var(--sp-2);font-size:var(--fs-sm)}
+/* 字号调节条：写 --fs-scale 令牌，全站 --fs-* 都是 calc(px * var(--fs-scale)) */
+.fs-scale{flex:none;display:flex;align-items:center;gap:var(--sp-1)}
+.fs-scale-label{font-size:var(--fs-caption);font-weight:var(--fw-semi);color:var(--muted);
+  white-space:nowrap;cursor:pointer}
+.fs-scale-range{width:84px;margin:0;accent-color:var(--accent);cursor:pointer}
+.fs-scale-val{font-size:var(--fs-caption);font-weight:var(--fw-semi);color:var(--muted);
+  min-width:4ch;text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
 .topbar-status{display:inline-flex;align-items:center;gap:var(--sp-1);
   font-size:var(--fs-sm);font-weight:var(--fw-semi);color:var(--green-text);
   padding:var(--sp-1) var(--sp-2);border-radius:var(--radius-pill);
@@ -451,7 +444,7 @@ code,kbd,pre,samp,.mono{font-family:var(--font-mono)}
    -------------------------------------------------------------------------*/
 
 /* 4.1 卡片 */
-/* 卡片：纸面 + 玉青描边。不加符卡花纹 —— 数据密集页靠留白和层级说话。 */
+/* 卡片：纸面 + 玉青描边。不加额外花纹 —— 数据密集页靠留白和层级说话。 */
 .card{background:var(--surface);
   -webkit-backdrop-filter:blur(20px) saturate(180%);backdrop-filter:blur(20px) saturate(180%);
   border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow-sm);
@@ -1041,7 +1034,6 @@ textarea.form-input{min-height:80px;line-height:var(--lh-normal);resize:vertical
   padding-bottom:var(--sp-2);border-bottom:1px solid var(--line)}
 .dash-sec-t{font-size:var(--fs-lg);font-weight:var(--fw-semi);letter-spacing:var(--tr-snug);
   color:var(--text);display:flex;align-items:center;gap:7px}
-.dash-sec-t::before{content:"\25c6";color:var(--gold);font-size:9px;flex:none}
 .dash-sec-d{font-size:var(--fs-caption);color:var(--muted);margin-top:2px}
 .dash-sec-actions{display:flex;gap:var(--sp-2);align-items:center;flex-wrap:wrap}
 
@@ -1192,7 +1184,7 @@ textarea.form-input{min-height:80px;line-height:var(--lh-normal);resize:vertical
   color:var(--accent-text);font-size:var(--fs-micro);font-weight:var(--fw-bold);
   display:grid;place-items:center;margin-top:1px}
 .steps-item.done::before{content:"OK";background:var(--green-soft);color:var(--green-text);
-  font-size:8px}
+  font-size:calc(9px * var(--fs-scale))}
 .pwd-field{position:relative}
 .pwd-field .form-input{padding-right:38px}
 .pwd-toggle{position:absolute;right:6px;top:50%;transform:translateY(-50%);
@@ -1220,16 +1212,18 @@ textarea.form-input{min-height:80px;line-height:var(--lh-normal);resize:vertical
   .onb-grid{grid-template-columns:minmax(0,1fr)}
   .onb-steps,.onb-code{min-width:0}
   .content{padding:var(--sp-4)}
-  .topbar{padding:0 var(--sp-4)}
+  .topbar{padding:var(--sp-1) var(--sp-4)}
   .icon-btn{display:inline-flex}
+  /* 顶栏变窄：字号调节条只留滑块与百分比 */
+  .fs-scale-label{display:none}
+  .fs-scale-range{width:72px}
 
   /* 折叠态：只留图标，label 隐藏，宽度收到 rail */
   .sidebar{width:var(--sidebar-rail);padding:var(--sp-4) var(--sp-2);align-items:stretch}
   .sidebar .logo span:not(.logo-mark):not(.logo-mark span){display:none}
   .sidebar .logo{justify-content:center;padding:0 0 var(--sp-4)}
-  /* 折叠成图标条时印章和副标题都藏起来，避免挤压 */
-  .sidebar .barrier-seal,.sidebar .logo-sub{display:none}
-  .sidebar.open .barrier-seal,.sidebar.open .logo-sub{display:grid}
+  /* 折叠成图标条时副标题藏起来，避免挤压 */
+  .sidebar .logo-sub{display:none}
   .sidebar.open .logo-sub{display:block}
   .sidebar .nav-label{display:none}
   .sidebar .nav button{justify-content:center;padding:var(--sp-2) 0}
@@ -1242,7 +1236,7 @@ textarea.form-input{min-height:80px;line-height:var(--lh-normal);resize:vertical
     width:var(--sidebar-w);padding:var(--sp-5) var(--sp-3) var(--sp-4);
     background-color:var(--rail-solid);background-image:var(--rail-bg);
     box-shadow:var(--shadow-lg);align-items:stretch}
-  .sidebar.open .logo{justify-content:flex-start;padding:0 42px var(--sp-2) var(--sp-2)}
+  .sidebar.open .logo{justify-content:flex-start;padding:0 var(--sp-2) var(--sp-2)}
   .sidebar.open .logo span{display:inline}
   .sidebar.open .logo .logo-mark span{display:block}
   .sidebar.open .nav-label{display:block}
@@ -1281,7 +1275,6 @@ textarea.form-input{min-height:80px;line-height:var(--lh-normal);resize:vertical
     background:linear-gradient(180deg,#0d5150,#073a3c);box-shadow:none}
   .sidebar .logo,.sidebar.open .logo,
   .sidebar .logo-sub,.sidebar.open .logo-sub,
-  .sidebar .barrier-seal,.sidebar.open .barrier-seal,
   .sidebar .nav-label,.sidebar.open .nav-label,
   .sidebar .sidebar-foot,.sidebar.open .sidebar-foot{display:none}
   /* 八个入口平分一行：nav 用 display:contents 让按钮成为 sidebar 的直接弹性子项 */
@@ -1303,10 +1296,10 @@ textarea.form-input{min-height:80px;line-height:var(--lh-normal);resize:vertical
   .scrim{display:none!important}
 
   .main{display:block;min-width:0;min-height:calc(100dvh - var(--sidebar-rail))}
-  .topbar{height:var(--topbar-h);padding:0 var(--sp-3);position:sticky;top:0}
+  .topbar{min-height:var(--topbar-h);padding:var(--sp-1) var(--sp-3);position:sticky;top:0}
   .topbar h1{font-size:var(--fs-base)}
-  .topbar-spell{display:none}
   .topbar-right{gap:var(--sp-1)}
+  .fs-scale-range{width:60px}
   .topbar-status{display:none}
   .topbar-right .btn{min-height:32px;padding:var(--sp-1) var(--sp-2);font-size:var(--fs-caption)}
   .content{width:100%;max-width:none;padding:var(--sp-3) var(--sp-3) var(--sp-5);margin:0}
@@ -1315,10 +1308,10 @@ textarea.form-input{min-height:80px;line-height:var(--lh-normal);resize:vertical
   .page-title{font-size:var(--fs-lg)}
   .stats{grid-template-columns:repeat(2,minmax(0,1fr));gap:var(--sp-2);margin-bottom:var(--sp-3)}
   .stat{padding:var(--sp-3)}
-  .stat-value{font-size:22px}
+  .stat-value{font-size:calc(23px * var(--fs-scale))}
   .usage-overview{grid-template-columns:repeat(2,minmax(0,1fr));margin-bottom:var(--sp-3)}
   .usage-overview-item{padding:var(--sp-3)}
-  .usage-overview-value{font-size:22px}
+  .usage-overview-value{font-size:calc(23px * var(--fs-scale))}
   .card,.onboarding,.quick-action{border-radius:var(--radius-sm)}
   .card-head{padding:var(--sp-3)}
   .card-body{padding:var(--sp-3)}
@@ -1345,7 +1338,7 @@ textarea.form-input{min-height:80px;line-height:var(--lh-normal);resize:vertical
     margin-bottom:var(--sp-3)}
   .kpi-card{padding:var(--sp-3);gap:var(--sp-2)}
   .kpi-ico{width:30px;height:30px}
-  .kpi-value{font-size:20px}
+  .kpi-value{font-size:calc(21px * var(--fs-scale))}
   .dash-sec{margin:var(--sp-5) 0 var(--sp-2)}
   .dash-sec-t{font-size:var(--fs-base)}
   .msg{max-width:100%}
@@ -1386,7 +1379,20 @@ textarea.form-input{min-height:80px;line-height:var(--lh-normal);resize:vertical
   body{background:#fff;background-image:none;color:#000}
   .table th{background:#fff;color:#000;border-bottom:1px solid #333}
 }
-</style></head>
+</style>
+<script>
+/* 字号缩放：在首屏绘制前尽早回填已保存的比例，避免放大后的闪烁。
+   与 app 脚本共用 key 'm365.fsScale' 与 0.9–1.5 区间；只写 CSS 令牌，不碰 DOM。 */
+(function(){
+  try{
+    var v=parseFloat(localStorage.getItem('m365.fsScale'));
+    if(!isFinite(v))return;
+    v=Math.min(1.5,Math.max(0.9,v));
+    document.documentElement.style.setProperty('--fs-scale',String(v));
+  }catch(e){}
+})();
+</script>
+</head>
 <body>
 
 <!-- =========================================================================
@@ -1419,13 +1425,11 @@ textarea.form-input{min-height:80px;line-height:var(--lh-normal);resize:vertical
   <button type="button" class="scrim" id="scrim" onclick="closeSidebar()" tabindex="-1" aria-hidden="true"></button>
 
   <aside class="sidebar" id="sidebar" aria-label="主导航">
-    <!-- 结界印章：纯装饰，对辅助技术隐藏 -->
-    <div class="barrier-seal" aria-hidden="true"><span>博丽</span><b>结界</b></div>
     <div class="logo">
       <span class="logo-mark" aria-hidden="true"><span></span><span></span><span></span><span></span></span>
       <span>M365 Copilot2API</span>
     </div>
-    <p class="logo-sub" aria-hidden="true">莲纹结界 / LOTUS THREAD</p>
+    <p class="logo-sub" aria-hidden="true">管理控制台 / CONSOLE</p>
 
     <p class="nav-label" id="navGroupOverview">概览</p>
     <nav class="nav" aria-labelledby="navGroupOverview">
@@ -1447,7 +1451,7 @@ textarea.form-input{min-height:80px;line-height:var(--lh-normal);resize:vertical
       <button type="button" data-page="settings" onclick="showPage('settings')"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M9.671 4.136a2.34 2.34 0 0 1 4.659 0 2.34 2.34 0 0 0 3.319 1.915 2.34 2.34 0 0 1 2.33 4.033 2.34 2.34 0 0 0 0 3.831 2.34 2.34 0 0 1-2.33 4.033 2.34 2.34 0 0 0-3.319 1.915 2.34 2.34 0 0 1-4.659 0 2.34 2.34 0 0 0-3.32-1.915 2.34 2.34 0 0 1-2.33-4.033 2.34 2.34 0 0 0 0-3.831A2.34 2.34 0 0 1 6.35 6.051a2.34 2.34 0 0 0 3.319-1.915"/> <circle cx="12" cy="12" r="3"/></svg><span>设置</span></button>
     </nav>
 
-    <div class="sidebar-foot">v0.2.0 · 灵符</div>
+    <div class="sidebar-foot">v0.2.0</div>
   </aside>
 
   <main class="main">
@@ -1456,9 +1460,14 @@ textarea.form-input{min-height:80px;line-height:var(--lh-normal);resize:vertical
         <button type="button" class="icon-btn" id="navToggle" onclick="toggleSidebar()" aria-label="展开导航" aria-expanded="false" aria-controls="sidebar"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M4 5h16"/> <path d="M4 12h16"/> <path d="M4 19h16"/></svg></button>
         <span class="topbar-mark" aria-hidden="true"></span>
         <h1 id="pageTitle">仪表盘</h1>
-        <span class="topbar-spell" aria-hidden="true">Spell Card Ready</span>
       </div>
       <div class="topbar-right">
+        <!-- 字号调节：滑块改 --fs-scale，比例存 localStorage('m365.fsScale') -->
+        <div class="fs-scale">
+          <label class="fs-scale-label" for="fsScale">字号</label>
+          <input class="fs-scale-range" id="fsScale" type="range" min="0.9" max="1.5" step="0.05" value="1" aria-label="字号缩放" aria-describedby="fsScaleVal" oninput="applyFsScale(this.value,true)">
+          <output class="fs-scale-val" id="fsScaleVal" for="fsScale">100%</output>
+        </div>
         <span class="topbar-status"><span class="status-dot" aria-hidden="true"></span> 运行中</span>
         <button type="button" class="btn" onclick="logout()"><svg class="ico ico-sm" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="m16 17 5-5-5-5"/> <path d="M21 12H9"/> <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/></svg> 退出</button>
       </div>
@@ -3192,7 +3201,9 @@ function renderTrend(trend){
     trend.forEach((t,i)=>{g.beginPath();g.arc(xAt(i),yAt(t.tokens),2.6,0,Math.PI*2);g.fill();});
   }
   // 端点日期标签
-  g.fillStyle=muted;g.font='9px '+cssVar('--font-sans','sans-serif');
+  // 端点标签跟随字号滑块缩放，并与全局字重一致加粗
+  const labelPx=Math.round(10*(parseFloat(cssVar('--fs-scale','1'))||1));
+  g.fillStyle=muted;g.font='600 '+labelPx+'px '+cssVar('--font-sans','sans-serif');
   g.textBaseline='alphabetic';
   [0,n-1].filter((v,i,a)=>a.indexOf(v)===i).forEach(i=>{
     g.textAlign=n===1?'center':(i===0?'left':'right');
@@ -4061,6 +4072,35 @@ function closeSidebar(){
   $('navToggle')?.setAttribute('aria-expanded','false');
 }
 
+/* ===== 字号缩放 =========================================================== */
+/* 顶栏滑块只改 --fs-scale：所有 --fs-* 都是 calc(px * var(--fs-scale))，
+   因此一处写入即等比缩放全站文字。比例存 localStorage，<head> 的早期脚本
+   负责首屏回填，这里负责校正控件显示值并持久化用户的新选择。 */
+const FS_SCALE_KEY='m365.fsScale';
+const FS_SCALE_MIN=0.9,FS_SCALE_MAX=1.5;
+function clampFsScale(v){
+  const n=parseFloat(v);
+  if(!isFinite(n))return 1;
+  // 对齐滑块步长 0.05，避免存进去的值回填时对不上刻度
+  return Math.min(FS_SCALE_MAX,Math.max(FS_SCALE_MIN,Math.round(n*20)/20));
+}
+function applyFsScale(v,persist){
+  const s=clampFsScale(v);
+  document.documentElement.style.setProperty('--fs-scale',String(s));
+  const out=$('fsScaleVal');
+  // 动态值一律走 textContent，不用 innerHTML
+  if(out)out.textContent=Math.round(s*100)+'%';
+  const range=$('fsScale');
+  if(range&&parseFloat(range.value)!==s)range.value=String(s);
+  if(persist){try{localStorage.setItem(FS_SCALE_KEY,String(s));}catch(e){}}
+  return s;
+}
+function initFsScale(){
+  let stored=null;
+  try{stored=localStorage.getItem(FS_SCALE_KEY);}catch(e){}
+  applyFsScale(stored===null?1:stored,false);
+}
+
 /* ===== 键盘可达性 ========================================================= */
 /* Esc 依次关闭：抽屉 → 最上层弹窗。弹窗打开时焦点锁在弹窗内。 */
 document.addEventListener('keydown',e=>{
@@ -4101,6 +4141,8 @@ document.addEventListener('keydown',e=>{
 /* 把静态 HTML 里残留的 <i data-icon> 占位符（若有）渲染成内联 SVG。
    正常情况下 HTML 已直接内联 <svg>，这里只是保险。 */
 renderIcons();
+// 字号：把已保存的比例同步到滑块与百分比显示（令牌已由 head 脚本先行应用）
+initFsScale();
 
 fetch('/api/admin/session').then(r=>r.json()).then(d=>{
   if(d.authenticated){enterApp();}
