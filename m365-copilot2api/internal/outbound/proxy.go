@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"fmt"
 	"net"
 	"net/http"
@@ -104,6 +105,11 @@ func Configure(raw string) error {
 	}
 	clientsMu.Lock()
 	clients = c
+	if proxyPool != nil {
+		// Drain the live pool before detaching it so a reference taken earlier stops
+		// serving exits that are no longer configured.
+		proxyPool.adoptEntries(&Pool{wsLimit: outboundWebSocketLimit()})
+	}
 	proxyPool = nil
 	clientsMu.Unlock()
 	return nil
@@ -114,9 +120,57 @@ func ConfigurePool(raw []string) error {
 		return e
 	}
 	clientsMu.Lock()
-	proxyPool = p
+	if proxyPool != nil {
+		// Update the live pool in place instead of swapping the pointer. Anything
+		// that already holds this *Pool - a dialer closure, an in-flight round
+		// tripper - must observe the new exit list. Replacing the pointer left such
+		// references pinned to the previous object, so deleted exits kept being
+		// dialed until the process restarted.
+		proxyPool.adoptEntries(p)
+	} else {
+		proxyPool = p
+	}
 	clientsMu.Unlock()
 	return nil
+}
+
+// adoptEntries makes p serve exactly the exits of next. Entries whose URL
+// survives the edit are reused, so their health, cooldown, sticky binding and
+// in-flight WebSocket accounting are not silently reset by an unrelated add or
+// remove. It lives next to ConfigurePool because it exists only to support live
+// reconfiguration.
+func (p *Pool) adoptEntries(next *Pool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	existing := make(map[string]*poolEntry, len(p.entries))
+	for _, entry := range p.entries {
+		existing[entry.raw] = entry
+	}
+	entries := make([]*poolEntry, 0, len(next.entries))
+	kept := make(map[string]bool, len(next.entries))
+	for _, entry := range next.entries {
+		if reused, ok := existing[entry.raw]; ok {
+			entry = reused
+		}
+		entries = append(entries, entry)
+		kept[entry.raw] = true
+	}
+	p.entries = entries
+	p.wsLimit = next.wsLimit
+	if len(p.entries) == 0 {
+		p.next = 0
+	} else {
+		p.next %= len(p.entries)
+	}
+	for account, raw := range p.sticky {
+		if !kept[raw] {
+			delete(p.sticky, account)
+		}
+	}
+	// Wake anyone waiting for WebSocket capacity: the exit list changed, so the
+	// waiter has to re-evaluate, including falling back to a direct dial once the
+	// pool is empty.
+	p.signalWebSocketWaitersLocked()
 }
 
 func CurrentPool() *Pool { clientsMu.RLock(); defer clientsMu.RUnlock(); return proxyPool }
@@ -131,6 +185,68 @@ func ProxyPoolStatus() []map[string]any {
 	return p.List()
 }
 
+// redactProxyDisplay renders an exit for human/UI consumption. Unlike
+// redactProxy (which drops userinfo entirely for log lines) it keeps the
+// username visible so operators can still tell two exits on the same host
+// apart, while the password is replaced by a fixed placeholder.
+func redactProxyDisplay(raw string) string {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Host == "" {
+		return "<invalid>"
+	}
+	if u.User == nil {
+		return u.String()
+	}
+	password, hasPassword := u.User.Password()
+	if !hasPassword || password == "" {
+		return u.String()
+	}
+	// Built by hand: url.URL.String() percent-encodes the placeholder into
+	// %2A%2A%2A, which is neither readable nor stable to match on.
+	return u.Scheme + "://" + u.User.Username() + ":" + proxyPasswordPlaceholder + "@" + u.Host
+}
+
+const proxyPasswordPlaceholder = "***"
+
+// sameProxyURL reports whether candidate identifies entry, accepting either the
+// raw URL or the redacted display form. The admin UI round-trips whatever it was
+// shown, so DELETE ?url=... must keep working once the GET body is redacted.
+func sameProxyURL(entry, candidate string) bool {
+	normalize := func(v string) string { return strings.TrimRight(strings.TrimSpace(v), "/") }
+	entry, candidate = normalize(entry), normalize(candidate)
+	if entry == candidate {
+		return true
+	}
+	return normalize(redactProxyDisplay(entry)) == candidate
+}
+
+// ProxyPoolRawURLs returns the exits verbatim, credentials included. It exists
+// for the settings persistence path, which must round-trip a usable URL. Never
+// route this into an API response, a log line, or an error message.
+func ProxyPoolRawURLs() []string {
+	clientsMu.RLock()
+	p := proxyPool
+	clientsMu.RUnlock()
+	if p == nil {
+		return []string{}
+	}
+	return p.rawURLs()
+}
+
+// ProxyPoolStatusRedacted is ProxyPoolStatus with the password of every exit
+// replaced by a placeholder. This is what belongs in an admin API response:
+// ProxyPoolStatus reports the raw URL, so serving it directly puts the proxy
+// password into the dashboard HTML and the browser devtools network tab.
+func ProxyPoolStatusRedacted() []map[string]any {
+	items := ProxyPoolStatus()
+	for _, item := range items {
+		if raw, ok := item["url"].(string); ok {
+			item["url"] = redactProxyDisplay(raw)
+		}
+	}
+	return items
+}
+
 func AddProxy(raw string) error {
 	clientsMu.RLock()
 	p := proxyPool
@@ -138,14 +254,7 @@ func AddProxy(raw string) error {
 	if p == nil {
 		return ConfigurePool([]string{raw})
 	}
-	items := make([]string, 0)
-	for _, item := range p.List() {
-		if v, ok := item["url"].(string); ok {
-			items = append(items, v)
-		}
-	}
-	items = append(items, raw)
-	return ConfigurePool(items)
+	return ConfigurePool(append(p.rawURLs(), raw))
 }
 
 func RemoveProxy(raw string) error {
@@ -158,25 +267,31 @@ func RemoveProxy(raw string) error {
 	}
 	items := make([]string, 0)
 	found := false
-	for _, item := range p.List() {
-		if v, ok := item["url"].(string); ok {
-			if strings.TrimRight(strings.TrimSpace(v), "/") == raw {
-				found = true
-				continue
-			}
-			items = append(items, v)
+	for _, v := range p.rawURLs() {
+		// Accept the redacted form too: the dashboard deletes by the URL it was
+		// shown, and that URL no longer carries the password.
+		if !found && sameProxyURL(v, raw) {
+			found = true
+			continue
 		}
+		items = append(items, v)
 	}
 	if !found {
-		return fmt.Errorf("proxy not found: %s", raw)
+		// redactProxy keeps a mistyped or stale credentialed URL out of the admin
+		// API error body, which the dashboard renders verbatim.
+		return fmt.Errorf("proxy not found: %s", redactProxy(raw))
 	}
 	return ConfigurePool(items)
 }
+
+// HTTPClient and WebSocketDialer resolve the current outbound configuration.
+// Callers must invoke them per request / per dial and must not cache the result:
+// the proxy pool is edited at runtime through the admin API.
 func HTTPClient() *http.Client {
 	clientsMu.RLock()
 	p, c := proxyPool, clients.HTTP
 	clientsMu.RUnlock()
-	if p != nil {
+	if p != nil && p.size() > 0 {
 		return p.HTTPClient()
 	}
 	return c
@@ -185,11 +300,20 @@ func WebSocketDialer() *websocket.Dialer {
 	clientsMu.RLock()
 	p, c := proxyPool, clients.WebSocket
 	clientsMu.RUnlock()
-	if p != nil {
+	if p != nil && p.size() > 0 {
 		return p.WebSocketDialer()
 	}
+	// An empty pool is a direct exit. Reuse the shared direct transport rather than
+	// a pool wrapper that would build a fresh transport per dial and lose
+	// connection reuse.
 	d := *c
 	return &d
+}
+
+func (p *Pool) size() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.entries)
 }
 func ValidateProxyURL(raw string) error { _, e := New(raw); return e }
 func New(raw string) (*Clients, error) {
@@ -238,6 +362,23 @@ func New(raw string) (*Clients, error) {
 	return c, nil
 }
 
+// setProxyAuthorization writes the proxy credentials onto a hand-rolled CONNECT
+// request. It must be Proxy-Authorization, not Authorization: http.Request's
+// SetBasicAuth sets the latter, which a proxy ignores, so every CONNECT came
+// back 407 Proxy Authentication Required on exits configured with userinfo.
+func setProxyAuthorization(header http.Header, proxyURL *url.URL) {
+	if header == nil || proxyURL == nil || proxyURL.User == nil {
+		return
+	}
+	username := proxyURL.User.Username()
+	password, _ := proxyURL.User.Password()
+	if username == "" && password == "" {
+		return
+	}
+	encoded := base64.StdEncoding.EncodeToString([]byte(username + ":" + password))
+	header.Set("Proxy-Authorization", "Basic "+encoded)
+}
+
 type httpProxyDialer struct{ proxyURL *url.URL }
 
 func (d httpProxyDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
@@ -265,10 +406,7 @@ func (d httpProxyDialer) DialContext(ctx context.Context, network, address strin
 	}
 	defer conn.SetDeadline(time.Time{})
 	req := &http.Request{Method: http.MethodConnect, URL: &url.URL{Opaque: address}, Host: address, Header: make(http.Header)}
-	if d.proxyURL.User != nil {
-		pw, _ := d.proxyURL.User.Password()
-		req.SetBasicAuth(d.proxyURL.User.Username(), pw)
-	}
+	setProxyAuthorization(req.Header, d.proxyURL)
 	if err := req.Write(conn); err != nil {
 		conn.Close()
 		return nil, err
@@ -313,10 +451,7 @@ func (d httpsProxyDialer) DialContext(ctx context.Context, network, address stri
 		return nil, e
 	}
 	q := &http.Request{Method: http.MethodConnect, URL: &url.URL{Opaque: address}, Host: address, Header: make(http.Header)}
-	if d.proxyURL.User != nil {
-		pw, _ := d.proxyURL.User.Password()
-		q.SetBasicAuth(d.proxyURL.User.Username(), pw)
-	}
+	setProxyAuthorization(q.Header, d.proxyURL)
 	if e = q.Write(conn); e != nil {
 		conn.Close()
 		return nil, e

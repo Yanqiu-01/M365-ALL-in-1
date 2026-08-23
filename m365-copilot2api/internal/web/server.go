@@ -252,6 +252,9 @@ func New() (*Server, error) {
 		upstreamCooldown:   newAccountCooldown(),
 		accountConcurrency: newAccountConcurrency(),
 		pkce:               map[string]pendingPKCE{},
+		// One Client for the process lifetime is fine: it holds no snapshot of the
+		// outbound configuration, so proxy-pool and client-profile edits are picked
+		// up on the next request. See chathub.Client.
 		chat: func() *chathub.Client {
 			c := chathub.NewClient()
 			c.Trace = func(meta map[string]any) { fmt.Printf("[multimodal-trace] %s\\n", mustJSON(meta)) }

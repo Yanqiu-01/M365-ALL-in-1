@@ -45,7 +45,9 @@ func NewPool(raw []string) (*Pool, error) {
 		}
 		c, err := New(v)
 		if err != nil {
-			return nil, fmt.Errorf("proxy %q: %w", v, err)
+			// Never echo the raw URL: it may carry userinfo and this error is
+			// surfaced verbatim by the admin API and the settings validator.
+			return nil, fmt.Errorf("proxy %q: %w", redactProxy(v), err)
 		}
 		seen[v] = true
 		p.entries = append(p.entries, &poolEntry{raw: v, clients: c})
@@ -347,6 +349,31 @@ func (p *Pool) List() []map[string]any {
 	}
 	return out
 }
+// rawURLs returns the exits verbatim, credentials included. Reserved for the
+// settings persistence path and for internal add/remove bookkeeping, both of
+// which need a URL that can actually be dialed again.
+func (p *Pool) rawURLs() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make([]string, 0, len(p.entries))
+	for _, e := range p.entries {
+		out = append(out, e.raw)
+	}
+	return out
+}
+
+// ListRedacted is List with the password of every exit masked. Use it for
+// anything that leaves the process: an API response, a log line, a template.
+func (p *Pool) ListRedacted() []map[string]any {
+	items := p.List()
+	for _, item := range items {
+		if raw, ok := item["url"].(string); ok {
+			item["url"] = redactProxyDisplay(raw)
+		}
+	}
+	return items
+}
+
 func (p *Pool) Remove(raw string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()

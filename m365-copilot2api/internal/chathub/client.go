@@ -116,24 +116,54 @@ type Result struct {
 	Images         []string
 }
 
+// Client is safe to keep for the process lifetime: every field that mirrors
+// mutable configuration is resolved per request rather than at construction.
 type Client struct {
+	// HTTPHeader, HTTPClient and Dialer are optional overrides that exist so tests
+	// can inject a fixed header set or a mock transport. They must stay nil in
+	// production: the live configuration is then resolved on every use, so a
+	// proxy-pool or client-profile edit takes effect on the next request of an
+	// existing Client instead of being frozen at construction time.
+	// outbound.ConfigurePool used to replace the pool object, so a dialer captured
+	// once kept dialing exits that had already been deleted.
 	HTTPHeader http.Header
 	HTTPClient *http.Client
 	Dialer     *websocket.Dialer
 	Trace      func(map[string]any)
 }
 
-func NewClient() *Client {
-	identity := identityFor()
+func NewClient() *Client { return &Client{} }
+
+// requestHeader returns the header set for one request. The User-Agent follows
+// the active client profile, which the admin settings can change at runtime.
+func (c *Client) requestHeader() http.Header {
+	if c.HTTPHeader != nil {
+		return c.HTTPHeader.Clone()
+	}
 	h := make(http.Header)
 	h.Set("Origin", "https://m365.cloud.microsoft")
-	h.Set("User-Agent", identity.UserAgent)
-	d := outbound.WebSocketDialer()
-	return &Client{
-		HTTPHeader: h,
-		HTTPClient: outbound.HTTPClient(),
-		Dialer:     d,
+	h.Set("User-Agent", identityFor().UserAgent)
+	return h
+}
+
+// WebSocketDialer resolves the exit configuration for a single dial attempt.
+// outbound.WebSocketDialer returns a fresh copy of the current configuration on
+// every call, which is what keeps proxy-pool changes live for a long-lived
+// Client. An explicitly injected Dialer always wins.
+func (c *Client) WebSocketDialer() *websocket.Dialer {
+	if c.Dialer != nil {
+		return c.Dialer
 	}
+	return outbound.WebSocketDialer()
+}
+
+// OutboundHTTPClient is the HTTP counterpart of WebSocketDialer: live outbound
+// configuration unless a client was injected.
+func (c *Client) OutboundHTTPClient() *http.Client {
+	if c.HTTPClient != nil {
+		return c.HTTPClient
+	}
+	return outbound.HTTPClient()
 }
 
 // dialAndInitialize retries one alternate WebSocket setup path before any chat
@@ -145,7 +175,8 @@ func (c *Client) dialAndInitialize(ctx context.Context, wsURL string) (*websocke
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		conn, resp, err := c.Dialer.DialContext(ctx, wsURL, c.HTTPHeader.Clone())
+		// Resolved per attempt so a pool change between retries is honoured.
+		conn, resp, err := c.WebSocketDialer().DialContext(ctx, wsURL, c.requestHeader())
 		if err != nil {
 			if resp != nil && (resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) {
 				retryAfter := 0
@@ -560,7 +591,7 @@ func (c *Client) uploadAttachments(ctx context.Context, acc Account, conversatio
 			if err != nil {
 				continue
 			}
-			resp, err := c.HTTPClient.Do(req)
+			resp, err := c.OutboundHTTPClient().Do(req)
 			if err != nil {
 				continue
 			}
@@ -615,14 +646,14 @@ func (c *Client) uploadAttachments(ctx context.Context, acc Account, conversatio
 		req.Header.Set("X-Variants", "feature.EnableImageSupportInUploadFile")
 		req.Header.Set("X-Scenario", "OfficeWebIncludedCopilot")
 		req.Header.Set("Referer", "https://m365.cloud.microsoft/")
-		for k, vv := range c.HTTPHeader {
+		for k, vv := range c.requestHeader() {
 			for _, v := range vv {
 				if k != "Origin" || v != "" {
 					req.Header.Add(k, v)
 				}
 			}
 		}
-		resp, err := c.HTTPClient.Do(req)
+		resp, err := c.OutboundHTTPClient().Do(req)
 		if err != nil {
 			log.Printf("[upload] http error: %v", err)
 			continue
