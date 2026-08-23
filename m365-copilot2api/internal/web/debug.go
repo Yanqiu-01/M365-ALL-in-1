@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -121,6 +122,32 @@ func (d *debugStore) add(r debugRecord) {
 		_, _ = f.Write(append(b, '\n'))
 		_ = f.Close()
 	}
+	d.rotateLocked()
+}
+
+// debugLogMaxBytes bounds the on-disk debug log. The in-memory ring has always
+// been capped at 500 records, but the file was appended to unconditionally, and
+// every record embeds a redacted request and response body of up to
+// maxDebugCaptureBytes each -- one observed instance reached 1.6 GB.
+func debugLogMaxBytes() int64 {
+	if value, err := strconv.Atoi(strings.TrimSpace(os.Getenv("M365_DEBUG_LOG_MAX_MB"))); err == nil && value >= 1 && value <= 4096 {
+		return int64(value) << 20
+	}
+	return 64 << 20
+}
+
+// rotateLocked keeps one previous generation, so recent history survives a
+// rotation and total disk use stays under twice the configured cap. The caller
+// must hold d.mu: rotation renames the file that add is appending to.
+func (d *debugStore) rotateLocked() {
+	info, err := os.Stat(d.path)
+	if err != nil || info.Size() < debugLogMaxBytes() {
+		return
+	}
+	previous := d.path + ".1"
+	// Windows will not rename onto an existing name.
+	_ = os.Remove(previous)
+	_ = os.Rename(d.path, previous)
 }
 func (d *debugStore) list() []debugRecord {
 	d.mu.RLock()
