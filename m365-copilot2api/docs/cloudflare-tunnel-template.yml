@@ -1,0 +1,10 @@
+tunnel: replace-with-your-tunnel-id
+credentials-file: C:\\path\\outside\\repository\\cloudflared.json
+
+ingress:
+  - hostname: replace-with-your-hostname
+    service: http://127.0.0.1:4141
+  - service: http_status:404
+
+# Template only. Do not run cloudflared or publish this endpoint until you have
+# reviewed authentication, firewall rules, DNS, and secret storage.
