@@ -359,6 +359,16 @@ func (sr *sessionResolver) Resolve(r *http.Request, body *oaiReq) ResolveResult 
 		sess.LastUsedAt = time.Now().UTC()
 		sr.sessions[bestSimilar] = sess
 		sr.persist.markDirty()
+		// 内容只是相似而非严格前缀，增量边界未知，交由上层发送全量。
+		//
+		// 但有一种情形必须排除在复用之外：整批消息被原样重发。客户端重试、
+		// 用户把同一句话再问一遍都会命中这里 —— Jaccard 对「历史多一条模型
+		// 回复」这种差异给 0.67，稳定越过 0.6 阈值。若复用该会话再发一遍全量，
+		// 上游会在同一个云端对话里第二次看到已经答过的内容，返回空补全，
+		// 客户端收到的就是空回复。原样重发应当开一轮新对话。
+		if repeatSuffixLen(sess.ContextHistory, body.Messages) > 0 {
+			return ResolveResult{IsNew: true}
+		}
 		return ResolveResult{
 			SessionID:      sess.SessionID,
 			ConversationID: sess.ConversationID,
@@ -398,6 +408,31 @@ func (sr *sessionResolver) matchContextLocked(ipFinger string, messages []oaiMsg
 		}
 	}
 	return best.id, best.n
+}
+
+// repeatSuffixLen 处理「同一批消息被重发」的情形：hist 是上一轮协商的完整
+// 消息（含模型回复），msgs 是这次到达的消息。若 msgs 逐条等于 hist 去掉尾部
+// assistant 回复后的那一段，说明客户端把同样的请求又发了一次，返回 len(msgs)
+// 作为增量起点 —— 也就是「已经全部发过，本轮没有新内容」。
+//
+// 返回 len(msgs) 而非 0 让上层跳过重复正文；上层随后会发现增量为空并保留
+// 原 prompt，但对话已定位到正确的会话，不会把旧内容再灌一遍。
+func repeatSuffixLen(hist, msgs []oaiMsg) int {
+	if len(hist) == 0 || len(msgs) == 0 || len(msgs) > len(hist) {
+		return 0
+	}
+	for i := range msgs {
+		if !messagesEqual(hist[i], msgs[i]) {
+			return 0
+		}
+	}
+	// 仅当 hist 多出来的部分全是模型侧输出时才算「重发」，否则是别的会话形状。
+	for _, extra := range hist[len(msgs):] {
+		if extra.Role != "assistant" && extra.Role != "tool" {
+			return 0
+		}
+	}
+	return len(msgs)
 }
 
 // contextPrefixLen 杩斿洖 hist 鏄惁涓ユ牸鏄?msgs 鐨勫墠缂€銆俬ist 涓虹┖鎴栦笉鏄墠缂€
