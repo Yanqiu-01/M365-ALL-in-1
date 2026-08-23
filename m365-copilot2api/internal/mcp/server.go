@@ -2,11 +2,14 @@ package mcp
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -75,11 +78,33 @@ type session struct {
 	done       chan struct{}
 }
 
+// newSessionID returns a collision-free session identifier.
+//
+// This used to be fmt.Sprintf("mcp-%d", time.Now().UnixNano()), which is not
+// unique on Windows: the clock there advances in ~0.5ms steps, so 2000 back to
+// back UnixNano calls were measured returning a single distinct value and 500
+// consecutive registrations produced 2 distinct ids. Deleting a session and
+// creating the next one within the same tick handed back the identifier that
+// was just released, so DELETE looked like a no-op -- the replacement session
+// carried the id the caller had already discarded.
+//
+// The timestamp prefix is kept because it keeps ids sortable by creation order,
+// which is convenient in logs; uniqueness comes from the random suffix. Failure
+// to read the CSPRNG falls back to a counter rather than to a duplicate id.
+func newSessionID() string {
+	var buf [8]byte
+	if _, err := rand.Read(buf[:]); err != nil {
+		return fmt.Sprintf("mcp-%d-%d", time.Now().UnixNano(), atomic.AddUint64(&sessionIDFallback, 1))
+	}
+	return fmt.Sprintf("mcp-%d-%s", time.Now().UnixNano(), hex.EncodeToString(buf[:]))
+}
+
+var sessionIDFallback uint64
 // RegisterSession creates a new MCP session with the given tool provider and returns the session ID.
 func (r *sessionRegistry) RegisterSession(provider ToolProvider) string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	id := fmt.Sprintf("mcp-%d", time.Now().UnixNano())
+	id := newSessionID()
 	r.sessions[id] = &session{
 		id:       id,
 		provider: provider,

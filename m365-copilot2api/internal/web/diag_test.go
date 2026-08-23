@@ -73,8 +73,12 @@ func TestDiagAPKConfiguration(t *testing.T) {
 }
 
 func TestStageTracksInflightAndWritesBoundedLog(t *testing.T) {
-	resetDiagForTest(t)
+	// Order matters: t.Cleanup runs LIFO, so t.TempDir has to be registered
+	// before resetDiagForTest. Otherwise the directory is removed while the
+	// stage log inside it is still open, and on Windows that fails the cleanup
+	// step even though every assertion in the test passed.
 	dir := t.TempDir()
+	resetDiagForTest(t)
 	t.Setenv("M365_DATA_DIR", dir)
 	t.Setenv("M365_STAGE_LOG", "1")
 	t.Setenv("M365_STAGE_LOG_MAX_BYTES", "512")

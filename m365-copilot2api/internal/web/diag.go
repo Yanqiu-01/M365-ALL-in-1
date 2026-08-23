@@ -75,6 +75,20 @@ func diagWriter() *os.File {
 	return diagFile
 }
 
+// closeDiagWriter releases the stage-log handle and rearms diagOnce so the next
+// diagWriter call reopens at the current diagPath().
+//
+// Production never calls this: the handle is meant to live for the process. It
+// exists for tests, which point M365_STAGE_LOG at t.TempDir() -- on Windows the
+// directory cannot be removed while the file is open, so the cleanup step
+// failed the test even though its assertions had passed.
+func closeDiagWriter() {
+	if diagFile != nil {
+		_ = diagFile.Close()
+		diagFile = nil
+	}
+	diagOnce = sync.Once{}
+}
 func diagMaxBytes() int64 {
 	value := strings.TrimSpace(os.Getenv("M365_STAGE_LOG_MAX_BYTES"))
 	if parsed, err := strconv.ParseInt(value, 10, 64); err == nil && parsed > 0 {
