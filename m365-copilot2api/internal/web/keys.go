@@ -1,16 +1,20 @@
 package web
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 type apiKeyRecord struct {
@@ -130,14 +134,97 @@ func (s *apiKeyStore) flush() error {
 	return writeFileAtomic(s.Path, b, 0600)
 }
 func keyHash(k string) string { h := sha256.Sum256([]byte(k)); return hex.EncodeToString(h[:]) }
+
+// 自定义 key 口令的形状约束。下界保证熵不低到可枚举，上界避免把
+// Authorization 头撑爆；字符集限制在 ASCII 可见范围（0x21-0x7e）内，因为
+// 空格与控制字符会直接破坏 "Authorization: Bearer <key>" 的解析。
+const (
+	customKeySecretMinLen = 16
+	customKeySecretMaxLen = 128
+)
+
+// 这两个哨兵错误让 HTTP 层把 400 与 409 分开。消息里刻意不回显调用方提交的
+// 明文片段，因此错误可以安全地直接写给客户端。
+var (
+	errKeySecretInvalid   = errors.New("自定义密钥必须是 16-128 个 ASCII 可见字符（0x21-0x7e），不能包含空格或控制字符")
+	errKeySecretDuplicate = errors.New("该密钥已存在，请换一个")
+)
+
+// validateKeySecret 只判定形状，不返回任何明文内容。
+func validateKeySecret(secret string) error {
+	if n := len(secret); n < customKeySecretMinLen || n > customKeySecretMaxLen {
+		return errKeySecretInvalid
+	}
+	for i := 0; i < len(secret); i++ {
+		if secret[i] < 0x21 || secret[i] > 0x7e {
+			return errKeySecretInvalid
+		}
+	}
+	return nil
+}
+
+// keySecretHTTPStatus 把上面两个哨兵错误映射成状态码。其它错误返回 0，
+// 由调用方按内部错误处理。
+func keySecretHTTPStatus(err error) int {
+	switch {
+	case errors.Is(err, errKeySecretInvalid):
+		return http.StatusBadRequest
+	case errors.Is(err, errKeySecretDuplicate):
+		return http.StatusConflict
+	}
+	return 0
+}
+
+// keyPrefix 取列表展示用的前缀。前缀是有意可见的（管理台靠它认 key），
+// 但仍要防越界：短于 12 字节时取全长。
+func keyPrefix(raw string) string {
+	const n = 12
+	if len(raw) < n {
+		return raw
+	}
+	return raw[:n]
+}
+
 func (s *apiKeyStore) create(name string) (apiKeyRecord, string, error) {
-	b := make([]byte, 32)
-	if _, e := rand.Read(b); e != nil {
+	return s.createWithSecret(name, "")
+}
+
+// createWithSecret 在 secret 为空时生成随机 key（与原 create 行为一致），
+// 否则把 secret 当作完整 key 明文使用。落盘的仍然只有 sha256 摘要。
+//
+// ID 一律独立于 key 明文随机生成。旧实现从随机 key 的前 8 字节派生 ID，在
+// 随机路径上无害，但若对自定义 secret 沿用同一做法，公开字段 ID 就变成了
+// 明文前 8 字节的可逆泄漏。
+func (s *apiKeyStore) createWithSecret(name, secret string) (apiKeyRecord, string, error) {
+	raw := secret
+	custom := secret != ""
+	if custom {
+		if err := validateKeySecret(secret); err != nil {
+			return apiKeyRecord{}, "", err
+		}
+	} else {
+		b := make([]byte, 32)
+		if _, e := rand.Read(b); e != nil {
+			return apiKeyRecord{}, "", e
+		}
+		raw = "m365_" + hex.EncodeToString(b)
+	}
+	idBytes := make([]byte, 8)
+	if _, e := rand.Read(idBytes); e != nil {
 		return apiKeyRecord{}, "", e
 	}
-	raw := "m365_" + hex.EncodeToString(b)
-	r := apiKeyRecord{ID: hex.EncodeToString(b[:8]), Name: name, Prefix: raw[:12], Hash: keyHash(raw), CreatedAt: time.Now()}
+	hash := keyHash(raw)
+	r := apiKeyRecord{ID: hex.EncodeToString(idBytes), Name: name, Prefix: keyPrefix(raw), Hash: hash, CreatedAt: time.Now()}
 	s.mu.Lock()
+	if custom {
+		// 唯一性只按 hash 比对，等价于按明文比对，但过程中不需要任何明文。
+		for i := range s.Keys {
+			if s.Keys[i].Hash == hash {
+				s.mu.Unlock()
+				return apiKeyRecord{}, "", errKeySecretDuplicate
+			}
+		}
+	}
 	s.Keys = append(s.Keys, r)
 	s.mu.Unlock()
 	if err := s.persist.flushNowBlocking(); err != nil {
@@ -331,4 +418,164 @@ func (s *apiKeyStore) valid(raw string) bool {
 		s.persist.markDirty()
 	}
 	return found
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/accounts/refresh-all
+//
+// 放在 keys.go 而不是 server.go，只因为本次改动的写区把 server.go 限制为
+// adminKeys 与路由注册行；语义上它属于账号刷新一族（refreshAccount）。
+// ---------------------------------------------------------------------------
+
+// refreshAllConcurrency 限制同时打向 Microsoft 令牌端点的刷新数。几百个账号
+// 齐发会直接被限流，反而把本来能刷新的账号也拖成失败。
+const refreshAllConcurrency = 4
+
+// refreshAllErrorMaxLen 截断单条错误消息。上游 error_description 可能很长，
+// 而汇总结果是给管理台看的，不需要完整堆栈。
+const refreshAllErrorMaxLen = 200
+
+type refreshAllEntry struct {
+	ID    string `json:"id"`
+	Email string `json:"email"`
+	OK    bool   `json:"ok"`
+	Error string `json:"error,omitempty"`
+}
+
+// refreshAllBudget 给整体刷新一个上限：基准 90s，账号多时按每账号 2s 放大，
+// 最多 10 分钟。超时后返回已完成的部分结果，未完成的标记为 timeout。
+func refreshAllBudget(accounts int) time.Duration {
+	const base = 90 * time.Second
+	const perAccount = 2 * time.Second
+	const max = 10 * time.Minute
+	budget := base
+	if scaled := time.Duration(accounts) * perAccount; scaled > budget {
+		budget = scaled
+	}
+	if budget > max {
+		budget = max
+	}
+	return budget
+}
+
+// sanitizeRefreshError 把上游错误压成一行短消息，并抹掉可能被回显的刷新令牌。
+// 调用方保证不把 access/refresh token 传进 message 之外的任何字段。
+func sanitizeRefreshError(err error, refreshToken string) string {
+	if err == nil {
+		return ""
+	}
+	msg := err.Error()
+	if strings.TrimSpace(refreshToken) != "" {
+		msg = strings.ReplaceAll(msg, refreshToken, "[redacted]")
+	}
+	msg = strings.NewReplacer("\r", " ", "\n", " ", "\t", " ").Replace(msg)
+	msg = strings.TrimSpace(msg)
+	if msg == "" {
+		return "refresh failed"
+	}
+	if len(msg) > refreshAllErrorMaxLen {
+		// 按 rune 边界截断，避免切出半个 UTF-8 字符。
+		cut := msg[:refreshAllErrorMaxLen]
+		for len(cut) > 0 && !utf8.ValidString(cut) {
+			cut = cut[:len(cut)-1]
+		}
+		msg = cut
+	}
+	return msg
+}
+
+// refreshAllAccounts 并发刷新全部账号的令牌。单个账号失败或卡死都不影响其余
+// 账号，也不会把 handler 挂死：ForceRefresh 不接受 context，因此每个账号跑在
+// 独立 goroutine 里，handler 只等到总预算用尽为止。
+func (s *Server) refreshAllAccounts(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeOpenAIError(w, http.StatusMethodNotAllowed, "invalid_request_error", "method not allowed")
+		return
+	}
+	if s.tokens == nil {
+		writeOpenAIError(w, http.StatusServiceUnavailable, "configuration_error", "账号存储不可用")
+		return
+	}
+	list := s.tokens.List()
+	entries := make([]refreshAllEntry, len(list))
+	filled := make([]bool, len(list))
+	var mu sync.Mutex
+
+	ctx, cancel := context.WithTimeout(r.Context(), refreshAllBudget(len(list)))
+	defer cancel()
+
+	record := func(i int, ok bool, message string) {
+		mu.Lock()
+		defer mu.Unlock()
+		if filled[i] {
+			return
+		}
+		filled[i] = true
+		entries[i].OK = ok
+		entries[i].Error = message
+	}
+
+	for i := range list {
+		entries[i] = refreshAllEntry{ID: list[i].ID, Email: list[i].Email}
+	}
+
+	sem := make(chan struct{}, refreshAllConcurrency)
+	var wg sync.WaitGroup
+	for i := range list {
+		acc := list[i]
+		index := i
+		wg.Add(1)
+		safeGoWithCleanup("accounts.refresh-all", func() {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-ctx.Done():
+				// 预算已用尽，排队中的账号不再发起刷新。
+				return
+			}
+			if _, err := s.tokens.ForceRefresh(acc.ID); err != nil {
+				record(index, false, sanitizeRefreshError(err, acc.RefreshToken))
+				return
+			}
+			record(index, true, "")
+		}, func(any) {
+			record(index, false, "internal error")
+		})
+	}
+
+	done := make(chan struct{})
+	safeGo("accounts.refresh-all-wait", func() {
+		wg.Wait()
+		close(done)
+	})
+	select {
+	case <-done:
+	case <-ctx.Done():
+	}
+
+	mu.Lock()
+	out := make([]refreshAllEntry, 0, len(entries))
+	refreshed, failed := 0, 0
+	for i := range entries {
+		entry := entries[i]
+		if !filled[i] {
+			entry.OK = false
+			entry.Error = "timeout"
+		}
+		if entry.OK {
+			refreshed++
+		} else {
+			failed++
+		}
+		out = append(out, entry)
+	}
+	mu.Unlock()
+
+	jsonOut(w, map[string]any{
+		"total":     len(out),
+		"refreshed": refreshed,
+		"failed":    failed,
+		"results":   out,
+	})
 }

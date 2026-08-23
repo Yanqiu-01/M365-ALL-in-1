@@ -325,6 +325,7 @@ func (s *Server) Routes() http.Handler {
 	m.HandleFunc("/api/update", s.update)
 	m.HandleFunc("/api/accounts", s.accounts)
 	m.HandleFunc("/api/accounts/refresh", s.refreshAccount)
+	m.HandleFunc("/api/accounts/refresh-all", s.refreshAllAccounts)
 	m.HandleFunc("/api/accounts/delete", s.deleteAccount)
 	m.HandleFunc("/api/accounts/provision", s.provisionAccount)
 	m.HandleFunc("/api/accounts/credentials", s.accountCredentials)
@@ -571,8 +572,11 @@ func (s *Server) adminKeys(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		jsonOut(w, map[string]any{"keys": s.apiKeys.listViews()})
 	case http.MethodPost:
+		// secret 可选。为空则照旧随机生成 key；非空则把它当作完整 key 明文，
+		// 校验形状与唯一性后只落 sha256 摘要。明文既不入日志也不入错误消息。
 		var b struct {
-			Name string `json:"name"`
+			Name   string `json:"name"`
+			Secret string `json:"secret"`
 		}
 		if json.NewDecoder(r.Body).Decode(&b) != nil {
 			http.Error(w, "bad json", 400)
@@ -581,7 +585,17 @@ func (s *Server) adminKeys(w http.ResponseWriter, r *http.Request) {
 		if strings.TrimSpace(b.Name) == "" {
 			b.Name = "API key"
 		}
-		rec, raw, e := s.apiKeys.create(b.Name)
+		// secret 不做 TrimSpace：空白本身就是非法字符，静默修剪会让调用方
+		// 拿到一个与它提交的字符串不同的 key。
+		rec, raw, e := s.apiKeys.createWithSecret(b.Name, b.Secret)
+		if status := keySecretHTTPStatus(e); status != 0 {
+			typ := "invalid_request_error"
+			if status == http.StatusConflict {
+				typ = "duplicate_key_error"
+			}
+			writeOpenAIError(w, status, typ, e.Error())
+			return
+		}
 		if e != nil {
 			http.Error(w, e.Error(), 500)
 			return
