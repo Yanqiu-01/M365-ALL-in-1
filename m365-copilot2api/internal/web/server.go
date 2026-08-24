@@ -332,6 +332,12 @@ func (s *Server) Routes() http.Handler {
 	m.HandleFunc("/api/accounts/delete", s.deleteAccount)
 	m.HandleFunc("/api/accounts/provision", s.provisionAccount)
 	m.HandleFunc("/api/admin/accounts/reassign", s.reassignAccount)
+	m.HandleFunc("/api/admin/panel/register", s.panelProxy)
+	m.HandleFunc("/api/admin/panel/oauth", s.panelProxy)
+	m.HandleFunc("/api/admin/panel/oauth/batch", s.panelProxy)
+	m.HandleFunc("/api/admin/panel/state", s.panelProxy)
+	m.HandleFunc("/api/admin/panel/job/stop", s.panelProxy)
+	m.HandleFunc("/api/admin/panel/job/poll", s.panelProxy)
 	m.HandleFunc("/api/accounts/credentials", s.accountCredentials)
 	m.HandleFunc("/api/accounts/web/run-scripts", s.accountRunScripts)
 	m.HandleFunc("/api/auth/start", s.startPKCE)
@@ -1567,6 +1573,21 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	// 消息拼成增量 prompt 发送（对齐 DeepSeek 上下文缓存语义）。
 	answerPrompt := prompt
 	resolvedConversationID := ""
+	// Incremental prompt: only send messages beyond what the cloud conversation
+	// already has. Two paths reach this:
+	//   - body.ConversationID was empty → content-key resolver finds the match;
+	//   - body.ConversationID was set by SessionKey/User above → look up that
+	//     conversation's history directly. Without this second path, every turn
+	//     on a long conversation re-flattens and re-sends the entire history.
+	historyLen := 0
+	if body.ConversationID != "" {
+		for _, sess := range s.sessionResolver.ListSessions() {
+			if sess.ConversationID == body.ConversationID && sess.SessionID != "" {
+				historyLen = len(sess.ContextHistory)
+				break
+			}
+		}
+	}
 	if body.ConversationID == "" && len(body.Messages) > 0 {
 		resolved := s.sessionResolver.Resolve(r, &body)
 		if !resolved.IsNew {
@@ -1575,14 +1596,16 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			body.SessionID = resolved.SessionID
 			body.AccountID = firstNonEmpty(body.AccountID, resolved.AccountID)
 			log.Printf("[session-resolver] matched=%s conversation=%s history=%d total=%d", resolved.MatchedBy, resolved.ConversationID, resolved.HistoryLen, len(body.Messages))
-			if resolved.HistoryLen > 0 && resolved.HistoryLen < len(body.Messages) {
-				incPrompt, incAtt := flattenPromptMessages(body.Messages[resolved.HistoryLen:], nil)
-				incPrompt = strings.TrimSpace(incPrompt)
-				if incPrompt != "" {
-					answerPrompt = incPrompt
-					body.Attachments = incAtt
-				}
-			}
+			historyLen = resolved.HistoryLen
+		}
+	}
+	if historyLen > 0 && historyLen < len(body.Messages) {
+		incPrompt, incAtt := flattenPromptMessages(body.Messages[historyLen:], nil)
+		incPrompt = strings.TrimSpace(incPrompt)
+		if incPrompt != "" {
+			answerPrompt = incPrompt
+			body.Attachments = incAtt
+			log.Printf("[session-resolver] incremental prompt_len=%d (full was %d)", len(incPrompt), len(prompt))
 		}
 	}
 	accountID := body.AccountID

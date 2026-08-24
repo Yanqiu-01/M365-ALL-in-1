@@ -2147,7 +2147,61 @@ if (response.output_text) {
             <div id="authStatus" style="margin-top:var(--sp-3)" aria-live="polite"></div>
           </div>
         </div>
-        <div class="card">
+        
+<!-- ================= 注册与批量授权（代理到 M365 面板 8555） ================= -->
+<div class="card">
+  <div class="card-head"><h3 class="card-title">注册新账号</h3><span class="card-note" id="panelRegState"></span></div>
+  <div class="card-body">
+    <p class="form-hint" style="margin-bottom:var(--sp-2)">调用本地 M365 面板(127.0.0.1:8555)的注册脚本，在 office.965007.xyz 上自动创建 M365 账号。需要面板进程在运行。</p>
+    <div style="display:flex;gap:var(--sp-3);flex-wrap:wrap;align-items:flex-end">
+      <div class="form-group" style="margin:0;min-width:130px">
+        <label class="form-label" for="regMode">注册模式</label>
+        <select class="form-input" id="regMode"><option value="phone">手机流量换IP</option><option value="clash">Clash 机场轮换</option><option value="proxy">代理池并发</option></select>
+      </div>
+      <div class="form-group" style="margin:0;width:80px">
+        <label class="form-label" for="regCount">数量</label>
+        <input class="form-input" id="regCount" type="number" min="1" max="1000" value="5">
+      </div>
+      <div class="form-group" style="margin:0;width:90px" id="regConcWrap" hidden>
+        <label class="form-label" for="regConc">并发数</label>
+        <input class="form-input" id="regConc" type="number" min="1" max="16" value="3">
+      </div>
+      <button type="button" class="btn primary" onclick="panelStartRegister()">开始注册</button>
+      <button type="button" class="btn danger" onclick="panelStopJob()">停止</button>
+    </div>
+    <div class="term" id="panelTermBox" hidden style="margin-top:var(--sp-3)">
+      <div class="term-head"><span class="term-dot red"></span><span class="term-dot yellow"></span><span class="term-dot green"></span><span class="term-title" id="panelTermTitle">panel — m365</span><button type="button" class="term-clear" onclick="$('panelTermBody').innerHTML=''">清空</button></div>
+      <div class="term-body" id="panelTermBody" role="log" aria-live="polite"></div>
+    </div>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-head"><h3 class="card-title">批量 OAuth 授权导入</h3></div>
+  <div class="card-body">
+    <p class="form-hint" style="margin-bottom:var(--sp-2)">对已注册但尚未授权的账号执行浏览器 OAuth，写入当前网关账号池。单个账号用上方「开始授权」即可。</p>
+    <div style="display:flex;gap:var(--sp-3);flex-wrap:wrap;align-items:flex-end;margin-bottom:var(--sp-3)">
+      <div class="form-group" style="margin:0;flex:1;min-width:200px">
+        <label class="form-label" for="oauthSingleEmail">单账号邮箱</label>
+        <input class="form-input" id="oauthSingleEmail" placeholder="例如 24s055001@office.bo.edu.kg">
+      </div>
+      <button type="button" class="btn primary" onclick="panelStartOauthSingle()">授权导入</button>
+    </div>
+    <details>
+      <summary class="form-hint" style="cursor:pointer">批量选项（并发 / 超时 / 续传）</summary>
+      <div style="display:flex;gap:var(--sp-3);flex-wrap:wrap;align-items:flex-end;margin-top:var(--sp-2)">
+        <div class="form-group" style="margin:0;width:80px"><label class="form-label" for="oauthBatchConc">并发数</label><input class="form-input" id="oauthBatchConc" type="number" min="1" max="16" value="3"></div>
+        <div class="form-group" style="margin:0;width:100px"><label class="form-label" for="oauthBatchTimeout">超时(s)</label><input class="form-input" id="oauthBatchTimeout" type="number" min="60" max="900" value="300"></div>
+        <div class="form-group" style="margin:0;width:72px"><label class="form-label" for="oauthBatchStart">起始序号</label><input class="form-input" id="oauthBatchStart" type="number" min="1" value="1"></div>
+        <div class="form-group" style="margin:0;width:72px"><label class="form-label" for="oauthBatchLimit">数量上限(0=全部)</label><input class="form-input" id="oauthBatchLimit" type="number" min="0" value="0"></div>
+        <label style="display:flex;align-items:center;gap:4px;font-size:13px"><input type="checkbox" id="oauthBatchResume">续传</label>
+        <button type="button" class="btn" onclick="panelStartOauthBatch(true)">并发批量 OAuth</button>
+        <button type="button" class="btn" onclick="panelStartOauthBatch(false)">串行批量</button>
+      </div>
+    </details>
+  </div>
+</div>
+<div class="card">
           <div class="card-head">
             <h3 class="card-title">已授权账号</h3>
             <div class="card-head-actions">
@@ -4340,6 +4394,77 @@ async function openConvDetail(id){
 // 重新分配账号：把当前对话从它粘住的账号上挪走，并同时释放
 // 账号→出口的粘连。只放开前者的话，新账号会继续沿用同一个抖动的
 // 出口，等于按钮没起作用（这正是 502 的常见成因）。
+// ===== 注册与批量 OAuth（代理到本地面板 8555） =====
+async function panelStartRegister(){
+  const mode=$('regMode')?.value||'phone';
+  const count=parseInt($('regCount')?.value)||1;
+  const conc=parseInt($('regConc')?.value)||3;
+  const concurrent=(mode==='proxy')&&!!$('regConcWrap')&&!$('regConcWrap').hidden;
+  const body={mode,count,concurrent,concurrency:conc};
+  panelTermOpen('register '+mode+(concurrent?' ×'+conc:''));
+  panelTermLine('提交注册请求…');
+  try{
+    const d=await api('/api/admin/panel/register',{method:'POST',body:JSON.stringify(body)});
+    panelTermLine('已启动: '+(d.kind||d.ok),'ok');
+    panelPollJob();
+  }catch(e){panelTermLine('启动失败: '+(e.message||e),'err');showNotice(e.message,'error');}
+}
+async function panelStartOauthSingle(){
+  const email=($('oauthSingleEmail')?.value||'').trim();
+  if(!email){showNotice('请输入邮箱','error');return;}
+  panelTermOpen('oauth single');
+  panelTermLine('授权 '+email+'…');
+  try{
+    const d=await api('/api/admin/panel/oauth',{method:'POST',body:JSON.stringify({email})});
+    panelTermLine('完成: '+(d.ok?'成功':'失败')+(d.error?' — '+d.error:''),d.ok?'ok':'err');
+    if(d.ok)loadAccounts();
+  }catch(e){panelTermLine('失败: '+(e.message||e),'err');showNotice(e.message,'error');}
+}
+async function panelStartOauthBatch(concurrent){
+  const body={
+    concurrent:!!concurrent,
+    concurrency:parseInt($('oauthBatchConc')?.value)||3,
+    timeout:parseInt($('oauthBatchTimeout')?.value)||300,
+    start:parseInt($('oauthBatchStart')?.value)||1,
+    limit:parseInt($('oauthBatchLimit')?.value)||0,
+    resume:$('oauthBatchResume')?.checked||false,
+  };
+  panelTermOpen('oauth batch '+(concurrent?('×'+body.concurrency):'serial'));
+  panelTermLine('提交批量 OAuth 请求…');
+  try{
+    const d=await api('/api/admin/panel/oauth/batch',{method:'POST',body:JSON.stringify(body)});
+    panelTermLine('已启动','ok');
+    panelPollJob();
+  }catch(e){panelTermLine('启动失败: '+(e.message||e),'err');showNotice(e.message,'error');}
+}
+async function panelStopJob(){
+  try{
+    await api('/api/admin/panel/job/stop',{method:'POST',body:'{}'});
+    panelTermLine('已请求停止','warn');
+  }catch(e){panelTermLine('停止失败: '+(e.message||e),'err');}
+}
+let _panelPollTimer=null;
+async function panelPollJob(){
+  if(_panelPollTimer)clearTimeout(_panelPollTimer);
+  try{
+    const d=await api('/api/admin/panel/job/poll');
+    if(d&&d.lines){
+      const body=$('panelTermBody');
+      if(body){const wasAtBottom=body.scrollHeight-body.scrollTop-body.clientHeight<50;body.textContent=d.lines.join('\n');if(wasAtBottom)body.scrollTop=body.scrollHeight;}
+    }
+    if(d&&d.running!==false){_panelPollTimer=setTimeout(panelPollJob,2000);}
+    else{panelTermLine('任务结束','ok');loadAccounts();}
+  }catch(e){_panelPollTimer=setTimeout(panelPollJob,5000);}
+}
+function panelTermOpen(title){const box=$('panelTermBox');if(box)box.hidden=false;const t=$('panelTermTitle');if(t)t.textContent=title;const body=$('panelTermBody');if(body)body.innerHTML='';}
+function panelTermLine(msg,cls){const body=$('panelTermBody');if(!body)return;const div=document.createElement('div');if(cls)div.className=cls;div.textContent='> '+msg;body.appendChild(div);body.scrollTop=body.scrollHeight;}
+// 注册模式切换时显示/隐藏并发数输入
+document.addEventListener('DOMContentLoaded',function(){
+  const sel=$('regMode');if(!sel)return;
+  sel.addEventListener('change',function(){
+    const wrap=$('regConcWrap');if(wrap)wrap.hidden=(sel.value!=='proxy');
+  });
+});
 async function reassignCurrentConv(){
   if(!_convCurrent)return;
   const id=_convCurrent;

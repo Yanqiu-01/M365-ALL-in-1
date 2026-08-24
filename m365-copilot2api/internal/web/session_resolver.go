@@ -32,6 +32,12 @@ type sessionBinding struct {
 	// ContextHistory 鎸佷箙鍖栦繚瀛樻渶杩戜竴娆″崗璁殑瀹屾暣娑堟伅锛屼緵閲嶅惎鍚庣户缁仛
 	// 鍐呭鍓嶇紑鍖归厤锛岄伩鍏嶈繘绋嬮噸鍚鑷存墍鏈変細璇濋敭鍏ㄩ儴澶辨晥銆?
 	ContextHistory []oaiMsg `json:"contextHistory,omitempty"`
+	// contentHashes caches the contentToString of every message in ContextHistory,
+	// computed once at Bind time. matchContextLocked and contextSimilarity compare
+	// hashes instead of re-running contentToString over the full history on every
+	// request. A 148-message / 578 KB session was re-materialising all of it per
+	// request; with the cache the comparison is O(messages) string equality.
+	contentHashes []string `json:"-"`
 }
 
 type sessionResolver struct {
@@ -366,7 +372,7 @@ func (sr *sessionResolver) Resolve(r *http.Request, body *oaiReq) ResolveResult 
 		// 回复」这种差异给 0.67，稳定越过 0.6 阈值。若复用该会话再发一遍全量，
 		// 上游会在同一个云端对话里第二次看到已经答过的内容，返回空补全，
 		// 客户端收到的就是空回复。原样重发应当开一轮新对话。
-		if repeatSuffixLen(sess.ContextHistory, body.Messages) > 0 {
+		if repeatSuffixLen(sess.ContextHistory, body.Messages, sess.contentHashes, nil) > 0 {
 			return ResolveResult{IsNew: true}
 		}
 		return ResolveResult{
@@ -389,6 +395,7 @@ func (sr *sessionResolver) matchContextLocked(ipFinger string, messages []oaiMsg
 	if len(messages) == 0 {
 		return "", 0
 	}
+	msgHashes := requestContentHashes(messages)
 	type match struct {
 		id     string
 		n      int
@@ -402,12 +409,54 @@ func (sr *sessionResolver) matchContextLocked(ipFinger string, messages []oaiMsg
 		if sess.IPFingerprint != ipFinger {
 			continue
 		}
-		n := contextPrefixLen(sess.ContextHistory, messages)
+		n := contextPrefixLenHashed(sess.ContextHistory, sess.contentHashes, messages, msgHashes)
 		if n >= 1 && (n > best.n || (n == best.n && sess.LastUsedAt.After(best.recent))) {
 			best = match{id: id, n: n, recent: sess.LastUsedAt}
 		}
 	}
 	return best.id, best.n
+}
+
+// contextPrefixLenHashed is contextPrefixLen with precomputed content strings.
+// It compares role + cached string instead of calling contentToString per
+// message. Falls back to the uncached version when either side has no cache.
+func contextPrefixLenHashed(hist []oaiMsg, histHashes []string, msgs []oaiMsg, msgHashes []string) int {
+	if len(hist) == 0 || len(msgs) < len(hist) {
+		return 0
+	}
+	if len(histHashes) != len(hist) || len(msgHashes) != len(msgs) {
+		return contextPrefixLen(hist, msgs)
+	}
+	for i := range hist {
+		if !messagesEqualHashed(hist[i], histHashes[i], msgs[i], msgHashes[i]) {
+			return 0
+		}
+	}
+	return len(hist)
+}
+
+// messagesEqualHashed is messagesEqual with the contentToString already done.
+// The hash covers role + text content; tool_calls are still compared structurally.
+func messagesEqualHashed(a oaiMsg, aHash string, b oaiMsg, bHash string) bool {
+	if a.Role != b.Role {
+		return false
+	}
+	if aHash != bHash {
+		return false
+	}
+	if (a.ToolCalls == nil) != (b.ToolCalls == nil) {
+		return false
+	}
+	for i := range a.ToolCalls {
+		if i >= len(b.ToolCalls) {
+			return false
+		}
+		if toolCallEqual(a.ToolCalls[i], b.ToolCalls[i]) {
+			continue
+		}
+		return false
+	}
+	return len(a.ToolCalls) == len(b.ToolCalls)
 }
 
 // repeatSuffixLen 处理「同一批消息被重发」的情形：hist 是上一轮协商的完整
@@ -417,12 +466,12 @@ func (sr *sessionResolver) matchContextLocked(ipFinger string, messages []oaiMsg
 //
 // 返回 len(msgs) 而非 0 让上层跳过重复正文；上层随后会发现增量为空并保留
 // 原 prompt，但对话已定位到正确的会话，不会把旧内容再灌一遍。
-func repeatSuffixLen(hist, msgs []oaiMsg) int {
+func repeatSuffixLen(hist, msgs []oaiMsg, histHashes, msgHashes []string) int {
 	if len(hist) == 0 || len(msgs) == 0 || len(msgs) > len(hist) {
 		return 0
 	}
 	for i := range msgs {
-		if !messagesEqual(hist[i], msgs[i]) {
+		if !messagesEqualCached(hist[i], msgs[i], i, histHashes, msgHashes) {
 			return 0
 		}
 	}
@@ -433,6 +482,16 @@ func repeatSuffixLen(hist, msgs []oaiMsg) int {
 		}
 	}
 	return len(msgs)
+}
+
+// messagesEqualCached falls back to the uncached path when either hash slice
+// is missing or shorter than the message index. The hot path (matchContext)
+// always has both caches populated by computeContentHashes.
+func messagesEqualCached(a, b oaiMsg, idx int, aHashes, bHashes []string) bool {
+	if aHashes != nil && bHashes != nil && idx < len(aHashes) && idx < len(bHashes) {
+		return aHashes[idx] == bHashes[idx]
+	}
+	return messagesEqual(a, b)
 }
 
 // contextPrefixLen 杩斿洖 hist 鏄惁涓ユ牸鏄?msgs 鐨勫墠缂€銆俬ist 涓虹┖鎴栦笉鏄墠缂€
@@ -490,6 +549,23 @@ func toolCallEqual(x, y map[string]any) bool {
 	return xa == ya
 }
 
+// computeContentHashes returns the contentToString of each message, computed
+// once. Callers store the result in contentHashes and compare slices on the
+// hot path instead of re-running contentToString over the full history.
+func computeContentHashes(msgs []oaiMsg) []string {
+	if len(msgs) == 0 {
+		return nil
+	}
+	out := make([]string, len(msgs))
+	for i, m := range msgs {
+		out[i] = m.Role + "\x00" + contentToString(m.Content)
+	}
+	return out
+}
+
+// requestContentHashes is the per-request analogue, computed once before the
+// resolver loop so matchContextLocked and contextSimilarity share the work.
+func requestContentHashes(msgs []oaiMsg) []string { return computeContentHashes(msgs) }
 func (sr *sessionResolver) Bind(sessionID, conversationID, accountID string, body *oaiReq, assistantText string, r *http.Request) {
 	sr.mu.Lock()
 	defer sr.mu.Unlock()
@@ -515,6 +591,7 @@ func (sr *sessionResolver) Bind(sessionID, conversationID, accountID string, bod
 			sess.IPFingerprint = clientIPFingerprint(r)
 			sess.ContextFinger = contextFingerprint(history)
 			sess.ContextHistory = history
+			sess.contentHashes = computeContentHashes(history)
 			sr.sessions[sessionID] = sess
 			sr.reindexLocked(sess)
 			sr.persist.markDirty()
@@ -530,6 +607,8 @@ func (sr *sessionResolver) Bind(sessionID, conversationID, accountID string, bod
 				sess.IPFingerprint = clientIPFingerprint(r)
 				sess.ContextFinger = contextFingerprint(history)
 				sess.ContextHistory = history
+				sess.contentHashes = computeContentHashes(history)
+			sess.contentHashes = computeContentHashes(history)
 				sr.sessions[sid] = sess
 				sr.reindexLocked(sess)
 				sr.persist.markDirty()
@@ -550,6 +629,8 @@ func (sr *sessionResolver) Bind(sessionID, conversationID, accountID string, bod
 		ContextFinger:  contextFingerprint(history),
 		ContextHistory: history,
 	}
+	sess.contentHashes = computeContentHashes(history)
+
 
 	sr.reindexLocked(sess)
 	sr.persist.markDirty()
