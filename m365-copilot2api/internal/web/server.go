@@ -1596,6 +1596,10 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if historyLen > 0 && historyLen < len(body.Messages) {
+		// Only the increment goes upstream. The full prompt above is still built
+		// because the router, identity answer, tool-intent heuristics and token
+		// accounting read it, but it must not be what we send: re-sending a
+		// 148-message history every turn is what saturated the CPU.
 		incPrompt, incAtt := flattenPromptMessages(body.Messages[historyLen:], nil)
 		incPrompt = strings.TrimSpace(incPrompt)
 		if incPrompt != "" {

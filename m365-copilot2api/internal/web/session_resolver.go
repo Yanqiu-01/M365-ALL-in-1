@@ -38,6 +38,11 @@ type sessionBinding struct {
 	// request. A 148-message / 578 KB session was re-materialising all of it per
 	// request; with the cache the comparison is O(messages) string equality.
 	contentHashes []string `json:"-"`
+	// contextTokens caches the tokenised form of ContextHistory used by the
+	// similarity fallback. Without it every strict-prefix miss re-flattened and
+	// re-tokenised each session's whole history, i.e. O(sessions x bytes) per
+	// request. Built alongside contentHashes at Bind and at load time.
+	contextTokens map[string]bool `json:"-"`
 }
 
 type sessionResolver struct {
@@ -100,6 +105,13 @@ func (sr *sessionResolver) loadLocked() {
 				if now.Sub(s.LastUsedAt) > sr.ttl {
 					continue
 				}
+				// contentHashes is json:"-", so a session read back from disk has
+				// no cache and every comparison would fall back to re-running
+				// contentToString over its whole history. That is exactly the
+				// per-request re-materialisation that saturated the CPU, and it
+				// returned on every restart. Rebuild the cache once here.
+				s.contentHashes = computeContentHashes(s.ContextHistory)
+				s.contextTokens = messageTokenSet(s.ContextHistory)
 				sr.reindexLocked(s)
 			}
 		}
@@ -213,14 +225,61 @@ func contextSimilarity(hist, msgs []oaiMsg) float64 {
 	if len(hist) == 0 || len(msgs) == 0 {
 		return 0
 	}
-	var histText, msgText strings.Builder
-	for _, m := range hist {
-		histText.WriteString(m.Role + ":" + contentToString(m.Content) + "\n")
+	return jaccardSets(messageTokenSet(hist), messageTokenSet(msgs))
+}
+
+// messageTokenSet flattens and tokenises a message slice into a set. Callers on
+// the hot path cache the result per session instead of rebuilding it for every
+// request.
+func messageTokenSet(msgs []oaiMsg) map[string]bool {
+	if len(msgs) == 0 {
+		return nil
 	}
+	var text strings.Builder
 	for _, m := range msgs {
-		msgText.WriteString(m.Role + ":" + contentToString(m.Content) + "\n")
+		text.WriteString(m.Role + ":" + contentToString(m.Content) + "\n")
 	}
-	return jaccardSimilarity(tokenize(histText.String()), tokenize(msgText.String()))
+	tokens := tokenize(text.String())
+	set := make(map[string]bool, len(tokens))
+	for _, token := range tokens {
+		set[token] = true
+	}
+	return set
+}
+
+// contextSimilarityCached is contextSimilarity with the session side already
+// tokenised. It falls back to the uncached path when the cache is absent.
+func contextSimilarityCached(hist []oaiMsg, histTokens map[string]bool, msgs []oaiMsg, msgTokens map[string]bool) float64 {
+	if len(hist) == 0 || len(msgs) == 0 {
+		return 0
+	}
+	if histTokens == nil || msgTokens == nil {
+		return contextSimilarity(hist, msgs)
+	}
+	return jaccardSets(histTokens, msgTokens)
+}
+
+// jaccardSets is jaccardSimilarity over prebuilt sets, so the caller can reuse
+// them across sessions rather than allocating two maps per comparison.
+func jaccardSets(a, b map[string]bool) float64 {
+	if len(a) == 0 || len(b) == 0 {
+		return 0
+	}
+	small, large := a, b
+	if len(small) > len(large) {
+		small, large = large, small
+	}
+	intersection := 0
+	for token := range small {
+		if large[token] {
+			intersection++
+		}
+	}
+	union := len(a) + len(b) - intersection
+	if union == 0 {
+		return 0
+	}
+	return float64(intersection) / float64(union)
 }
 
 // jaccardSimilarity 返回两个词集合的 Jaccard 系数 |A∩B| / |A∪B|。
@@ -345,6 +404,9 @@ func (sr *sessionResolver) Resolve(r *http.Request, body *oaiReq) ResolveResult 
 	bestSimilar := ""
 	bestScore := 0.0
 	var bestSimilarAt time.Time
+	// Tokenise the request once. Previously this happened inside the loop for
+	// both sides, so the cost scaled with sessions x history bytes per request.
+	requestTokens := messageTokenSet(body.Messages)
 	for id, sess := range sr.sessions {
 		if time.Since(sess.LastUsedAt) > sr.contextTTL {
 			continue
@@ -352,7 +414,7 @@ func (sr *sessionResolver) Resolve(r *http.Request, body *oaiReq) ResolveResult 
 		if sess.IPFingerprint != ipFinger {
 			continue
 		}
-		score := contextSimilarity(sess.ContextHistory, body.Messages)
+		score := contextSimilarityCached(sess.ContextHistory, sess.contextTokens, body.Messages, requestTokens)
 		if score < threshold {
 			continue
 		}
@@ -489,7 +551,11 @@ func repeatSuffixLen(hist, msgs []oaiMsg, histHashes, msgHashes []string) int {
 // always has both caches populated by computeContentHashes.
 func messagesEqualCached(a, b oaiMsg, idx int, aHashes, bHashes []string) bool {
 	if aHashes != nil && bHashes != nil && idx < len(aHashes) && idx < len(bHashes) {
-		return aHashes[idx] == bHashes[idx]
+		// The hash only covers role + text. Comparing hashes alone treated two
+		// assistant turns with different tool_calls as the same message, which
+		// let an unrelated turn join an existing conversation. Delegate to the
+		// hashed comparison so tool_calls are still checked structurally.
+		return messagesEqualHashed(a, aHashes[idx], b, bHashes[idx])
 	}
 	return messagesEqual(a, b)
 }
@@ -592,6 +658,7 @@ func (sr *sessionResolver) Bind(sessionID, conversationID, accountID string, bod
 			sess.ContextFinger = contextFingerprint(history)
 			sess.ContextHistory = history
 			sess.contentHashes = computeContentHashes(history)
+			sess.contextTokens = messageTokenSet(history)
 			sr.sessions[sessionID] = sess
 			sr.reindexLocked(sess)
 			sr.persist.markDirty()
@@ -608,7 +675,7 @@ func (sr *sessionResolver) Bind(sessionID, conversationID, accountID string, bod
 				sess.ContextFinger = contextFingerprint(history)
 				sess.ContextHistory = history
 				sess.contentHashes = computeContentHashes(history)
-			sess.contentHashes = computeContentHashes(history)
+				sess.contextTokens = messageTokenSet(history)
 				sr.sessions[sid] = sess
 				sr.reindexLocked(sess)
 				sr.persist.markDirty()
@@ -630,7 +697,7 @@ func (sr *sessionResolver) Bind(sessionID, conversationID, accountID string, bod
 		ContextHistory: history,
 	}
 	sess.contentHashes = computeContentHashes(history)
-
+	sess.contextTokens = messageTokenSet(history)
 
 	sr.reindexLocked(sess)
 	sr.persist.markDirty()
