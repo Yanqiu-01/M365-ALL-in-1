@@ -85,3 +85,32 @@ func TestNativePanelOriginAndBatchCompatibility(t *testing.T) {
 		t.Fatal("concurrent=false from the existing 4141 UI must select serial mode")
 	}
 }
+
+func TestPersistedNativePanelConfigPrefersEnvThenSettings(t *testing.T) {
+	t.Setenv(nativePanelRootEnv, "")
+	t.Setenv(nativePanelPythonEnv, "")
+	server := &Server{settings: &settingsStore{v: runtimeSettings{
+		NativePanelRoot:   filepath.Join("E:", "persisted", "worker"),
+		NativePanelPython: filepath.Join("C:", "persisted", "python.exe"),
+	}}}
+
+	// A restart with no environment variables must still find the worker.
+	saved := persistedNativePanelConfig(server)
+	if saved.Root != filepath.Join("E:", "persisted", "worker") {
+		t.Fatalf("persisted root not used: %q", saved.Root)
+	}
+	if saved.Python != filepath.Join("C:", "persisted", "python.exe") {
+		t.Fatalf("persisted python not used: %q", saved.Python)
+	}
+
+	// An explicit environment override still wins over the stored value.
+	t.Setenv(nativePanelRootEnv, filepath.Join("E:", "env", "worker"))
+	if overridden := persistedNativePanelConfig(server); overridden.Root != filepath.Join("E:", "env", "worker") {
+		t.Fatalf("environment override ignored: %q", overridden.Root)
+	}
+
+	// A server without settings must not panic and must keep the defaults.
+	if fallback := persistedNativePanelConfig(nil); fallback.Python == "" {
+		t.Fatal("nil server must still yield a usable python command")
+	}
+}

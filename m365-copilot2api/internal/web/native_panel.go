@@ -67,6 +67,28 @@ func defaultNativePanelConfig() nativePanelConfig {
 	return nativePanelConfig{Root: root, Python: python, LogCap: nativePanelLogCap, PollLogCap: nativePanelPollLogCap}
 }
 
+// persistedNativePanelConfig resolves the worker location from saved settings so
+// a plain restart keeps registration and OAuth working. The environment variables
+// still take precedence, which matches how every other setting behaves here.
+func persistedNativePanelConfig(server *Server) nativePanelConfig {
+	config := defaultNativePanelConfig()
+	if server == nil || server.settings == nil {
+		return config
+	}
+	saved := server.settings.get()
+	if strings.TrimSpace(os.Getenv(nativePanelRootEnv)) == "" {
+		if root := strings.TrimSpace(saved.NativePanelRoot); root != "" {
+			config.Root = root
+		}
+	}
+	if strings.TrimSpace(os.Getenv(nativePanelPythonEnv)) == "" {
+		if python := strings.TrimSpace(saved.NativePanelPython); python != "" {
+			config.Python = python
+		}
+	}
+	return config
+}
+
 func (c nativePanelConfig) normalized() nativePanelConfig {
 	if c.LogCap <= 0 {
 		c.LogCap = nativePanelLogCap
@@ -875,7 +897,7 @@ func nativePanelManagerFor(server *Server) *nativePanelManager {
 	if current, ok := nativePanelManagers.Load(server); ok {
 		return current.(*nativePanelManager)
 	}
-	created := newNativePanelManager(defaultNativePanelConfig(), nil)
+	created := newNativePanelManager(persistedNativePanelConfig(server), nil)
 	actual, _ := nativePanelManagers.LoadOrStore(server, created)
 	return actual.(*nativePanelManager)
 }

@@ -65,6 +65,11 @@ type runtimeSettings struct {
 	ToolPlanningMode    string         `json:"toolPlanningMode"`
 	CaptureRouterFrames bool           `json:"captureRouterFrames"`
 	ClientProfile       string         `json:"clientProfile"`
+	// NativePanelRoot/NativePanelPython persist where the local registration and
+	// OAuth workers live, so 4141 keeps working after a restart without relying on
+	// per-process environment variables. The matching env vars still win when set.
+	NativePanelRoot     string         `json:"nativePanelRoot,omitempty"`
+	NativePanelPython   string         `json:"nativePanelPython,omitempty"`
 }
 
 type settingsStore struct {
@@ -91,6 +96,8 @@ func defaultRuntimeSettings() runtimeSettings {
 		ModelMappings:    append([]modelMapping(nil), defaultModelMappings...),
 		ToolPlanningMode: toolPlanningMode(os.Getenv("M365_TOOL_PLANNING_MODE")),
 		ClientProfile:    "office",
+		NativePanelRoot:   strings.TrimSpace(os.Getenv(nativePanelRootEnv)),
+		NativePanelPython: strings.TrimSpace(os.Getenv(nativePanelPythonEnv)),
 	}
 }
 func settingsPath() string {
