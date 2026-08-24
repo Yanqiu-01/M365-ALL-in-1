@@ -292,10 +292,21 @@ func logProbe(raw string, result probeResult) {
 		redactProxy(raw), result.l2Code, result.wsCode, result.l2Latency)
 }
 
+// checkAllBudget is the wall clock a manual "check every exit" run may take. It
+// exists so the admin handler returns on a predictable schedule instead of being
+// bounded only by the slowest exit in the pool.
+const checkAllBudget = 30 * time.Second
+
 // CheckAll probes every exit. Probes run concurrently under the same cap the
 // background guard uses (<=20 against Microsoft); the previous sequential loop
-// needed 10s per exit and made the admin handler hang on a large pool.
+// spent 10s per exit and made the admin handler hang on a large pool.
 func (p *Pool) CheckAll(ctx context.Context) []map[string]any {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, cancelAll := context.WithTimeout(ctx, checkAllBudget)
+	defer cancelAll()
+
 	p.mu.Lock()
 	targets := make([]*poolEntry, len(p.entries))
 	copy(targets, p.entries)
