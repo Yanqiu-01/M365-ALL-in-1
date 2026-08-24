@@ -220,6 +220,40 @@ func (p *Pool) unstick(accountID, raw string) {
 	}
 }
 
+// ReleaseStickyExits drops the account -> exit bindings so the next request
+// re-picks by score instead of staying pinned to whatever exit it landed on.
+// Passing no account clears every binding. Callers use this to force a
+// reassignment after the pool changed or after an exit started flapping;
+// it only forgets the affinity, it never touches an in-flight connection.
+func ReleaseStickyExits(accountIDs ...string) int {
+	clientsMu.RLock()
+	p := proxyPool
+	clientsMu.RUnlock()
+	if p == nil {
+		return 0
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.sticky == nil {
+		return 0
+	}
+	if len(accountIDs) == 0 {
+		released := len(p.sticky)
+		p.sticky = map[string]string{}
+		return released
+	}
+	released := 0
+	for _, id := range accountIDs {
+		if id == "" {
+			continue
+		}
+		if _, ok := p.sticky[id]; ok {
+			delete(p.sticky, id)
+			released++
+		}
+	}
+	return released
+}
 func accountAffinity(ctx context.Context) string {
 	if ctx == nil {
 		return ""
@@ -704,13 +738,17 @@ func (e *poolEntry) probeIntervalLocked(timing guardTiming) time.Duration {
 	}
 }
 
+// windowStats reduces the sliding window to the numbers the score needs. Only a
+// passing round contributes a latency sample: a failing exit often rejects in a
+// millisecond, and counting that would make a dead exit look fast.
 func windowStats(window []probeSample) (passes, attempts int, median time.Duration) {
 	latencies := make([]time.Duration, 0, len(window))
 	for _, sample := range window {
 		attempts++
-		if sample.pass {
-			passes++
+		if !sample.pass {
+			continue
 		}
+		passes++
 		if sample.latency > 0 {
 			latencies = append(latencies, sample.latency)
 		}

@@ -2242,6 +2242,7 @@ if (response.output_text) {
                 <p class="conv-detail-sub" id="convDetailSub">点击左侧列表查看完整消息内容</p>
               </div>
               <div class="dash-sec-actions" id="convDetailActions" hidden>
+                <button type="button" class="btn btn-sm" id="convReassignBtn" onclick="reassignCurrentConv()" aria-label="为该对话重新分配账号">重新分配账号</button>
                 <button type="button" class="btn btn-sm danger" id="convDeleteBtn" onclick="deleteCurrentConv()">删除对话</button>
               </div>
             </div>
@@ -4335,6 +4336,29 @@ async function openConvDetail(id){
       isMissing?'网关侧没有该对话的消息记录':'加载详情失败',
       isMissing?'详情只覆盖由本网关创建并保留了上下文的会话':(e.message||''));
   }
+}
+// 重新分配账号：把当前对话从它粘住的账号上挪走，并同时释放
+// 账号→出口的粘连。只放开前者的话，新账号会继续沿用同一个抖动的
+// 出口，等于按钮没起作用（这正是 502 的常见成因）。
+async function reassignCurrentConv(){
+  if(!_convCurrent)return;
+  const id=_convCurrent;
+  if(!confirm('为该对话重新分配账号？\n\n将换到下一个健康账号，并释放当前账号绑定的代理出口。\n本地上下文会保留，但云端会开启一个新对话（跨账号复用同一云端对话会造成串号）。'))return;
+  const btn=$('convReassignBtn');
+  if(btn)btn.disabled=true;
+  try{
+    const d=await api('/api/admin/accounts/reassign',{method:'POST',
+      body:JSON.stringify({conversationId:id,releaseExit:true})});
+    const a=(d.assignments||[])[0];
+    showNotice(a?('已改派到 '+(a.accountEmail||a.accountId)):('已重新分配 '+(d.reassigned||0)+' 个会话'),'success');
+    if((d.failed||[]).length){
+      termOpen('reassign — m365-copilot2api');
+      (d.failed||[]).forEach(f=>termLine('✗ '+(f.sessionId||'')+' — '+(f.error||''),'err'));
+    }
+    openConvDetail(id);
+    loadConversations();
+  }catch(e){showNotice(e.message,'error');}
+  finally{if(btn)btn.disabled=false;}
 }
 async function deleteCurrentConv(){
   if(!_convCurrent)return;

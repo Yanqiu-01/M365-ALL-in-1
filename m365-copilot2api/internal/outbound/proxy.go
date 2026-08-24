@@ -208,6 +208,34 @@ func redactProxyDisplay(raw string) string {
 
 const proxyPasswordPlaceholder = "***"
 
+// RedactProxyURL masks the password of a single exit URL for callers outside this
+// package. /api/admin/settings echoes runtimeSettings.ProxyPool verbatim, which
+// put the proxy password into the dashboard payload and the browser devtools
+// network tab; the proxy-pool endpoint had the same defect. Anything that leaves
+// the process goes through here.
+func RedactProxyURL(raw string) string {
+	// An unset exit must stay unset: redactProxyDisplay reports "<invalid>" for an
+	// unparseable value, and turning "" into "<invalid>" would make the dashboard
+	// claim a direct-dial deployment has a broken proxy configured.
+	if strings.TrimSpace(raw) == "" {
+		return raw
+	}
+	return redactProxyDisplay(raw)
+}
+
+// RedactProxyURLs is RedactProxyURL over a slice, preserving order. A nil input
+// yields nil so a caller can tell "no exits configured" from "empty list".
+func RedactProxyURLs(raw []string) []string {
+	if raw == nil {
+		return nil
+	}
+	out := make([]string, 0, len(raw))
+	for _, v := range raw {
+		out = append(out, RedactProxyURL(v))
+	}
+	return out
+}
+
 // sameProxyURL reports whether candidate identifies entry, accepting either the
 // raw URL or the redacted display form. The admin UI round-trips whatever it was
 // shown, so DELETE ?url=... must keep working once the GET body is redacted.

@@ -331,6 +331,7 @@ func (s *Server) Routes() http.Handler {
 	m.HandleFunc("/api/accounts/refresh-all", s.refreshAllAccounts)
 	m.HandleFunc("/api/accounts/delete", s.deleteAccount)
 	m.HandleFunc("/api/accounts/provision", s.provisionAccount)
+	m.HandleFunc("/api/admin/accounts/reassign", s.reassignAccount)
 	m.HandleFunc("/api/accounts/credentials", s.accountCredentials)
 	m.HandleFunc("/api/accounts/web/run-scripts", s.accountRunScripts)
 	m.HandleFunc("/api/auth/start", s.startPKCE)

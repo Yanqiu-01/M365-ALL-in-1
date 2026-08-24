@@ -197,7 +197,15 @@ func (s *settingsStore) save(v runtimeSettings) error {
 func (s *Server) adminSettings(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		jsonOut(w, map[string]any{"settings": s.settings.get(), "codexModels": configurableCodexModels, "upstreamTones": knownUpstreamTones(), "restartRequiredFields": []string{"listenAddress", "configPath", "tokenCachePath", "sessionCachePath", "outboundProxy", "proxyPool", "clientId", "authority", "redirectUri", "scope", "debugLogPath"}})
+		// The proxy pool carries userinfo, so the response must not echo it raw:
+		// this endpoint is what put the Azure proxy password into the dashboard
+		// payload. Redact on the way out only - the stored value stays dialable,
+		// and PUT merges field by field, so an untouched proxyPool is never
+		// overwritten with the "***" placeholder.
+		view := s.settings.get()
+		view.ProxyPool = outbound.RedactProxyURLs(view.ProxyPool)
+		view.OutboundProxy = outbound.RedactProxyURL(view.OutboundProxy)
+		jsonOut(w, map[string]any{"settings": view, "codexModels": configurableCodexModels, "upstreamTones": knownUpstreamTones(), "restartRequiredFields": []string{"listenAddress", "configPath", "tokenCachePath", "sessionCachePath", "outboundProxy", "proxyPool", "clientId", "authority", "redirectUri", "scope", "debugLogPath"}})
 	case http.MethodPut:
 		// 前端可能只修改一个字段（如监听地址），其余字段以零值提交。
 		// 逐字段合并到当前设置再校验，避免"改一个字段弄丢其他配置"。

@@ -609,6 +609,43 @@ func (sr *sessionResolver) DeleteSession(sessionID string) bool {
 	return true
 }
 
+// ReassignAccount repoints one session at a different account, keeping the
+// conversation history so the next turn continues rather than starting over.
+// The cloud ConversationID is cleared on purpose: a conversation belongs to the
+// account that created it, so replaying it under a new account is exactly the
+// CrossID mixing the resolver exists to prevent. The next request therefore
+// opens a fresh upstream conversation while the local history is still replayed.
+func (sr *sessionResolver) ReassignAccount(sessionID, accountID string) bool {
+	sr.mu.Lock()
+	defer sr.mu.Unlock()
+	sess, ok := sr.sessions[sessionID]
+	if !ok {
+		return false
+	}
+	sess.AccountID = accountID
+	sess.ConversationID = ""
+	sess.LastUsedAt = time.Now().UTC()
+	sr.sessions[sessionID] = sess
+	sr.reindexLocked(sess)
+	sr.persist.markDirty()
+	return true
+}
+
+// SessionsForConversation lists the session ids bound to a cloud conversation.
+// The dashboard addresses a row by conversation, while reassignment operates on
+// the session, so the handler needs this translation.
+func (sr *sessionResolver) SessionsForConversation(conversationID string) []string {
+	sr.mu.Lock()
+	defer sr.mu.Unlock()
+	out := []string{}
+	for sid, sess := range sr.sessions {
+		if sess.ConversationID == conversationID {
+			out = append(out, sid)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
 // UnbindByConversation drops every session bound to the given conversation.
 // Called after an automatic cleanup deletes the cloud conversation, so the
 // anti-CrossID resolver never reuses a dead conversation.

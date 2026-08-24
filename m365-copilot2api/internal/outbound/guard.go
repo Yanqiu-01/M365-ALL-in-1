@@ -63,7 +63,12 @@ const (
 	// guardMaxConcurrency caps in-flight probes. Microsoft is the target, so this
 	// is a politeness limit as much as a resource limit.
 	guardMaxConcurrency     = 20
-	guardDefaultConcurrency = 20
+	// guardDefaultConcurrency was 20, equal to the ceiling, so a 15-exit pool probed
+	// every exit in the same instant. Short-lived exits (21-minute 51daili leases)
+	// flap, and a fully synchronous round made them all fail in the same second,
+	// which drained the ws-dial retry budget and surfaced as a 502 upstream
+	// handshake failure. A lower fan-out keeps exit failures independent.
+	guardDefaultConcurrency = 6
 
 	EnvProxyGuardInterval    = "M365_PROXY_GUARD_INTERVAL"
 	EnvProxyGuardConcurrency = "M365_PROXY_GUARD_CONCURRENCY"
