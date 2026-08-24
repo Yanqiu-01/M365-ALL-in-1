@@ -45,6 +45,15 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 	r2.Body = io.NopCloser(bytes.NewReader(b))
 	r2.ContentLength = int64(len(b))
 	pr, pw := io.Pipe()
+	// The reader end MUST be closed on every exit path, including the ones that
+	// bypass <-innerDone (client disconnect, scanner error, panic in this
+	// function). io.Pipe is unbuffered and io.PipeWriter.Write does not observe
+	// context cancellation, so the inner goroutine parks in pw.Write forever if
+	// nobody drains or closes the pipe. Its deferred releases then never run,
+	// permanently stranding the process-wide chat slot, the per-account slot,
+	// the client-key slot and the upstream ChatHub WebSocket. Closing pr makes
+	// that pending Write fail immediately, which lets the goroutine unwind.
+	defer pr.Close()
 	irw := &pipeResponseWriter{h: make(http.Header), w: pw}
 	innerDone := make(chan struct{})
 	go func() {
@@ -109,7 +118,15 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 		if rawCalls, ok := delta["tool_calls"].([]any); ok {
 			for _, raw := range rawCalls {
 				tc, _ := raw.(map[string]any)
-				idx := int(tc["index"].(float64))
+				// Every other read from this map uses the two-value form; this one
+				// used a bare assertion and was the single panic site in the loop.
+				// A tool_calls delta without a numeric index is malformed, so skip
+				// it rather than taking down the request.
+				rawIdx, ok := tc["index"].(float64)
+				if !ok {
+					continue
+				}
+				idx := int(rawIdx)
 				st := calls[idx]
 				typ := "function"
 				if v, ok := tc["type"].(string); ok && v == "custom" {
@@ -143,6 +160,13 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 			}
 		}
 	}
+	// Reading is finished either way, so release the pipe before waiting. On a
+	// clean end-of-stream the inner goroutine has already closed pw and this is a
+	// no-op; on a scanner error (for example a single SSE line above the 2 MiB
+	// cap) the goroutine is still blocked in pw.Write, and only this close lets
+	// it unwind so <-innerDone can return instead of deadlocking. The deferred
+	// pr.Close above stays as the guard for the early-return paths.
+	_ = pr.Close()
 	<-innerDone
 	if scanner.Err() != nil || irw.status >= http.StatusBadRequest {
 		status := irw.status

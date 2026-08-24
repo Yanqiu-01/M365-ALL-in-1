@@ -2329,12 +2329,42 @@ if (response.output_text) {
           </div>
         </div>
         <div class="card">
-          <div class="card-head"><h3 class="card-title">代理列表</h3></div>
+          <div class="card-head"><h3 class="card-title">免费节点拉取</h3><span class="badge info">质量守护</span></div>
+          <div class="card-body">
+            <label class="form-label" for="proxyFreeSourceURL">公开文本来源 URL</label>
+            <input class="form-input" id="proxyFreeSourceURL" type="url" inputmode="url" autocomplete="off" placeholder="https://example.com/proxies.txt">
+            <div class="form-row" style="margin-top:var(--sp-3)">
+              <div class="form-group">
+                <label class="form-label" for="proxyFreeScheme">列表协议</label>
+                <select class="form-input" id="proxyFreeScheme"><option value="http">HTTP</option><option value="https">HTTPS</option><option value="socks5">SOCKS5</option></select>
+              </div>
+              <div class="form-group">
+                <label class="form-label" for="proxyFreeLimit">本次质量筛选上限</label>
+                <input class="form-input" id="proxyFreeLimit" type="number" min="1" max="30" value="10">
+              </div>
+            </div>
+            <div class="btn-row">
+              <button type="button" class="btn primary" id="proxyFreeImportBtn" onclick="proxyFreeImport()">拉取并质量筛选导入</button>
+            </div>
+            <p class="form-hint" style="margin-top:var(--sp-2)">仅接受公开 IP:端口列表；网关直连来源、去重后以 M365 登录面探测，失败节点不会入池。每次最多检查 30 条。</p>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-head"><h3 class="card-title">购买代理</h3></div>
+          <div class="card-body">
+            <label class="form-label" for="proxyPurchaseURL">购买页面 URL</label>
+            <input class="form-input" id="proxyPurchaseURL" type="url" inputmode="url" autocomplete="off" placeholder="https://provider.example.com/order">
+            <div class="btn-row" style="margin-top:var(--sp-3)"><button type="button" class="btn" onclick="proxyOpenPurchase()">打开购买页</button></div>
+            <p class="form-hint" style="margin-top:var(--sp-2)">此链接仅用于当前浏览器跳转，不会上传、保存到网关或写入设置；请勿将供应商凭据硬编码到页面。</p>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-head"><h3 class="card-title">代理列表</h3><div class="btn-row"><span class="form-hint" id="proxySelectedCount">未选择</span><button type="button" class="btn danger" id="proxyDeleteSelectedBtn" onclick="proxyDeleteSelected()" disabled>删除选中</button></div></div>
           <div class="table-wrap">
             <table class="table compact">
               <caption class="sr-only">代理池列表与健康状态</caption>
-              <thead><tr><th scope="col">地址</th><th scope="col">状态</th><th scope="col" class="num">延迟</th><th scope="col" class="num">失败次数</th><th scope="col">冷却至</th><th scope="col" class="actions">操作</th></tr></thead>
-              <tbody id="proxyRows"><tr aria-hidden="true"><td><span class="skel w-80"></span></td><td><span class="skel w-40"></span></td><td><span class="skel w-30"></span></td><td><span class="skel w-30"></span></td><td><span class="skel w-60"></span></td><td><span class="skel w-40"></span></td></tr></tbody>
+              <thead><tr><th scope="col"><input id="proxySelectAll" type="checkbox" onchange="proxyToggleAll(this.checked)" aria-label="选择全部代理"></th><th scope="col">地址</th><th scope="col">状态</th><th scope="col" class="num">延迟</th><th scope="col" class="num">失败次数</th><th scope="col">冷却至</th><th scope="col" class="actions">操作</th></tr></thead>
+              <tbody id="proxyRows"><tr aria-hidden="true"><td><span class="skel w-30"></span></td><td><span class="skel w-80"></span></td><td><span class="skel w-40"></span></td><td><span class="skel w-30"></span></td><td><span class="skel w-30"></span></td><td><span class="skel w-60"></span></td><td><span class="skel w-40"></span></td></tr></tbody>
             </table>
           </div>
         </div>
@@ -4533,10 +4563,14 @@ async function cleanupAll(){
   showNotice('清理完成','success');loadConversations();
 }
 
+const proxySelectedIDs=new Set();
 function proxyRow(x){
+  const id=String(x.id||'');
   const inCooldown=x.cooldownUntil&&new Date(x.cooldownUntil)>new Date();
+  const selected=id&&proxySelectedIDs.has(id);
   const badge=x.health==='reachable'?'<span class="badge ok">正常</span>':x.health==='unreachable'?'<span class="badge err">不可达</span>':x.health==='upstream_error'?'<span class="badge warn">上游异常</span>':'<span class="badge">未检测</span>';
   return `<tr>
+    <td><input type="checkbox" data-proxy-id="${escAttr(id)}" ${id?'':'disabled'} ${selected?'checked':''} onchange="proxyToggleSelected(this.dataset.proxyId,this.checked)" aria-label="选择代理 ${escAttr(x.url)}"></td>
     <td><code class="mono-cell cell-trunc w-lg" title="${esc(x.url)}">${esc(x.url)}</code>${inCooldown?'<div class="t-dim">冷却中</div>':''}</td>
     <td>${badge}</td>
     <td class="num t-time">${x.latencyMs>0?x.latencyMs+' ms':'-'}</td>
@@ -4544,16 +4578,46 @@ function proxyRow(x){
     <td class="t-time">${x.cooldownUntil?esc(fmtTime(x.cooldownUntil)):'-'}</td>
     <td class="actions">
       <button class="btn btn-sm" onclick="proxyCheckOne('${escAttr(x.url)}')" aria-label="检查代理 ${esc(x.url)}">检查</button>
-      <button class="btn btn-sm danger" onclick="proxyRemove('${escAttr(x.url)}')" aria-label="删除代理 ${esc(x.url)}">删除</button>
+      <button class="btn btn-sm danger" onclick="proxyRemove('${escAttr(id)}','${escAttr(x.url)}')" ${id?'':'disabled'} aria-label="删除代理 ${esc(x.url)}">删除</button>
     </td>
   </tr>`;
+}
+function updateProxySelectionUI(){
+  const selected=proxySelectedIDs.size;
+  const rows=[...document.querySelectorAll('#proxyRows input[data-proxy-id]:not(:disabled)')];
+  const count=$('proxySelectedCount'),button=$('proxyDeleteSelectedBtn'),all=$('proxySelectAll');
+  if(count)count.textContent=selected?'已选择 '+selected+' 个':'未选择';
+  if(button)button.disabled=selected===0;
+  if(all){all.checked=rows.length>0&&selected===rows.length;all.indeterminate=selected>0&&selected<rows.length;}
+}
+function proxyToggleSelected(id,checked){
+  if(!id)return;
+  if(checked)proxySelectedIDs.add(id);else proxySelectedIDs.delete(id);
+  updateProxySelectionUI();
+}
+function proxyToggleAll(checked){
+  document.querySelectorAll('#proxyRows input[data-proxy-id]:not(:disabled)').forEach(box=>{
+    const id=box.dataset.proxyId;if(!id)return;
+    box.checked=checked;if(checked)proxySelectedIDs.add(id);else proxySelectedIDs.delete(id);
+  });
+  updateProxySelectionUI();
+}
+function pruneProxySelection(proxies){
+  const active=new Set((proxies||[]).map(x=>String(x.id||'')).filter(Boolean));
+  [...proxySelectedIDs].forEach(id=>{if(!active.has(id))proxySelectedIDs.delete(id);});
 }
 async function loadProxies(){
   try{
     const d=await api('/api/admin/proxy-pool');
     const p=d.proxies||[];
-    $('proxyRows').innerHTML=p.length?p.map(proxyRow).join(''):emptyRow(6,'globe','没有配置代理','当前请求将直连上游；在上方粘贴代理地址即可启用故障切换');
-  }catch(e){$('proxyRows').innerHTML=errorRow(6,e.message);}
+    pruneProxySelection(p);
+    $('proxyRows').innerHTML=p.length?p.map(proxyRow).join(''):emptyRow(7,'globe','没有配置代理','当前请求将直连上游；可在上方手动添加或拉取经质量筛选的公开节点');
+    updateProxySelectionUI();
+  }catch(e){
+    proxySelectedIDs.clear();
+    $('proxyRows').innerHTML=errorRow(7,e.message);
+    updateProxySelectionUI();
+  }
 }
 async function proxyAdd(){
   const raw=$('proxyInput').value.trim();
@@ -4563,10 +4627,59 @@ async function proxyAdd(){
     showNotice('已添加 '+d.added+' 个代理','success');$('proxyInput').value='';loadProxies();
   }catch(e){showNotice(e.message,'error');}
 }
-async function proxyRemove(url){
-  if(!confirm('删除代理 '+url+'？'))return;
-  try{await api('/api/admin/proxy-pool?url='+encodeURIComponent(url),{method:'DELETE'});showNotice('已删除','success');loadProxies();}
-  catch(e){showNotice(e.message,'error');}
+async function proxyRemove(id,label){
+  if(!id)return showNotice('该代理缺少可安全删除的 ID','error');
+  if(!confirm('删除代理 '+label+'？'))return;
+  try{
+    await api('/api/admin/proxy-pool?id='+encodeURIComponent(id),{method:'DELETE'});
+    proxySelectedIDs.delete(id);showNotice('已删除','success');loadProxies();
+  }catch(e){showNotice(e.message,'error');}
+}
+async function proxyDeleteSelected(){
+  const ids=[...proxySelectedIDs];
+  if(!ids.length)return showNotice('请先勾选要删除的代理','error');
+  if(!confirm('删除已选的 '+ids.length+' 个代理？此操作会释放其粘号关联。'))return;
+  try{
+    const d=await api('/api/admin/proxy-pool?action=selected',{method:'DELETE',body:JSON.stringify({ids})});
+    proxySelectedIDs.clear();
+    const suffix=d.missing?'；'+d.missing+' 个已不在当前代理池':'';
+    showNotice('已删除 '+(d.deleted||0)+' 个代理'+suffix,'success');loadProxies();
+  }catch(e){showNotice(e.message,'error');}
+}
+function normalizeExternalHTTPURL(raw,label){
+  let target;
+  try{target=new URL(String(raw||'').trim());}catch{throw Error(label+'不是有效 URL');}
+  if(target.protocol!=='http:'&&target.protocol!=='https:')throw Error(label+'仅支持 http 或 https');
+  if(target.username||target.password)throw Error(label+'不能包含用户名或密码');
+  return target;
+}
+function proxyOpenPurchase(){
+  try{
+    const target=normalizeExternalHTTPURL($('proxyPurchaseURL').value,'购买页面 URL');
+    const popup=window.open(target.href,'_blank','noopener,noreferrer');
+    if(popup)popup.opener=null;
+  }catch(e){showNotice(e.message,'error');}
+}
+async function proxyFreeImport(){
+  let source;
+  try{source=normalizeExternalHTTPURL($('proxyFreeSourceURL').value,'公开文本来源 URL').href;}
+  catch(e){showNotice(e.message,'error');return;}
+  const rawLimit=Number.parseInt($('proxyFreeLimit').value,10);
+  const limit=Number.isFinite(rawLimit)?Math.min(30,Math.max(1,rawLimit)):10;
+  $('proxyFreeLimit').value=limit;
+  const button=$('proxyFreeImportBtn');
+  if(button)button.disabled=true;
+  termOpen('free proxy import — quality gate');
+  termLine('正在拉取公开来源并执行 M365 质量筛选…');
+  try{
+    const d=await api('/api/admin/proxy-pool?action=free-import',{method:'POST',body:JSON.stringify({sourceUrl:source,scheme:$('proxyFreeScheme').value,limit})});
+    const r=d.report||{};
+    termLine('发现 '+(r.discovered||0)+' 条；格式无效 '+(r.invalid||0)+'；重复 '+(r.duplicates||0)+'；上限跳过 '+(r.limited||0)+'。','warn');
+    termLine('质量探测 '+(r.checked||0)+' 条；通过 '+(r.passed||0)+'；拒绝 '+(r.rejected||0)+'；导入 '+(r.imported||0)+'。',(r.imported||0)?'ok':'warn');
+    showNotice('质量筛选完成：导入 '+(r.imported||0)+' 个代理',(r.imported||0)?'success':'error');
+    loadProxies();
+  }catch(e){termLine('拉取失败：'+e.message,'err');showNotice(e.message,'error');}
+  finally{if(button)button.disabled=false;}
 }
 async function proxyCheckOne(url){
   try{
