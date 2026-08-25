@@ -802,6 +802,56 @@ func (s *Server) provisionAccount(w http.ResponseWriter, r *http.Request) {
 // beginPKCEAuthorization 生成一次新的 PKCE 授权，返回 state、授权 URL、
 // 代数与 redirect URI。startPKCE 与「账密一键回调」的交互式回退路径共用
 // 它，因此仓库里只有一套 PKCE 实现。
+// maxPendingPKCE 限制并发进行中的授权数，避免这张表无界增长。
+// 批量授权的并发上限是 16，留出余量。
+const maxPendingPKCE = 64
+
+// registerPKCEState 登记一个进行中的授权，并返回它的 generation。
+//
+// keepOthers 区分两种调用者，二者的正确行为相反：
+//
+//   - false（浏览器交互式授权）：整表覆盖，只留当前这一个。旧的终态条目残留
+//     会让 UI 反复进入上一次的回调。
+//   - true（批量并发授权）：必须保留其它进行中的 state。批量脚本会先连着调
+//     N 次 /api/auth/start 再逐个回调；若每次都整表覆盖，前 N-1 个账号回调时
+//     都会拿到 "invalid or expired state" —— 实测 3 并发时 2 个 http400，
+//     只有最后启动的那个成功。
+//
+// 并发模式下用 Attempt 做隔离已经足够：callback 兑换前会重新校验 Attempt，
+// 过期条目由 prunePKCELocked 按 TTL 回收。
+func (s *Server) registerPKCEState(state, verifier string, keepOthers bool) uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	attempt := s.nextPKCEAttemptLocked()
+	if !keepOthers {
+		// 浏览器交互式授权：保持「一次只有一个进行中的授权」。旧的终态条目
+		// 残留会让 UI 反复进入上一次的回调（见 TestStartPKCEClearsStaleAttempts）。
+		s.pkce = map[string]pendingPKCE{
+			state: {Verifier: verifier, Created: time.Now(), Attempt: attempt, Status: "pending"},
+		}
+		return attempt
+	}
+	s.prunePKCELocked()
+	if s.pkce == nil {
+		s.pkce = map[string]pendingPKCE{}
+	}
+	// 满了就淘汰最旧的一条，而不是整表清空。
+	for len(s.pkce) >= maxPendingPKCE {
+		oldestState, oldest := "", time.Time{}
+		for st, p := range s.pkce {
+			if oldestState == "" || p.Created.Before(oldest) {
+				oldestState, oldest = st, p.Created
+			}
+		}
+		if oldestState == "" {
+			break
+		}
+		delete(s.pkce, oldestState)
+	}
+	s.pkce[state] = pendingPKCE{Verifier: verifier, Created: time.Now(), Attempt: attempt, Status: "pending"}
+	return attempt
+}
+
 func (s *Server) beginPKCEAuthorization(prompt string) (string, string, uint64, string, error) {
 	v, err := auth.Verifier()
 	if err != nil {
@@ -814,15 +864,7 @@ func (s *Server) beginPKCEAuthorization(prompt string) (string, string, uint64, 
 	state := hex.EncodeToString(b)
 	redirectURI := auth.RedirectURI()
 
-	// A new authorization owns a fresh generation. Drop every older state,
-	// including an exchange in flight: callback completion rechecks Attempt
-	// before writing anything, so an old browser tab cannot pollute this one.
-	s.mu.Lock()
-	attempt := s.nextPKCEAttemptLocked()
-	s.pkce = map[string]pendingPKCE{
-		state: {Verifier: v, Created: time.Now(), Attempt: attempt, Status: "pending"},
-	}
-	s.mu.Unlock()
+	attempt := s.registerPKCEState(state, v, false)
 
 	url := auth.AuthorizationURLWithPrompt(
 		auth.AuthorizeEndpoint(),
@@ -850,15 +892,16 @@ func (s *Server) startPKCE(w http.ResponseWriter, r *http.Request) {
 	state := hex.EncodeToString(b)
 	redirectURI := auth.RedirectURI()
 
-	// A new authorization owns a fresh generation. Drop every older state,
-	// including an exchange in flight: callback completion rechecks Attempt
-	// before writing anything, so an old browser tab cannot pollute this one.
-	s.mu.Lock()
-	attempt := s.nextPKCEAttemptLocked()
-	s.pkce = map[string]pendingPKCE{
-		state: {Verifier: v, Created: time.Now(), Attempt: attempt, Status: "pending"},
+	// 批量并发授权必须显式声明，才允许多个 state 并存。默认仍是独占语义，
+	// 保证浏览器交互式授权不会被旧条目干扰。
+	keepOthers := false
+	if r != nil {
+		switch strings.ToLower(strings.TrimSpace(r.URL.Query().Get("concurrent"))) {
+		case "1", "true", "yes":
+			keepOthers = true
+		}
 	}
-	s.mu.Unlock()
+	attempt := s.registerPKCEState(state, v, keepOthers)
 
 	// Default prompt is login (auth.Prompt). select_account still auto-continues
 	// a single signed-in session, so it is only used when the caller asks for it.

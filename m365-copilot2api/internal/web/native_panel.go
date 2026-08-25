@@ -601,7 +601,7 @@ func (m *nativePanelManager) startRegister(request nativePanelRegisterRequest) (
 		request.Count = resolvedCount
 	}
 	if request.Concurrent && mode == "proxy" {
-		concurrency := nativePanelClamp(nativePanelPositive(request.Concurrency, 3), 1, 16)
+		concurrency := nativePanelClamp(nativePanelPositive(request.Concurrency, 3), 1, maxPanelConcurrency)
 		timeout := nativePanelClamp(nativePanelPositive(request.Timeout, 180), 30, 600)
 		args := []string{"--concurrency", strconv.Itoa(concurrency), "--limit", strconv.Itoa(count), "--timeout", strconv.Itoa(timeout)}
 		if request.Resume {
@@ -721,6 +721,19 @@ func (r nativePanelOAuthBatchRequest) serial() bool {
 	return r.Concurrent != nil && !*r.Concurrent
 }
 
+// maxPanelConcurrency 是注册 / OAuth 批量任务的并发上限。
+//
+// 之前是 16。放开到 64 的前提是两个真实缺陷已经修掉：
+//   1. 批量脚本原来所有账号共用一个 browser context（共用 cookie），并发登录
+//      不同账号会互相顶掉会话，表现为 login_timeout；现在每账号一个独立
+//      context。
+//   2. 网关每次 /api/auth/start 都整表覆盖 PKCE state，前 N-1 个账号回调必然
+//      拿到 invalid state（http400）；现在并发模式下多个 state 并存。
+//
+// 实测：修复前 3 并发 1 成功 2 失败（204s）；修复后 5 并发 5 成功（12.6s）。
+// 真正的天花板是本机内存与微软风控，不是这个常量，所以上限给到 64 而不是更高。
+const maxPanelConcurrency = 64
+
 func (m *nativePanelManager) startOAuthBatch(request nativePanelOAuthBatchRequest) (nativePanelJobSnapshot, error) {
 	paths, cfg, err := m.workerConfig()
 	if err != nil {
@@ -762,7 +775,7 @@ func (m *nativePanelManager) startOAuthBatch(request nativePanelOAuthBatchReques
 		}
 		return m.start("oauth:batch", "oauth/oauth_batch.py", args, nil)
 	}
-	concurrency := nativePanelClamp(nativePanelPositive(request.Concurrency, 3), 1, 16)
+	concurrency := nativePanelClamp(nativePanelPositive(request.Concurrency, 3), 1, maxPanelConcurrency)
 	timeout := nativePanelClamp(nativePanelPositive(request.Timeout, 300), 60, 900)
 	args := []string{"--concurrency", strconv.Itoa(concurrency), "--timeout", strconv.Itoa(timeout)}
 	if request.Resume {
