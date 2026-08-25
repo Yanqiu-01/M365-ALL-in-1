@@ -35,12 +35,19 @@ func TestInnerAdapterCallDetection(t *testing.T) {
 // 因为给生产代码加一个只为测试存在的钩子，本身就是把测试成本转嫁给实现。
 func TestBothAdapterEntrypointsSetInnerHeader(t *testing.T) {
 	src := readSourceFile(t, "protocol_handlers.go")
-	for _, fn := range []string{"runOpenAIAdapter", "streamResponsesAdapter"} {
+	// runOpenAIAdapter 现在只是薄封装，真正克隆请求的是
+	// runOpenAIAdapterWithStats —— 标记必须在实际发起内部调用的那个函数里。
+	for _, fn := range []string{"runOpenAIAdapterWithStats", "streamResponsesAdapter"} {
 		body := funcBody(t, src, fn)
 		if !strings.Contains(body, "r2.Header.Set(innerAdapterHeader") {
 			t.Fatalf("%s 没有给内部请求打 %s 标记；这一侧的用量会被重复统计",
 				fn, innerAdapterHeader)
 		}
+	}
+	// 薄封装必须确实委派给带标记的那个实现，否则它会绕过标记。
+	if !strings.Contains(src, "return out, raw, status, err") ||
+		!strings.Contains(src, "s.runOpenAIAdapterWithStats(r, o)") {
+		t.Fatal("runOpenAIAdapter 没有委派给 runOpenAIAdapterWithStats，会绕过内部委派标记")
 	}
 }
 

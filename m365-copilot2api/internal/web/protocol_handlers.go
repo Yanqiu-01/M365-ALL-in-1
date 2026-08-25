@@ -1,6 +1,7 @@
 package web
 
 import (
+	"context"
 	"bufio"
 	"bytes"
 	"encoding/json"
@@ -38,6 +39,9 @@ func (p *pipeResponseWriter) Flush() {}
 // streamResponsesAdapter converts the internal OpenAI SSE incrementally instead
 // of buffering the entire completion in httptest.ResponseRecorder.
 func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, o oaiReq, model string) {
+	// 本次请求的计时。不能用包级 startedAt —— 那是服务启动时间，
+	// 拿它算 DurationMs 会把每条记录写成进程已运行的总时长。
+	requestStartedAt := time.Now()
 	o.Stream = true
 	b, _ := json.Marshal(o)
 	r2 := r.Clone(r.Context())
@@ -46,6 +50,7 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 	r2.ContentLength = int64(len(b))
 	// 与 runOpenAIAdapter 同理：内层不记账，避免一次请求两条用量记录。
 	r2.Header.Set(innerAdapterHeader, "1")
+	r2, innerSink := withInnerStats(r2)
 	pr, pw := io.Pipe()
 	// The reader end MUST be closed on every exit path, including the ones that
 	// bypass <-innerDone (client disconnect, scanner error, panic in this
@@ -237,6 +242,24 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 	estimate := estimateResponsesUsage(model, o.Messages, o.Tools, o.ToolChoice, usageOutput)
 	resp := map[string]any{"id": id, "object": "response", "created_at": created, "status": "completed", "model": model, "output": output, "usage": estimate.Values, "m365": localUsageMetadata(estimate.Source)}
 	emit("response.completed", map[string]any{"type": "response.completed", "response": resp})
+
+	// 流式 Responses 此前完全不记账：内层被 innerAdapterHeader 挡掉，外层这条
+	// 路径又没有 usage.record，于是走流式的 Codex 请求在用量表里根本不存在。
+	// 缓存 token 来自内层回填 —— 只有它看得到会话历史。
+	if s.usage != nil {
+		s.usage.record(UsageRecord{
+			Time:         time.Now(),
+			APIKeyPrefix: extractAPIKey(r),
+			Model:        model,
+			Endpoint:     "/v1/responses",
+			Stream:       true,
+			InputTokens:  int64(estimate.Values["input_tokens"].(int)),
+			OutputTokens: int64(estimate.Values["output_tokens"].(int)),
+			CacheTokens:  innerStatsCacheTokens(innerSink),
+			DurationMs:   time.Since(requestStartedAt).Milliseconds(),
+			Status:       200,
+		})
+	}
 }
 
 // innerAdapterHeader 标记「这是一次内部委派」。
@@ -253,7 +276,55 @@ func isInnerAdapterCall(r *http.Request) bool {
 	return r != nil && r.Header.Get(innerAdapterHeader) == "1"
 }
 
+// innerStatsKey 在 context 里挂一个回填槽，让内层把只有它算得出来的统计量
+// 交给外层。
+//
+// 为什么需要：历史（缓存）token 只有内层算得出来 —— 那里才有 body.Messages
+// 和 session 解析结果。外层 /v1/messages、/v1/responses 手上只有转换后的请求，
+// 自己重算既是重复劳动，又容易和内层口径不一致。内层跳过记账后如果不回传，
+// 外层写出的记录里缓存永远是 0（面板上就是「缓0」），看起来像完全没命中缓存。
+//
+// 用 context 而不是响应头：流式路径的响应头早就随首个 SSE 帧发走了，等内层
+// 算完历史 token 时再 Set 已经无效。
+type innerStatsKeyType struct{}
+
+var innerStatsKey innerStatsKeyType
+
+// innerStats 承接内层回填的统计量。
+type innerStats struct {
+	CacheTokens int64
+}
+
+// withInnerStats 给内部委派请求挂上回填槽。
+func withInnerStats(r *http.Request) (*http.Request, *innerStats) {
+	sink := &innerStats{}
+	return r.WithContext(context.WithValue(r.Context(), innerStatsKey, sink)), sink
+}
+
+// innerStatsSink 取出当前请求的回填槽；非内部委派时为 nil。
+func innerStatsSink(r *http.Request) *innerStats {
+	if r == nil {
+		return nil
+	}
+	sink, _ := r.Context().Value(innerStatsKey).(*innerStats)
+	return sink
+}
+
+// innerStatsCacheTokens 安全地读出回填的缓存 token 数。
+func innerStatsCacheTokens(stats *innerStats) int64 {
+	if stats == nil {
+		return 0
+	}
+	return stats.CacheTokens
+}
+
 func (s *Server) runOpenAIAdapter(r *http.Request, o oaiReq) (map[string]any, []byte, int, error) {
+	out, raw, status, _, err := s.runOpenAIAdapterWithStats(r, o)
+	return out, raw, status, err
+}
+
+// runOpenAIAdapterWithStats 同时交出内层回填的统计量，供外层按真实端点记账。
+func (s *Server) runOpenAIAdapterWithStats(r *http.Request, o oaiReq) (map[string]any, []byte, int, *innerStats, error) {
 	o.Stream = false
 	b, _ := json.Marshal(o)
 	r2 := r.Clone(r.Context())
@@ -261,11 +332,12 @@ func (s *Server) runOpenAIAdapter(r *http.Request, o oaiReq) (map[string]any, []
 	r2.Body = io.NopCloser(bytes.NewReader(b))
 	r2.ContentLength = int64(len(b))
 	r2.Header.Set(innerAdapterHeader, "1")
+	r2, sink := withInnerStats(r2)
 	rr := httptest.NewRecorder()
 	s.openaiChat(rr, r2)
 	var out map[string]any
 	err := json.Unmarshal(rr.Body.Bytes(), &out)
-	return out, rr.Body.Bytes(), rr.Code, err
+	return out, rr.Body.Bytes(), rr.Code, sink, err
 }
 
 func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
@@ -300,7 +372,7 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 		s.streamResponsesAdapter(w, r, o, firstNonEmpty(body.Model, "m365-copilot"))
 		return
 	}
-	out, raw, status, err := s.runOpenAIAdapter(r, o)
+	out, raw, status, stats, err := s.runOpenAIAdapterWithStats(r, o)
 	if status >= 400 {
 		writeResponsesError(w, status, "upstream_error", errorMessage(raw, "upstream protocol error"))
 		return
@@ -331,8 +403,10 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 		Endpoint:     "/v1/responses",
 		InputTokens:  int64(estimate.Values["input_tokens"].(int)),
 		OutputTokens: int64(estimate.Values["output_tokens"].(int)),
-		DurationMs:   time.Since(startedAt).Milliseconds(),
-		Status:       200,
+		// 缓存 token 由内层回填 —— 只有它看得到会话历史。
+		CacheTokens: innerStatsCacheTokens(stats),
+		DurationMs:  time.Since(startedAt).Milliseconds(),
+		Status:      200,
 	})
 	// Retain the normalized history so a subsequent previous_response_id can
 	// validate its function_call_output against the original tool call.
@@ -411,7 +485,7 @@ func (s *Server) anthropicMessages(w http.ResponseWriter, r *http.Request) {
 		writeAnthropicError(w, 400, "invalid_request_error", err.Error())
 		return
 	}
-	out, raw, status, err := s.runOpenAIAdapter(r, o)
+	out, raw, status, stats, err := s.runOpenAIAdapterWithStats(r, o)
 	if status >= 400 {
 		writeAnthropicError(w, status, "api_error", errorMessage(raw, "upstream protocol error"))
 		return
@@ -440,8 +514,10 @@ func (s *Server) anthropicMessages(w http.ResponseWriter, r *http.Request) {
 		Stream:       body.Stream,
 		InputTokens:  int64(estimate.Values["input_tokens"].(int)),
 		OutputTokens: int64(estimate.Values["output_tokens"].(int)),
-		DurationMs:   time.Since(startedAt).Milliseconds(),
-		Status:       200,
+		// 缓存 token 由内层回填 —— 只有它看得到会话历史。
+		CacheTokens: innerStatsCacheTokens(stats),
+		DurationMs:  time.Since(startedAt).Milliseconds(),
+		Status:      200,
 	})
 	writeAnthropicResult(w, firstNonEmpty(body.Model, "m365-copilot"), body.Stream, out)
 }
