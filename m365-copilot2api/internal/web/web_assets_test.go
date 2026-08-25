@@ -11,9 +11,11 @@ import (
 	"testing"
 )
 
-// web/ 下的三个页面逐字节取自 APK assets/web/。
+// web/ 下 APK 原有的三个页面逐字节取自 APK assets/web/。
 // APK 中不存在 conversation.html —— rodata 只有 "web/index.html"，
 // 且 rootPage 的路径判定只覆盖 / 与 /login。
+// workbench.html 是 2026-08-26 按用户要求新增的「仅聊天」工作台，
+// 属有意的功能扩展，不属于 APK 复原集，因此单独校验而非并入 want。
 func TestWebAssetsMatchAPKSet(t *testing.T) {
 	entries, err := os.ReadDir("../../web")
 	if err != nil {
@@ -26,12 +28,14 @@ func TestWebAssetsMatchAPKSet(t *testing.T) {
 	sort.Strings(got)
 
 	want := []string{"debug.html", "index.html", "login.html"}
-	if strings.Join(got, ",") != strings.Join(want, ",") {
-		t.Errorf("web/ 内容为 %v，期望 %v（APK assets/web 只有这三个文件）", got, want)
+	extra := []string{"workbench.html"} // 有意新增，见函数注释
+	allowed := append(append([]string{}, want...), extra...)
+	if strings.Join(got, ",") != strings.Join(allowed, ",") {
+		t.Errorf("web/ 内容为 %v，期望 %v（APK 三件 + 有意新增的 workbench）", got, allowed)
 	}
 
 	// 逐个确认非空且是 HTML 文档。
-	for _, name := range want {
+	for _, name := range allowed {
 		body, err := os.ReadFile(filepath.Join("../../web", name))
 		if err != nil {
 			t.Fatal(err)

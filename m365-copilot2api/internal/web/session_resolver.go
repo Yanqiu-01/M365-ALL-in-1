@@ -21,14 +21,17 @@ import (
 // sessionBinding 璁板綍涓€娆″唴瀹归敭澶嶇敤鐨勪細璇濄€侷dentity 瀛楁锛圛P/user锛変粎浣?
 // 璇婃柇鍏冩暟鎹繚鐣欙紝鍖归厤鍒ゅ畾鍙緷璧栦笂涓嬫枃鍐呭锛岃 Resolve 鐨勫唴瀹归敭閫昏緫銆?
 type sessionBinding struct {
-	SessionID      string    `json:"sessionId"`
-	ConversationID string    `json:"conversationId"`
-	AccountID      string    `json:"accountId"`
-	CreatedAt      time.Time `json:"createdAt"`
-	LastUsedAt     time.Time `json:"lastUsedAt"`
-	IPFingerprint  string    `json:"ipFingerprint,omitempty"`
-	UserField      string    `json:"userField,omitempty"`
-	ContextFinger  string    `json:"contextFinger,omitempty"`
+	SessionID      string `json:"sessionId"`
+	ConversationID string `json:"conversationId"`
+	AccountID      string `json:"accountId"`
+	// TenantKey 是租户隔离键，取自请求的 API key（extractAPIKey 同源逻辑），
+	// 空值视为 "anon"。三级匹配全部按此键过滤，防止跨租户上下文串话。
+	TenantKey     string    `json:"tenant_key,omitempty"`
+	CreatedAt     time.Time `json:"createdAt"`
+	LastUsedAt    time.Time `json:"lastUsedAt"`
+	IPFingerprint string    `json:"ipFingerprint,omitempty"`
+	UserField     string    `json:"userField,omitempty"`
+	ContextFinger string    `json:"contextFinger,omitempty"`
 	// ContextHistory 鎸佷箙鍖栦繚瀛樻渶杩戜竴娆″崗璁殑瀹屾暣娑堟伅锛屼緵閲嶅惎鍚庣户缁仛
 	// 鍐呭鍓嶇紑鍖归厤锛岄伩鍏嶈繘绋嬮噸鍚鑷存墍鏈変細璇濋敭鍏ㄩ儴澶辨晥銆?
 	ContextHistory []oaiMsg `json:"contextHistory,omitempty"`
@@ -49,7 +52,6 @@ type sessionResolver struct {
 	mu          sync.Mutex
 	path        string
 	sessions    map[string]sessionBinding
-	byExplicit  map[string]string // explicitID -> sessionID
 	byUserField map[string]string // userField -> sessionID
 	byIPFinger  map[string]string // ipFingerprint -> sessionID
 	byContext   map[string]string // contextFingerprint -> sessionID
@@ -83,7 +85,6 @@ func openSessionResolver() *sessionResolver {
 	sr := &sessionResolver{
 		path:        path,
 		sessions:    map[string]sessionBinding{},
-		byExplicit:  map[string]string{},
 		byUserField: map[string]string{},
 		byIPFinger:  map[string]string{},
 		byContext:   map[string]string{},
@@ -104,6 +105,11 @@ func (sr *sessionResolver) loadLocked() {
 			for _, s := range list {
 				if now.Sub(s.LastUsedAt) > sr.ttl {
 					continue
+				}
+				// 旧 sessions.json 无 tenant_key：读出为空串，视为 "anon"，
+				// 不崩溃；该会话只会被同属 "anon"（即无 API key）的请求复用。
+				if s.TenantKey == "" {
+					s.TenantKey = "anon"
 				}
 				// contentHashes is json:"-", so a session read back from disk has
 				// no cache and every comparison would fall back to re-running
@@ -325,27 +331,17 @@ func (sr *sessionResolver) Resolve(r *http.Request, body *oaiReq) ResolveResult 
 	defer sr.mu.Unlock()
 	sr.evictLocked()
 
+	// 租户键：取 Authorization Bearer / X-API-Key 前缀，与 server.extractAPIKey
+	// 同源逻辑（同包，本文件实现最小等价函数 requestTenantKey，避免跨文件耦合
+	// 与循环依赖）。空则回退 "anon"。三级匹配均按此键过滤，防跨租户串话。
+	tenantKey := requestTenantKey(r)
+
 	explicitID := r.Header.Get("X-M365-Session-Id")
 
 	// 瀹㈡埛绔樉寮忔寚瀹氱殑浼氳瘽 ID 鏄渶楂樹紭鍏堢殑缁帴璇箟锛氫笉鍙備笌浠讳綍韬唤鍒ゅ畾锛?
 	// 鐢辫皟鐢ㄦ柟涓诲姩鍐冲畾瑕佺户缁摢涓簯绔璇濄€?
 	if explicitID != "" {
-		if sessID, ok := sr.byExplicit[explicitID]; ok {
-			if sess, ok := sr.sessions[sessID]; ok {
-				sess.LastUsedAt = time.Now().UTC()
-				sr.sessions[sessID] = sess
-				sr.persist.markDirty()
-				return ResolveResult{
-					SessionID:      sess.SessionID,
-					ConversationID: sess.ConversationID,
-					AccountID:      sess.AccountID,
-					MatchedBy:      "explicit",
-					IsNew:          false,
-					HistoryLen:     len(sess.ContextHistory),
-				}
-			}
-		}
-		if sess, ok := sr.sessions[explicitID]; ok {
+		if sess, ok := sr.sessions[explicitID]; ok && sess.TenantKey == tenantKey {
 			sess.LastUsedAt = time.Now().UTC()
 			sr.sessions[explicitID] = sess
 			sr.persist.markDirty()
@@ -364,7 +360,7 @@ func (sr *sessionResolver) Resolve(r *http.Request, body *oaiReq) ResolveResult 
 	// 浜戠瀵硅瘽锛屼絾鍙湪鍚屼竴 IP/UA 鎸囩汗涓嬶紝閬垮厤鐭秷鎭湪涓嶅悓鐢ㄦ埛闂翠簰绔?
 	// HistoryLen 杩斿洖璇ュ墠缂€闀垮害锛屼笂灞傛嵁姝ゅ彧鍙戦€?messages[HistoryLen:] 澧為噺銆?
 	ipFinger := clientIPFingerprint(r)
-	if bestID, n := sr.matchContextLocked(ipFinger, body.Messages); bestID != "" {
+	if bestID, n := sr.matchContextLocked(ipFinger, tenantKey, body.Messages); bestID != "" {
 		sess := sr.sessions[bestID]
 		sess.LastUsedAt = time.Now().UTC()
 		sr.sessions[bestID] = sess
@@ -414,6 +410,10 @@ func (sr *sessionResolver) Resolve(r *http.Request, body *oaiReq) ResolveResult 
 		if sess.IPFingerprint != ipFinger {
 			continue
 		}
+		// 租户过滤：相似度兜底只在同租户候选间扫描，跨租户上下文不得互串。
+		if sess.TenantKey != tenantKey {
+			continue
+		}
 		score := contextSimilarityCached(sess.ContextHistory, sess.contextTokens, body.Messages, requestTokens)
 		if score < threshold {
 			continue
@@ -437,10 +437,17 @@ func (sr *sessionResolver) Resolve(r *http.Request, body *oaiReq) ResolveResult 
 		if repeatSuffixLen(sess.ContextHistory, body.Messages, sess.contentHashes, nil) > 0 {
 			return ResolveResult{IsNew: true}
 		}
+		// 相似度是弱证据，不足以作为账号切换依据：不得采纳命中会话的
+		// AccountID，只保留当前请求自身解析得到的账号。仅当本请求未带账号
+		// 时才沿用会话记录里的 AccountID，避免把别人的账号贴到当前用户上。
+		resolvedAccountID := body.AccountID
+		if resolvedAccountID == "" {
+			resolvedAccountID = sess.AccountID
+		}
 		return ResolveResult{
 			SessionID:      sess.SessionID,
 			ConversationID: sess.ConversationID,
-			AccountID:      sess.AccountID,
+			AccountID:      resolvedAccountID,
 			MatchedBy:      fmt.Sprintf("context_similar_%.2f", bestScore),
 			IsNew:          false,
 			HistoryLen:     0,
@@ -453,7 +460,7 @@ func (sr *sessionResolver) Resolve(r *http.Request, body *oaiReq) ResolveResult 
 // matchContextLocked 浠庡叏閮ㄤ細璇濅腑鎵惧埌鍏?contextHistory 涓ユ牸浣滀负娑堟伅鍓嶇紑鐨?
 // 閭ｄ釜浼氳瘽锛涘彧閫夊墠缂€鏈€闀跨殑涓€涓紝閬垮厤鐭墠缂€鍦ㄤ笉鍚屼細璇濋棿浜掓挒銆傝繑鍥?
 // (sessionID, 鍖归厤鍒扮殑娑堟伅鏉℃暟)銆?
-func (sr *sessionResolver) matchContextLocked(ipFinger string, messages []oaiMsg) (string, int) {
+func (sr *sessionResolver) matchContextLocked(ipFinger, tenantKey string, messages []oaiMsg) (string, int) {
 	if len(messages) == 0 {
 		return "", 0
 	}
@@ -469,6 +476,10 @@ func (sr *sessionResolver) matchContextLocked(ipFinger string, messages []oaiMsg
 			continue
 		}
 		if sess.IPFingerprint != ipFinger {
+			continue
+		}
+		// 租户过滤：内容前缀匹配同样只在同租户候选间进行。
+		if sess.TenantKey != tenantKey {
 			continue
 		}
 		n := contextPrefixLenHashed(sess.ContextHistory, sess.contentHashes, messages, msgHashes)
@@ -632,12 +643,36 @@ func computeContentHashes(msgs []oaiMsg) []string {
 // requestContentHashes is the per-request analogue, computed once before the
 // resolver loop so matchContextLocked and contextSimilarity share the work.
 func requestContentHashes(msgs []oaiMsg) []string { return computeContentHashes(msgs) }
+
+// requestTenantKey 提取请求的租户键，与 server.extractAPIKey 同源：
+// 优先 X-API-Key，其次 Authorization Bearer，超过 8 字符取前缀加省略号，
+// 空则回退 "anon"。本文件不能 import server 包（同包），此处实现最小等价
+// 函数以避免跨文件耦合；server.extractAPIKey 仍是用量记账的权威来源。
+func requestTenantKey(r *http.Request) string {
+	key := strings.TrimSpace(r.Header.Get("X-API-Key"))
+	if key != "" {
+		return key
+	}
+	auth := r.Header.Get("Authorization")
+	if strings.HasPrefix(strings.ToLower(auth), "bearer ") {
+		key = strings.TrimSpace(auth[7:])
+	}
+	if len(key) > 8 {
+		return key[:8] + "..."
+	}
+	if key == "" {
+		return "anon"
+	}
+	return key
+}
+
 func (sr *sessionResolver) Bind(sessionID, conversationID, accountID string, body *oaiReq, assistantText string, r *http.Request) {
 	sr.mu.Lock()
 	defer sr.mu.Unlock()
 	sr.evictLocked()
 
 	now := time.Now().UTC()
+	tenantKey := requestTenantKey(r)
 	history := cloneMessages(body.Messages)
 	if strings.TrimSpace(assistantText) != "" {
 		history = append(history, oaiMsg{Role: "assistant", Content: assistantText})
@@ -652,6 +687,7 @@ func (sr *sessionResolver) Bind(sessionID, conversationID, accountID string, bod
 		if sess, ok := sr.sessions[sessionID]; ok {
 			sess.ConversationID = conversationID
 			sess.AccountID = accountID
+			sess.TenantKey = tenantKey
 			sess.LastUsedAt = now
 			sess.UserField = body.User
 			sess.IPFingerprint = clientIPFingerprint(r)
@@ -670,6 +706,7 @@ func (sr *sessionResolver) Bind(sessionID, conversationID, accountID string, bod
 			if sess.ConversationID == conversationID {
 				sess.LastUsedAt = now
 				sess.AccountID = accountID
+				sess.TenantKey = tenantKey
 				sess.UserField = body.User
 				sess.IPFingerprint = clientIPFingerprint(r)
 				sess.ContextFinger = contextFingerprint(history)
@@ -689,6 +726,7 @@ func (sr *sessionResolver) Bind(sessionID, conversationID, accountID string, bod
 		SessionID:      sessionID,
 		ConversationID: conversationID,
 		AccountID:      accountID,
+		TenantKey:      tenantKey,
 		CreatedAt:      now,
 		LastUsedAt:     now,
 		IPFingerprint:  clientIPFingerprint(r),
@@ -743,7 +781,6 @@ func (sr *sessionResolver) DeleteSession(sessionID string) bool {
 		return false
 	}
 	delete(sr.sessions, sessionID)
-	delete(sr.byExplicit, sessionID)
 	if s.UserField != "" {
 		delete(sr.byUserField, s.UserField)
 	}
@@ -794,6 +831,7 @@ func (sr *sessionResolver) SessionsForConversation(conversationID string) []stri
 	sort.Strings(out)
 	return out
 }
+
 // UnbindByConversation drops every session bound to the given conversation.
 // Called after an automatic cleanup deletes the cloud conversation, so the
 // anti-CrossID resolver never reuses a dead conversation.
@@ -806,7 +844,6 @@ func (sr *sessionResolver) UnbindByConversation(conversationID string) int {
 			continue
 		}
 		delete(sr.sessions, sid)
-		delete(sr.byExplicit, sid)
 		if s.UserField != "" {
 			delete(sr.byUserField, s.UserField)
 		}

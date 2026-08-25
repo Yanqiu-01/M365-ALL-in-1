@@ -22,6 +22,15 @@ type responsesRequest struct {
 	PreviousResponseID string           `json:"previous_response_id,omitempty"`
 	Conversation       string           `json:"conversation,omitempty"`
 	NewConversation    bool             `json:"new_conversation,omitempty"`
+	// Codex sends these on every /v1/responses call. They were previously dropped
+	// by the decoder without a trace; capture them so the request is represented
+	// faithfully. ParallelToolCalls has no destination on oaiReq yet, so it stays
+	// readable here only -- forwarding it needs a matching field on oaiReq
+	// (server.go). Store and PromptCacheKey are accepted, not acted on: the
+	// gateway keeps no response store and no prompt cache.
+	ParallelToolCalls *bool  `json:"parallel_tool_calls,omitempty"`
+	Store             *bool  `json:"store,omitempty"`
+	PromptCacheKey    string `json:"prompt_cache_key,omitempty"`
 }
 
 const customExecWorkspaceInstruction = `You are operating through the caller's local OpenCode execution bridge. Never use, request, or mention Microsoft 365/Copilot native tools. The only permitted execution tool is the caller-provided custom exec tool. The executor already starts in the caller-selected project workspace. Use relative paths only; never guess, cd to, or write under /root, /workspace, /tmp, or any other absolute project path. Inspect pwd and ls before changes. Do not create files outside the current working directory. Never claim a file was created, modified, or verified until custom exec returns a successful result. After every execution, use custom exec to verify the result.`
@@ -110,6 +119,47 @@ func (r responsesRequest) openAI() (oaiReq, error) {
 		typ, _ := t["type"].(string)
 		name, _ := t["name"].(string)
 		if hasCustomExec && !(typ == "custom" && name == "exec") {
+			continue
+		}
+		switch typ {
+		case "namespace":
+			// Codex groups related tools (multi_agent_v1, mcp__*) into a namespace
+			// wrapper whose real functions live in its "tools" array. ChatHub only
+			// understands a flat function list, so the children are flattened here;
+			// without this the entire group never reaches the model.
+			// Children are renamed to "<namespace>__<child>" for two reasons: two
+			// namespaces may export the same child name (e.g. two MCP servers both
+			// exposing "search"), and the tool-call callback carries only the flat
+			// name, so the prefix is what lets a call be resolved back to the
+			// namespace that owns it.
+			children, _ := t["tools"].([]any)
+			for _, raw := range children {
+				c, ok := raw.(map[string]any)
+				if !ok {
+					continue
+				}
+				if ctyp, _ := c["type"].(string); ctyp != "function" {
+					continue
+				}
+				cname, _ := c["name"].(string)
+				if cname == "" {
+					continue
+				}
+				if name != "" {
+					cname = name + "__" + cname
+				}
+				cf := map[string]any{"name": cname, "description": c["description"], "parameters": c["parameters"]}
+				cb, _ := json.Marshal(cf)
+				o.Tools = append(o.Tools, chathub.Tool{Type: "function", Function: cb})
+			}
+			continue
+		case "web_search":
+			// Declaration passthrough only. Neither the gateway nor chathub.Request
+			// has any web-search implementation; M365 Copilot grounds from the prompt
+			// itself. Keep the client's declaration intact instead of silently
+			// dropping it, and never synthesise a search tool or fake results.
+			wb, _ := json.Marshal(t)
+			o.Tools = append(o.Tools, chathub.Tool{Type: typ, Function: wb})
 			continue
 		}
 		f := map[string]any{"name": t["name"], "description": t["description"], "parameters": t["parameters"]}

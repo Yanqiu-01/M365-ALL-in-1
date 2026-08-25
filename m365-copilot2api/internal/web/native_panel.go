@@ -804,9 +804,6 @@ func (m *nativePanelManager) state(server *Server) map[string]any {
 			}
 		}
 		sort.Strings(emails)
-		if len(emails) > 200 {
-			emails = emails[:200]
-		}
 		state["gw_online"], state["gw_emails"] = len(accounts), emails
 	}
 	paths, cfg, err := m.workerConfig()
