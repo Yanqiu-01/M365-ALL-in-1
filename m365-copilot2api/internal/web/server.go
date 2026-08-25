@@ -380,7 +380,7 @@ func (s *Server) adminMiddleware(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		if r.URL.Path == "/api/admin/login" || r.URL.Path == "/api/admin/session" || r.URL.Path == "/api/admin/change-password" || r.URL.Path == "/api/admin/logout" || r.URL.Path == "/api/auth/start" || r.URL.Path == "/api/auth/status" || r.URL.Path == "/api/auth/callback" || r.URL.Path == "/api/auth/reset" || r.URL.Path == "/api/live" || r.URL.Path == "/" || r.URL.Path == "/login" {
+		if r.URL.Path == "/api/admin/login" || r.URL.Path == "/api/admin/session" || r.URL.Path == "/api/admin/change-password" || r.URL.Path == "/api/admin/logout" || r.URL.Path == "/api/auth/start" || r.URL.Path == "/api/auth/status" || r.URL.Path == "/api/auth/callback" || r.URL.Path == "/api/auth/reset" || r.URL.Path == "/api/live" || r.URL.Path == "/" || r.URL.Path == "/login" || r.URL.Path == "/workbench" || r.URL.Path == "/favicon.ico" {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -1763,6 +1763,13 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			}
 			calls = limitToolCalls(calls, adaptiveToolCallLimit(calls, configuredToolCallLimit(s.settings)))
 			_ = writeToolResponse(w, "chatcmpl-"+uuid.NewString(), firstNonEmpty(body.Model, "m365-copilot"), true, calls, routeRes)
+			// 工具轮提前返回：本地轻量登记会话（空 ConversationID），不把
+			// 一次性 router 对话写入 sessionResolver。routeRes 的云端对话
+			// 已由上方的 dropTransientConversation 删除。
+			bindRes := routeRes
+			bindRes.ConversationID = ""
+			bindRes.SessionID = ""
+			s.bindConversation(acc, &body, r, bindRes, answerPrompt, startedAt)
 			return
 		}
 	}
@@ -1785,6 +1792,13 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 					}
 					retryCalls = limitToolCalls(retryCalls, adaptiveToolCallLimit(retryCalls, configuredToolCallLimit(s.settings)))
 					_ = writeToolResponse(w, "chatcmpl-"+uuid.NewString(), firstNonEmpty(body.Model, "m365-copilot"), true, retryCalls, retryRes)
+					// 工具轮提前返回：本地轻量登记会话（空 ConversationID），
+					// 不把一次性 router 对话写入 sessionResolver。retryRes
+					// 的云端对话已由上方的 dropTransientConversation 删除。
+					bindRes := retryRes
+					bindRes.ConversationID = ""
+					bindRes.SessionID = ""
+					s.bindConversation(acc, &body, r, bindRes, answerPrompt, startedAt)
 					return
 				}
 			}
@@ -1994,6 +2008,18 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			}
 			calls = limitToolCalls(calls, adaptiveToolCallLimit(calls, configuredToolCallLimit(s.settings)))
 			_ = writeToolResponse(w, "chatcmpl-"+uuid.NewString(), firstNonEmpty(body.Model, "m365-copilot"), body.Stream, calls, routeRes)
+			// 非流式工具轮提前返回：本地轻量登记会话（空 ConversationID），
+			// 不把一次性 router 对话写入 sessionResolver。routeRes 的云端
+			// 对话是 router 合成 prompt 走的一次性对话，这里对称地调用
+			// dropTransientConversation 删除它，避免每个非流式工具轮在云端
+			// 遗留一条一次性对话（流式路径在 :1738-1740 已做同样处理）。
+			if routeRes.ConversationID != "" {
+				s.dropTransientConversation(routeRes.ConversationID)
+			}
+			bindRes := routeRes
+			bindRes.ConversationID = ""
+			bindRes.SessionID = ""
+			s.bindConversation(acc, &body, r, bindRes, prompt, startedAt)
 			return
 		}
 		if len(calls) == 0 && normalizedToolChoiceMode(body.ToolChoice) == "auto" && toolIntentLikely(latestUserIntent(body.Messages, prompt), toolMaps) {
@@ -2017,6 +2043,14 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 					}
 					calls = limitToolCalls(calls, adaptiveToolCallLimit(calls, configuredToolCallLimit(s.settings)))
 					_ = writeToolResponse(w, "chatcmpl-"+uuid.NewString(), firstNonEmpty(body.Model, "m365-copilot"), body.Stream, calls, retryRes)
+					// 非流式 intent-retry 工具轮提前返回：本地轻量登记
+					// 会话（空 ConversationID），不把一次性 router 对话写入
+					// sessionResolver。retryRes 的云端对话已由上方的
+					// dropTransientConversation 删除。
+					bindRes := retryRes
+					bindRes.ConversationID = ""
+					bindRes.SessionID = ""
+					s.bindConversation(acc, &body, r, bindRes, prompt, startedAt)
 					return
 				}
 			}
@@ -2038,6 +2072,18 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 					}
 					calls = limitToolCalls(calls, adaptiveToolCallLimit(calls, configuredToolCallLimit(s.settings)))
 					_ = writeToolResponse(w, "chatcmpl-"+uuid.NewString(), firstNonEmpty(body.Model, "m365-copilot"), body.Stream, calls, retryRes)
+					// 非流式 required-retry 工具轮提前返回：本地轻量登记
+					// 会话（空 ConversationID），不把一次性 router 对话写入
+					// sessionResolver。required-retry 路径上方没有对称的
+					// dropTransientConversation 调用，这里补上，避免云端
+					// 遗留一次性对话。
+					if retryRes.ConversationID != "" {
+						s.dropTransientConversation(retryRes.ConversationID)
+					}
+					bindRes := retryRes
+					bindRes.ConversationID = ""
+					bindRes.SessionID = ""
+					s.bindConversation(acc, &body, r, bindRes, prompt, startedAt)
 					return
 				}
 			}
@@ -2456,22 +2502,40 @@ const sessionHeaderName = "X-M365-Session-Id"
 // bindConversation 在请求完成后登记会话解析器索引与缓存统计，流式与非流式
 // 路径共用。会话为内容键，云端的对话由 auto_cleanup 按 2h 闲置窗口回收，
 // 这里不再做"用完即删"，否则复用永远不可能命中。
+//
+// 工具轮提前返回点也复用本函数登记本地会话。此时上游对话是一次性 router
+// 对话（dropTransientConversation 会删掉它），ConversationID 为空：绑定的
+// 意义不是复用云端对话，而是让下一轮 Resolve 的内容前缀匹配有据可查、并
+// 维持账号粘性与 cacheStats 口径不变。因此空 ConversationID 时仍执行
+// cacheStats / sink 回填，但跳过 sessionResolver.Bind 与 conversationManager
+// 等任何依赖上游会话 ID 的动作 —— 没有上游会话可绑，写进去反而会让显式路径
+// 或 auto_cleanup 误把一次性 router 对话当成长效会话。
 func (s *Server) bindConversation(acc auth.AccountToken, body *oaiReq, r *http.Request, res chathub.Result, prompt string, startedAt time.Time) {
-	if res.ConversationID == "" {
-		return
-	}
+	emptyConversation := res.ConversationID == ""
 	historyBody := *body
 	historyBody.Messages = append(cloneMessages(body.Messages), oaiMsg{
 		Role:             "assistant",
 		Content:          res.Text,
 		ReasoningContent: res.Reasoning,
 	})
-	s.sessionResolver.Bind(res.SessionID, res.ConversationID, acc.ID, &historyBody, "", r)
-	s.conversationManager.Record(res.ConversationID, acc.ID, prompt)
-	if s.conversationManager.ShouldCleanup() {
-		if cleaned := s.conversationManager.Cleanup(); len(cleaned) > 0 {
-			log.Printf("[conversation-manager] auto-cleaned %d conversations", len(cleaned))
+	if !emptyConversation {
+		s.sessionResolver.Bind(res.SessionID, res.ConversationID, acc.ID, &historyBody, "", r)
+		s.conversationManager.Record(res.ConversationID, acc.ID, prompt)
+		if s.conversationManager.ShouldCleanup() {
+			if cleaned := s.conversationManager.Cleanup(); len(cleaned) > 0 {
+				log.Printf("[conversation-manager] auto-cleaned %d conversations", len(cleaned))
+			}
 		}
+	} else {
+		// 轻量登记：工具轮的上游对话是一次性 router 对话（已由
+		// dropTransientConversation 删除），不写入 ConversationID。生成
+		// 独立 UUID 作为 SessionID，绕过 Bind 内 explicitID 覆盖分支
+		// （explicitID 仅在 sessionID=="" 时才覆盖），避免与客户端显式
+		// X-M365-Session-Id 串扰。ContextHistory 含 router 决策文本，
+		// 与下一轮回传的 tool_calls 助手消息不构成严格前缀，不会命中
+		// 内容前缀匹配（那会向空对话只发增量、丢失上下文）；但可参与
+		// 相似度兜底，命中时 HistoryLen=0，回答轮发全量到新对话。
+		s.sessionResolver.Bind(uuid.NewString(), "", acc.ID, &historyBody, "", r)
 	}
 
 	apiKey := extractAPIKey(r)

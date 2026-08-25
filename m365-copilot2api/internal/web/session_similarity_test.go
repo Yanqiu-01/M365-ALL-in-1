@@ -106,7 +106,6 @@ func TestResolveSimilarFallbackFormatAndFingerprint(t *testing.T) {
 	newResolver := func() *sessionResolver {
 		sr := &sessionResolver{
 			sessions:    map[string]sessionBinding{},
-			byExplicit:  map[string]string{},
 			ttl:         2 * time.Hour,
 			contextTTL:  2 * time.Hour,
 			maxSessions: defaultMaxSessions,
@@ -133,6 +132,7 @@ func TestResolveSimilarFallbackFormatAndFingerprint(t *testing.T) {
 		SessionID:      "s1",
 		ConversationID: "c1",
 		AccountID:      "a1",
+		TenantKey:      "anon",
 		IPFingerprint:  clientIPFingerprint(r),
 		ContextHistory: hist,
 		LastUsedAt:     time.Now().UTC(),
@@ -160,6 +160,7 @@ func TestResolveSimilarFallbackFormatAndFingerprint(t *testing.T) {
 	sr2 := newResolver()
 	sr2.sessions["s1"] = sessionBinding{
 		SessionID:      "s1",
+		TenantKey:      "anon",
 		IPFingerprint:  clientIPFingerprint(req("agent/1.0")),
 		ContextHistory: hist,
 		LastUsedAt:     time.Now().UTC(),
@@ -174,6 +175,7 @@ func TestResolveSimilarFallbackFormatAndFingerprint(t *testing.T) {
 	r3 := req("agent/1.0")
 	sr3.sessions["s1"] = sessionBinding{
 		SessionID:      "s1",
+		TenantKey:      "anon",
 		IPFingerprint:  clientIPFingerprint(r3),
 		ContextHistory: hist,
 		LastUsedAt:     time.Now().UTC(),
@@ -198,7 +200,6 @@ func TestResolveSimilarThresholdEnvOverride(t *testing.T) {
 		t.Setenv("M365_CONTEXT_SIMILARITY", env)
 		sr := &sessionResolver{
 			sessions:    map[string]sessionBinding{},
-			byExplicit:  map[string]string{},
 			ttl:         2 * time.Hour,
 			contextTTL:  2 * time.Hour,
 			maxSessions: defaultMaxSessions,
@@ -209,6 +210,7 @@ func TestResolveSimilarThresholdEnvOverride(t *testing.T) {
 		r.Header.Set("User-Agent", "probe/1.0")
 		sr.sessions["s1"] = sessionBinding{
 			SessionID:      "s1",
+			TenantKey:      "anon",
 			IPFingerprint:  clientIPFingerprint(r),
 			ContextHistory: hist,
 			LastUsedAt:     time.Now().UTC(),

@@ -29,8 +29,43 @@ func securityHeaders(next http.Handler) http.Handler {
 //
 // 此前本地多出的 /conversation 分支属虚构：APK 的 assets/web 仅有
 // index.html / login.html / debug.html 三个文件。
+//
+// /workbench 是唯一的例外，且不是复原产物：见下方 case 处的说明。
 func (s *Server) rootPage(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/" && r.URL.Path != "/login" {
+	// /favicon.ico 由用户指定的壁纸（琉璃神社壁纸包 2025年11月号 编号05）生成，
+	// 与 APK 原始行为无关，属有意扩展。Content-Type 必须显式声明，否则浏览器
+	// 不会把响应识别为图标。
+	if r.URL.Path == "/favicon.ico" && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
+		f, err := os.Open("web/favicon.ico")
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		defer f.Close()
+		st, err := f.Stat()
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "image/x-icon")
+		http.ServeContent(w, r, "favicon.ico", st.ModTime(), f)
+		return
+	}
+	var name string
+	switch r.URL.Path {
+	case "/", "/login":
+		// 原 APK 实测 /login 与 / 返回同一份 index.html（逐字节相同，102579
+		// 字节）：登录态由前端 JS 依据 /api/admin/session 切换，没有独立的
+		// 登录页路由。上游那句 name = "login.html" 的分支在二开版里已被删除，
+		// 恢复时误将其带回，导致 /login 只返回 10611 字节的空壳页面。
+		name = "web/index.html"
+	case "/workbench":
+		// 本次按用户明确要求新增的「仅聊天」前端工作台，与 APK 原始行为无关：
+		// APK rodata 只有 "web/index.html"，不存在 workbench.html，原版 GET
+		// /workbench 应为 404。此分支属于有意的功能扩展，不是上文所述那类凭空
+		// 复原出的虚构路由，请勿按「APK 无此路径」为由直接删除。
+		name = "web/workbench.html"
+	default:
 		http.NotFound(w, r)
 		return
 	}
@@ -38,11 +73,6 @@ func (s *Server) rootPage(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusMethodNotAllowed, "invalid_request_error", "method not allowed")
 		return
 	}
-	// 原 APK 实测 /login 与 / 返回同一份 index.html（逐字节相同，102579
-	// 字节）：登录态由前端 JS 依据 /api/admin/session 切换，没有独立的
-	// 登录页路由。上游那句 name = "login.html" 的分支在二开版里已被删除，
-	// 恢复时误将其带回，导致 /login 只返回 10611 字节的空壳页面。
-	name := "web/index.html"
 	f, err := os.Open(name)
 	if err != nil {
 		http.Error(w, "web interface unavailable", http.StatusInternalServerError)

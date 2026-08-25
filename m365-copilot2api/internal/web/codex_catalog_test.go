@@ -230,7 +230,7 @@ func TestModelsAdvertiseContextAndReasoning(t *testing.T) {
 		if _, ok := m["service_tiers"].([]any); !ok {
 			t.Fatalf("missing service tiers: %#v", m)
 		}
-		if m["apply_patch_tool_type"] != "freeform" || m["web_search_tool_type"] != "text_and_image" || m["tool_mode"] != "code_mode_only" || m["multi_agent_version"] != "v2" {
+		if m["apply_patch_tool_type"] != "freeform" || m["web_search_tool_type"] != "text_and_image" || m["tool_mode"] != "code_mode_only" || m["multi_agent_version"] != "v1" {
 			t.Fatalf("missing Codex tool metadata: %#v", m)
 		}
 		if m["max_context_window"] != m["context_window"] || m["effective_context_window_percent"] != float64(95) {

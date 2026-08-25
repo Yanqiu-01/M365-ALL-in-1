@@ -252,8 +252,12 @@ func modelCatalogForSettings(settings runtimeSettings) []map[string]any {
 			"supports_parallel_tool_calls": true, "supports_image_detail_original": true,
 			"max_context_window": l.ContextWindow, "effective_context_window_percent": 95,
 			"experimental_supported_tools": []any{}, "supports_search_tool": true, "use_responses_lite": false,
-			"tool_mode": "code_mode_only", "multi_agent_version": "v2",
-			"context_window": l.ContextWindow, "max_input_tokens": l.MaxInputTokens, "max_output_tokens": l.MaxOutputTokens,
+			"tool_mode": "code_mode_only",
+			// Mirrors the namespace name the client actually declares in tools[]:
+			// multi_agent_v1. Advertising v2 named a namespace no observed client
+			// sends, so the version tracked nothing real.
+			"multi_agent_version": "v1",
+			"context_window":      l.ContextWindow, "max_input_tokens": l.MaxInputTokens, "max_output_tokens": l.MaxOutputTokens,
 			"capabilities": caps, "supports_tools": true, "tool_calls": true,
 			"supported_reasoning_levels": advertisedReasoningEfforts,
 			"function_calling":           true, "supports_function_calling": true, "supports_vision": true,
