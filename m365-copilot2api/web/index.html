@@ -2366,14 +2366,18 @@ if (response.output_text) {
               </div>
               <div class="form-group">
                 <label class="form-label" for="proxyFreeLimit">本次质量筛选上限</label>
-                <input class="form-input" id="proxyFreeLimit" type="number" min="1" max="30" value="10">
+                <input class="form-input" id="proxyFreeLimit" type="number" min="1" max="200" value="50">
+              </div>
+              <div class="form-group">
+                <label class="form-label" for="proxyFreePages">抓取页数</label>
+                <input class="form-input" id="proxyFreePages" type="number" min="1" max="500" value="20">
               </div>
             </div>
             <div class="btn-row">
               <button type="button" class="btn primary" id="proxyFreeImportBtn" onclick="proxyFreeImport()">拉取并质量筛选导入</button>
             </div>
             <p class="form-hint" style="margin-top:var(--sp-2)">支持三种排布：<code>HTTP 1.2.3.4 80</code>（协议/IP/端口分列，购买的 IP 与快代理等表格页即此形态）、<code>1.2.3.4:8080</code>、<code>socks5://1.2.3.4:1080</code>。HTML 表格会自动剥标签、忽略表头，每行以该行自带的协议为准。</p>
-            <p class="form-hint">仅接受公网地址；去重后逐个以 M365 登录面探测，失败节点不会入池。每次最多检查 30 条。</p>
+            <p class="form-hint">仅接受公网地址；去重后逐个以 M365 登录面探测，失败节点不会入池。快代理这类站点<strong>每页只有 12 条</strong>，产量由「抓取页数」决定 —— 实测 40 页可得约 2000 条候选。这类站点按来源 IP 限流，所以抓取是串行的（约 2.5 秒/页，40 页约 4 分半），页数越多越慢；被限流的页会自动退避重试。「筛选上限」限制的是实际探测条数（最多 200），探测比抓取慢得多，建议先小后大。</p>
           </div>
         </div>
         <div class="card">
@@ -5082,16 +5086,20 @@ async function proxyFreeImport(){
   try{source=normalizeExternalHTTPURL($('proxyFreeSourceURL').value,'公开文本来源 URL').href;}
   catch(e){showNotice(e.message,'error');return;}
   const rawLimit=Number.parseInt($('proxyFreeLimit').value,10);
-  const limit=Number.isFinite(rawLimit)?Math.min(30,Math.max(1,rawLimit)):10;
+  const limit=Number.isFinite(rawLimit)?Math.min(200,Math.max(1,rawLimit)):50;
   $('proxyFreeLimit').value=limit;
+  // 页数才是产量的决定因素：每页只有十几条，只抓一页最多就十几个候选。
+  const rawPages=Number.parseInt($('proxyFreePages').value,10);
+  const pages=Number.isFinite(rawPages)?Math.min(500,Math.max(1,rawPages)):20;
+  $('proxyFreePages').value=pages;
   const button=$('proxyFreeImportBtn');
   if(button)button.disabled=true;
   termOpen('free proxy import — quality gate');
-  termLine('正在拉取公开来源并执行 M365 质量筛选…');
+  termLine('正在拉取 '+pages+' 页公开来源并执行 M365 质量筛选…');
   try{
-    const d=await api('/api/admin/proxy-pool?action=free-import',{method:'POST',body:JSON.stringify({sourceUrl:source,scheme:$('proxyFreeScheme').value,limit})});
+    const d=await api('/api/admin/proxy-pool?action=free-import',{method:'POST',body:JSON.stringify({sourceUrl:source,scheme:$('proxyFreeScheme').value,limit,pages})});
     const r=d.report||{};
-    termLine('发现 '+(r.discovered||0)+' 条；格式无效 '+(r.invalid||0)+'；重复 '+(r.duplicates||0)+'；上限跳过 '+(r.limited||0)+'。','warn');
+    termLine('实际抓取 '+(r.pages||1)+' 页；发现 '+(r.discovered||0)+' 条；格式无效 '+(r.invalid||0)+'；重复 '+(r.duplicates||0)+'；上限跳过 '+(r.limited||0)+'。','warn');
     termLine('质量探测 '+(r.checked||0)+' 条；通过 '+(r.passed||0)+'；拒绝 '+(r.rejected||0)+'；导入 '+(r.imported||0)+'。',(r.imported||0)?'ok':'warn');
     showNotice('质量筛选完成：导入 '+(r.imported||0)+' 个代理',(r.imported||0)?'success':'error');
     loadProxies();

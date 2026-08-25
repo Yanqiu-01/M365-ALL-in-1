@@ -44,6 +44,8 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 	r2.Method = http.MethodPost
 	r2.Body = io.NopCloser(bytes.NewReader(b))
 	r2.ContentLength = int64(len(b))
+	// 与 runOpenAIAdapter 同理：内层不记账，避免一次请求两条用量记录。
+	r2.Header.Set(innerAdapterHeader, "1")
 	pr, pw := io.Pipe()
 	// The reader end MUST be closed on every exit path, including the ones that
 	// bypass <-innerDone (client disconnect, scanner error, panic in this
@@ -237,6 +239,20 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 	emit("response.completed", map[string]any{"type": "response.completed", "response": resp})
 }
 
+// innerAdapterHeader 标记「这是一次内部委派」。
+//
+// /v1/messages 与 /v1/responses 都把请求转成 OpenAI 形态后回调 openaiChat，
+// 而 openaiChat 自己会写一条 /v1/chat/completions 用量记录，外层再按真实端点
+// 写一条 —— 于是一次请求在用量表里变成两行（messages 与 chat/completions
+// 各一条，时间戳相同），token 被重复计算，路由归属也看不出来。
+// 带上这个标记后内层不再记账，由外层按真实端点记一次。
+const innerAdapterHeader = "X-M365-Inner-Adapter"
+
+// isInnerAdapterCall 报告当前请求是否由另一个协议处理器内部委派而来。
+func isInnerAdapterCall(r *http.Request) bool {
+	return r != nil && r.Header.Get(innerAdapterHeader) == "1"
+}
+
 func (s *Server) runOpenAIAdapter(r *http.Request, o oaiReq) (map[string]any, []byte, int, error) {
 	o.Stream = false
 	b, _ := json.Marshal(o)
@@ -244,6 +260,7 @@ func (s *Server) runOpenAIAdapter(r *http.Request, o oaiReq) (map[string]any, []
 	r2.Method = http.MethodPost
 	r2.Body = io.NopCloser(bytes.NewReader(b))
 	r2.ContentLength = int64(len(b))
+	r2.Header.Set(innerAdapterHeader, "1")
 	rr := httptest.NewRecorder()
 	s.openaiChat(rr, r2)
 	var out map[string]any
@@ -403,12 +420,24 @@ func (s *Server) anthropicMessages(w http.ResponseWriter, r *http.Request) {
 		writeAnthropicError(w, http.StatusBadGateway, "api_error", "upstream protocol error: "+err.Error())
 		return
 	}
-	estimate := estimateResponsesUsage(firstNonEmpty(body.Model, "m365-copilot"), o.Messages, o.Tools, o.ToolChoice, "")
+	// 输出必须用真实回答来算。之前这里传空字符串，于是 /v1/messages 的
+	// 用量永远是「出 0」—— 面板上看到的 110377入/出0 就是这么来的。
+	answerText := ""
+	if msg, _ := openAIChoice(out); msg != nil {
+		if text, ok := msg["content"].(string); ok {
+			answerText = text
+		}
+		if calls, ok := msg["tool_calls"].([]any); ok && len(calls) > 0 {
+			answerText += mustJSON(calls)
+		}
+	}
+	estimate := estimateResponsesUsage(firstNonEmpty(body.Model, "m365-copilot"), o.Messages, o.Tools, o.ToolChoice, answerText)
 	s.usage.record(UsageRecord{
 		Time:         time.Now(),
 		APIKeyPrefix: extractAPIKey(r),
 		Model:        firstNonEmpty(body.Model, "m365-copilot"),
 		Endpoint:     "/v1/messages",
+		Stream:       body.Stream,
 		InputTokens:  int64(estimate.Values["input_tokens"].(int)),
 		OutputTokens: int64(estimate.Values["output_tokens"].(int)),
 		DurationMs:   time.Since(startedAt).Milliseconds(),

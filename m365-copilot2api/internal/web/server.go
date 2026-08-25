@@ -2448,6 +2448,16 @@ func (s *Server) bindConversation(acc auth.AccountToken, body *oaiReq, r *http.R
 	newTokens := EstimateTokens(prompt)
 	sessions := s.sessionResolver.ListSessions()
 	cacheStats.RecordRequest(apiKey, historyTokens > 0, newTokens, historyTokens, len(sessions))
+	// 内部委派时只跳过用量记账，不跳过上面的 cacheStats：缓存命中是真实发生的，
+	// 而外层 /v1/messages、/v1/responses 不记 cacheStats，在这里跳掉会让缓存
+	// 命中率凭空变低。所以这里不能复用 internalCallHeader —— 那个标记在
+	// cacheStats 之前就 return 了，语义是「整段统计都由调用方负责」。
+	//
+	// 不加这个判断的后果（面板实测）：一次 /v1/messages 请求产生两行用量，
+	// 时间戳相同、端点一个 messages 一个 chat/completions，token 被算两遍。
+	if isInnerAdapterCall(r) {
+		return
+	}
 	s.usage.record(UsageRecord{
 		Time:         time.Now(),
 		APIKeyPrefix: apiKey,

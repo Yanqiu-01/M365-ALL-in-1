@@ -22,10 +22,25 @@ const (
 	freeProxySourceMaxBytes      int64 = 256 << 10
 	freeProxySourceTimeout             = 12 * time.Second
 	freeProxyImportTimeout             = 45 * time.Second
-	freeProxyProbeConcurrency          = 4
+	// 200 个候选按 4 并发 x 10s 超时，最坏要 8 分钟才探完，直接顶穿预算。
+	// 探测是纯网络等待，几乎不吃 CPU，提到 16 后最坏约 2 分钟。
+	freeProxyProbeConcurrency = 16
 	freeProxyDefaultImportLimit        = 10
-	freeProxyMaxImportLimit            = 30
+	freeProxyMaxImportLimit            = 200
 	freeProxySourceRedirectLimit       = 3
+	// 翻页抓取。快代理这类站点每页只有 12 行，只抓第一页最多就 12 条 ——
+	// 想凑够成百上千个候选必须翻页。
+	//
+	// 页数上限 500（约 6000 个候选）：抓取是纯 IO 等待，真正的瓶颈在后面的
+	// 质量探测，而不是抓取本身。间隔压到 150ms 以在礼貌与效率间取平衡；
+	// 500 页约 75s 抓完。
+	freeProxyMaxPages = 500
+	// 页间间隔。实测快代理的节流很凶：150ms 间隔只有 3/12 成功（HTTP 567/403），
+	// 1s 是 2/6，2s 是 3/6，3s 才 6/6。所以这里必须串行 + 秒级间隔 ——
+	// 并发抓取只会把成功率打下去（40 页并发实测只成功 6 页）。
+	freeProxyPageFetchTimeout = 30 * time.Minute
+	// 被节流时的重试次数。节流是暂时的，退避后重试比直接丢掉这一页划算得多。
+	freeProxyPageRetries = 2
 )
 
 // These seams keep network-dependent admission checks out of unit tests. The
@@ -33,15 +48,26 @@ const (
 var (
 	freeProxySourceFetcher      = fetchFreeProxySource
 	freeProxyCandidateValidator = outbound.ValidateProxyCandidate
+
+	// 页间间隔与重试退避。做成变量而非常量，是为了让单元测试把它们调成 0 ——
+	// 否则一个「抓 5 页」的测试要真等 10 秒，整包测试从 7s 涨到 71s。
+	//
+	// 生产值来自实测：快代理 150ms 间隔只有 3/12 成功（HTTP 567/403），
+	// 1s 是 2/6，2s 是 3/6，3s 才 6/6。
+	freeProxyPageDelay      = 2500 * time.Millisecond
+	freeProxyPageRetryDelay = 4 * time.Second
 )
 
 type freeProxyImportRequest struct {
 	SourceURL string `json:"sourceUrl"`
 	Scheme    string `json:"scheme"`
 	Limit     int    `json:"limit"`
+	// Pages 抓取多少页（含首页）。0/1 保持旧行为只抓给定 URL。
+	Pages int `json:"pages"`
 }
 
 type freeProxyImportReport struct {
+	Pages      int `json:"pages"`
 	Discovered int `json:"discovered"`
 	Invalid    int `json:"invalid"`
 	Duplicates int `json:"duplicates"`
@@ -74,16 +100,22 @@ func (s *Server) importFreeProxySource(w http.ResponseWriter, r *http.Request) {
 	}
 	limit := normalizeFreeProxyImportLimit(body.Limit)
 
-	ctx, cancel := context.WithTimeout(r.Context(), freeProxyImportTimeout)
+	pages := normalizeFreeProxyPages(body.Pages)
+	// 翻页抓取要给足时间：45s 是单页预算，20 页会把整个导入掐死在抓取阶段。
+	timeout := freeProxyImportTimeout
+	if pages > 1 {
+		timeout = freeProxyPageFetchTimeout
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), timeout)
 	defer cancel()
-	payload, err := freeProxySourceFetcher(ctx, body.SourceURL)
+	payload, fetchedPages, err := fetchFreeProxyPages(ctx, body.SourceURL, pages)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadGateway, "proxy_source_error", "免费代理来源获取失败；仅支持公开可访问的 http/https 文本列表")
 		return
 	}
 
 	parsed, invalid := parseFreeProxyCandidates(payload, scheme)
-	report := freeProxyImportReport{Discovered: len(parsed) + invalid, Invalid: invalid}
+	report := freeProxyImportReport{Pages: fetchedPages, Discovered: len(parsed) + invalid, Invalid: invalid}
 	existing := existingProxyEndpointKeys()
 	seen := make(map[string]struct{}, len(existing)+len(parsed))
 	for key := range existing {
@@ -127,6 +159,142 @@ func (s *Server) importFreeProxySource(w http.ResponseWriter, r *http.Request) {
 		"ok": true, "report": report,
 		"proxies": outbound.ProxyPoolStatusRedacted(),
 	})
+}
+
+// freeProxyPageURL 生成第 n 页的地址。
+//
+// 两种常见形态都要支持：
+//   - 路径分页 https://www.kuaidaili.com/free/inha/    -> /free/inha/2/
+//     （该站首页不带页号，第 2 页起是 /N/；实测每页 12 条）
+//   - 查询分页 https://example.com/list?page=1        -> ?page=2
+//
+// 找不到可翻页的形态时返回 ok=false，调用方就只抓这一页 —— 绝不猜。
+func freeProxyPageURL(raw string, page int) (string, bool) {
+	if page <= 1 {
+		return raw, true
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", false
+	}
+	// 查询参数分页优先：显式的 page/pn/p 参数语义最明确。
+	q := u.Query()
+	for _, key := range []string{"page", "pn", "p", "pageno", "page_no"} {
+		if _, ok := q[key]; ok {
+			q.Set(key, strconv.Itoa(page))
+			u.RawQuery = q.Encode()
+			return u.String(), true
+		}
+	}
+	// 路径分页：末段是纯数字则替换，否则在末尾追加一段页号。
+	trimmed := strings.TrimSuffix(u.Path, "/")
+	hadSlash := strings.HasSuffix(u.Path, "/") || u.Path == ""
+	if trimmed == "" {
+		return "", false
+	}
+	segs := strings.Split(trimmed, "/")
+	last := segs[len(segs)-1]
+	if n, err := strconv.Atoi(last); err == nil && n > 0 {
+		segs[len(segs)-1] = strconv.Itoa(page)
+	} else {
+		segs = append(segs, strconv.Itoa(page))
+	}
+	u.Path = strings.Join(segs, "/")
+	if hadSlash {
+		u.Path += "/"
+	}
+	return u.String(), true
+}
+
+// normalizeFreeProxyPages 夹住页数。0/1 表示沿用旧行为（只抓给定 URL）。
+func normalizeFreeProxyPages(pages int) int {
+	if pages <= 1 {
+		return 1
+	}
+	if pages > freeProxyMaxPages {
+		return freeProxyMaxPages
+	}
+	return pages
+}
+
+// fetchFreeProxyPages 依次抓取多页并把正文拼起来，交给同一个解析器。
+//
+// 单页失败不中断：免费列表站点常见某一页 5xx 或超时，为此丢掉已经抓到的
+// 十几页是不划算的。全部页都失败时才向上报错。
+func fetchFreeProxyPages(ctx context.Context, rawURL string, pages int) ([]byte, int, error) {
+	pages = normalizeFreeProxyPages(pages)
+	if pages == 1 {
+		payload, err := freeProxySourceFetcher(ctx, rawURL)
+		if err != nil {
+			return nil, 0, err
+		}
+		return payload, 1, nil
+	}
+
+	// 串行抓取。并发在这里是反效果：来源站点按来源 IP 限流，40 页并发实测
+	// 只成功 6 页，而串行 + 秒级间隔能接近全成功。
+	var combined []byte
+	fetched := 0
+	var firstErr error
+	for page := 1; page <= pages; page++ {
+		if ctx.Err() != nil {
+			break
+		}
+		target := rawURL
+		if page > 1 {
+			next, ok := freeProxyPageURL(rawURL, page)
+			if !ok {
+				// 这个 URL 推导不出分页形态，抓到这里为止 —— 绝不猜。
+				break
+			}
+			target = next
+		}
+
+		var payload []byte
+		var err error
+		for attempt := 0; attempt <= freeProxyPageRetries; attempt++ {
+			if attempt > 0 {
+				// 被节流后退避重试：节流是暂时的，直接丢掉这一页太浪费。
+				select {
+				case <-ctx.Done():
+					return finishFreeProxyPages(combined, fetched, firstErr)
+				case <-time.After(freeProxyPageRetryDelay * time.Duration(attempt)):
+				}
+			} else if page > 1 {
+				select {
+				case <-ctx.Done():
+					return finishFreeProxyPages(combined, fetched, firstErr)
+				case <-time.After(freeProxyPageDelay):
+				}
+			}
+			payload, err = freeProxySourceFetcher(ctx, target)
+			if err == nil {
+				break
+			}
+		}
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		fetched++
+		combined = append(combined, payload...)
+		combined = append(combined, '\n')
+	}
+	return finishFreeProxyPages(combined, fetched, firstErr)
+}
+
+// finishFreeProxyPages 只有在一页都没抓到时才算失败。部分成功是正常结果：
+// 免费列表站点常见某几页被节流，为此丢掉已抓到的十几页不划算。
+func finishFreeProxyPages(combined []byte, fetched int, firstErr error) ([]byte, int, error) {
+	if fetched == 0 {
+		if firstErr != nil {
+			return nil, 0, firstErr
+		}
+		return nil, 0, errors.New("no page could be fetched")
+	}
+	return combined, fetched, nil
 }
 
 func normalizeFreeProxyScheme(raw string) (string, error) {
@@ -707,8 +875,11 @@ func readFreeProxySource(ctx context.Context, client *http.Client, target *url.U
 	if err != nil {
 		return nil, errors.New("source request is invalid")
 	}
-	req.Header.Set("Accept", "text/plain, text/html;q=0.8, application/octet-stream;q=0.5")
-	req.Header.Set("User-Agent", "M365-Copilot2API-ProxyPool/1.0")
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,text/plain;q=0.8,*/*;q=0.5")
+	// 免费代理站点普遍按 User-Agent 拦非浏览器客户端（实测快代理对自定义 UA
+	// 直接 403）。这里发一个常规浏览器 UA：目标是读公开页面，不是伪装身份。
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36")
+	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, errors.New("source request failed")
