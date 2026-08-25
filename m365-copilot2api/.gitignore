@@ -1,0 +1,44 @@
+# 签名密钥库与任何私钥：绝不入库。
+# 密钥库保存在仓库外，构建时通过 KS 环境变量指定路径。
+build/android/keys/
+*.jks
+*.keystore
+*.p12
+*.pfx
+*.pem
+*.key
+
+# 构建产物
+*.apk
+*.idsig
+*.so
+/out/
+# 注意：/build/ 是受版本控制的构建脚本目录（build/pc、build/android），
+# 不能整目录忽略；忽略的只是构建输出。
+/.build-out/
+/build/out*/
+
+# 本地环境
+.env
+.env.*
+*.local
+
+# 编辑器与系统
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Go
+/vendor/
+*.test
+*.out
+
+# Local runtime state and build artifacts
+.codebase-memory/
+debug-logs.jsonl
+sessions.json
+conversations.json
+server.exe
+*.log
+*.err

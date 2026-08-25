@@ -1,0 +1,96 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>M365 Copilot2API · 调试日志</title><meta name="color-scheme" content="light dark"><style>:root{color-scheme:light dark;
+  /* 排版比例尺：变量名与基准值与 index.html 保持一致，全部乘 --fs-scale，
+     便于整页缩放。11 / 12 / 13 / 15 / 16 / 19 / 23 / 29 / 35 */
+  --fs-scale:1;
+  --fs-micro:calc(11px * var(--fs-scale));
+  --fs-caption:calc(12px * var(--fs-scale));
+  --fs-sm:calc(13px * var(--fs-scale));
+  --fs-base:calc(15px * var(--fs-scale));
+  --fs-md:calc(16px * var(--fs-scale));
+  --fs-lg:calc(19px * var(--fs-scale));
+  --fs-xl:calc(23px * var(--fs-scale));
+  --fs-2xl:calc(29px * var(--fs-scale));
+  --fs-3xl:calc(35px * var(--fs-scale));
+  /* 字重：正文 600，标题 700-800 */
+  --fw-normal:600;--fw-medium:600;--fw-semi:700;--fw-bold:800;
+  --bg:#f5f5f7;--surface:rgba(255,255,255,0.72);--surface-border:rgba(255,255,255,0.5);--line:rgba(0,0,0,0.06);--text:#1d1d1f;--muted:#86868b;--accent:#0071e3;--green:#34c759;--orange:#ff9f0a;--radius:12px;--radius-sm:8px;--shadow:0 8px 32px rgba(0,0,0,0.06);--ease-out:cubic-bezier(0.23,1,0.32,1);--font-sans:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei","PingFang SC","Hiragino Sans GB","Noto Sans SC","Source Han Sans SC",system-ui,"Helvetica Neue",Arial,sans-serif;--font-mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;--focus-color:#0062c4;--red:#c9231a}@media(prefers-color-scheme:dark){:root{--bg:#1c1c1e;--surface:rgba(44,44,46,0.75);--surface-border:rgba(255,255,255,0.06);--line:rgba(255,255,255,0.06);--text:#f5f5f7;--muted:#98989d;--accent:#0a84ff;--shadow:0 8px 32px rgba(0,0,0,0.25);--focus-color:#5aabff}}body{font-family:var(--font-sans);font-size:var(--fs-md);font-weight:var(--fw-normal);line-height:1.55;margin:0;background:var(--bg);color:var(--text);-webkit-font-smoothing:antialiased;transition:background .3s ease,color .3s ease}main{max-width:1200px;margin:30px auto;padding:0 20px;animation:fadeIn .4s var(--ease-out)}@keyframes fadeIn{from{opacity:0;transform:translateY(6px)}}h1{font-size:var(--fs-2xl);font-weight:var(--fw-bold);letter-spacing:-0.02em;line-height:1.25}.stats{display:flex;gap:12px;flex-wrap:wrap}.card{background:var(--surface);-webkit-backdrop-filter:blur(40px) saturate(180%);backdrop-filter:blur(40px) saturate(180%);border:1px solid var(--surface-border);border-radius:var(--radius);padding:16px;min-width:150px;flex:1;box-shadow:var(--shadow);transition:transform .2s var(--ease-out),box-shadow .2s ease}.card:hover{transform:translateY(-2px);box-shadow:0 12px 40px rgba(0,0,0,0.08)}@media(prefers-color-scheme:dark){.card:hover{box-shadow:0 12px 40px rgba(0,0,0,0.3)}}.value{font-size:var(--fs-2xl);font-weight:var(--fw-bold);letter-spacing:-0.02em;display:block;margin-top:4px}table{width:100%;border-collapse:collapse;margin-top:20px;background:var(--surface);-webkit-backdrop-filter:blur(40px) saturate(180%);backdrop-filter:blur(40px) saturate(180%);border:1px solid var(--surface-border);border-radius:var(--radius);overflow:hidden;box-shadow:var(--shadow)}th,td{padding:10px 14px;border-bottom:1px solid var(--line);text-align:left;font-size:var(--fs-base)}th{color:var(--muted);font-weight:var(--fw-semi);font-size:var(--fs-caption);text-transform:uppercase;letter-spacing:0.05em}tr:hover td{background:rgba(0,113,227,0.03)}@media(prefers-color-scheme:dark){tr:hover td{background:rgba(10,132,255,0.04)}}tr:last-child td{border-bottom:0}.ok{color:var(--green)}.hit{color:var(--orange)}.muted{color:var(--muted)}pre{padding:16px;background:var(--surface);-webkit-backdrop-filter:blur(40px) saturate(180%);backdrop-filter:blur(40px) saturate(180%);border:1px solid var(--surface-border);border-radius:var(--radius-sm);white-space:pre-wrap;overflow:auto;max-height:520px;font-size:var(--fs-base);line-height:1.6;font-family:var(--font-mono);box-shadow:var(--shadow)}.hidden{display:none}.back{margin:15px 0;border:1px solid var(--line);background:var(--surface);-webkit-backdrop-filter:blur(10px);backdrop-filter:blur(10px);color:var(--text);border-radius:var(--radius-sm);padding:6px 14px;cursor:pointer;font:inherit;font-size:var(--fs-base);font-weight:var(--fw-semi);font-family:inherit;transition:background .15s ease,border-color .15s ease,transform .15s var(--ease-out);min-height:32px}.back:hover{background:var(--bg)}.back:active{transform:scale(0.97)}@media(max-width:600px){.stats{flex-direction:column}main{margin:15px auto;padding:0 12px}th,td{padding:8px 10px;font-size:var(--fs-sm)}}.ico{width:1em;height:1em;flex-shrink:0;display:inline-block;vertical-align:-0.15em;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}td{font-variant-numeric:tabular-nums}tbody tr:nth-child(even) td{background:rgba(0,0,0,0.015)}@media(prefers-color-scheme:dark){tbody tr:nth-child(even) td{background:rgba(255,255,255,0.02)}}tbody tr{cursor:pointer}td code{font-family:var(--font-mono);font-size:var(--fs-sm)}:focus{outline:none}:focus-visible{outline:2px solid var(--focus-color);outline-offset:2px}.back{display:inline-flex;align-items:center;gap:6px}.detail-h3{font-size:var(--fs-md);font-weight:var(--fw-semi);margin:16px 0 8px}.empty{text-align:center;padding:40px}tbody tr:focus-visible{outline:2px solid var(--focus-color);outline-offset:-2px}@media(prefers-reduced-motion:reduce){*,*::before,*::after{transition-duration:.01ms!important;animation-duration:.01ms!important}}</style>
+<script>
+/* 尽早应用已保存的字号缩放，避免首屏先渲染默认字号再跳变。
+   localStorage 键 m365.fsScale 与主界面 index.html 共用。 */
+(function(){try{var v=parseFloat(localStorage.getItem('m365.fsScale'));if(v>=0.9&&v<=1.5)document.documentElement.style.setProperty('--fs-scale',String(v))}catch(e){}})();
+</script>
+</head><body><main><h1>调试日志</h1><p class="muted">记录客户端请求、上游摘要与网关最终响应。token 为估算值。</p><section class="stats"><div class="card">请求数<span id="n" class="value">—</span></div><div class="card">输入 token<span id="in" class="value">—</span></div><div class="card">输出 token<span id="out" class="value">—</span></div><div class="card">缓存命中<span id="hit" class="value">—</span></div></section><section id="list"><table><thead><tr><th>时间</th><th>路径</th><th>状态</th><th>耗时</th><th>输入</th><th>输出</th><th>缓存</th><th>ID</th></tr></thead><tbody id="rows"></tbody></table></section><section id="detail" class="hidden"><button class="back" onclick="showList()"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="m12 19-7-7 7-7"/> <path d="M19 12H5"/></svg> 返回列表</button><h2 id="title"></h2><h3 class="detail-h3">客户端发送的信息</h3><pre id="client"></pre><h3 class="detail-h3">上游返回的信息</h3><pre id="upstream"></pre><h3 class="detail-h3">网关处理后的信息</h3><pre id="gateway"></pre></section></main><script>
+const $=x=>document.getElementById(x);
+let data=[];
+// 全部走 createElement + textContent，不再用 HTML 字符串拼接接口返回的内容。
+function cell(text,cls){
+  const td=document.createElement('td');
+  td.textContent=text==null?'':String(text);
+  if(cls)td.className=cls;
+  return td;
+}
+function codeCell(text,cls){
+  const td=document.createElement('td');
+  const code=document.createElement('code');
+  code.textContent=text==null?'':String(text);
+  if(cls)td.className=cls;
+  td.appendChild(code);
+  return td;
+}
+function placeholderRow(text){
+  const tr=document.createElement('tr');
+  const td=cell(text,'muted empty');
+  td.colSpan=8;
+  tr.appendChild(td);
+  return tr;
+}
+function renderRows(){
+  const body=$('rows');
+  body.replaceChildren();
+  if(!data.length){body.appendChild(placeholderRow('暂无记录'));return}
+  data.forEach((x,i)=>{
+    const tr=document.createElement('tr');
+    tr.tabIndex=0;
+    tr.appendChild(cell(x.at,'muted'));
+    tr.appendChild(codeCell(x.method+' '+x.path));
+    tr.appendChild(cell(x.status));
+    tr.appendChild(cell(x.durationMs+'ms'));
+    tr.appendChild(cell(x.inputTokens));
+    tr.appendChild(cell(x.outputTokens));
+    tr.appendChild(cell(x.cacheHit?'命中':'—',x.cacheHit?'hit':'muted'));
+    tr.appendChild(codeCell(x.id,'muted'));
+    tr.addEventListener('click',()=>showDetail(i));
+    tr.addEventListener('keydown',e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();showDetail(i)}});
+    body.appendChild(tr);
+  });
+}
+async function load(){
+  try{
+    const r=await fetch('/api/admin/debug/logs');
+    const d=await r.json();
+    data=d.records||[];
+  }catch(e){
+    data=[];
+    $('n').textContent='—';$('in').textContent='—';$('out').textContent='—';$('hit').textContent='—';
+    $('rows').replaceChildren(placeholderRow('加载失败，请确认已登录管理后台'));
+    return;
+  }
+  $('n').textContent=data.length;
+  $('in').textContent=data.reduce((a,x)=>a+x.inputTokens,0);
+  $('out').textContent=data.reduce((a,x)=>a+x.outputTokens,0);
+  $('hit').textContent=data.filter(x=>x.cacheHit).length;
+  renderRows();
+}
+function showDetail(i){
+  const x=data[i];
+  if(!x)return;
+  $('list').classList.add('hidden');
+  $('detail').classList.remove('hidden');
+  $('title').textContent=x.method+' '+x.path;
+  $('client').textContent=x.clientPayload||'(无)';
+  $('upstream').textContent=x.upstreamPayload||'(无)';
+  $('gateway').textContent=x.gatewayPayload||'(无)';
+}
+function showList(){$('detail').classList.add('hidden');$('list').classList.remove('hidden')}
+load();
+</script></body></html>
