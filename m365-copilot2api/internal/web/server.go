@@ -1924,8 +1924,22 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				calls, parsed = parseModelToolDecision(repairRes.Text, toolMaps, body.ToolChoice)
 			}
 			if !parsed {
-				http.Error(w, "model returned an invalid tool routing decision", http.StatusBadGateway)
-				return
+				// 路由器没能给出可解析的决策，这不等于请求失败。
+				// 绝大多数情况是模型直接用自然语言回答了问题（"I will read
+				// the file for you." / "抱歉，我无法……"），此时唯一正确的动作
+				// 是当作「本轮不调用工具」继续走下面的回答链路。
+				//
+				// 之前这里直接 502，导致 Claude CLI 侧看到
+				// "model returned an invalid tool routing decision"：
+				// 一次散文回复就把整条对话打死。仅当客户端明确要求必须调用
+				// 工具时，无法给出决策才是真正的失败。
+				if toolChoiceRequiresToolCall(body.ToolChoice) {
+					log.Printf("[req-trace] id=%s stage=router_undecidable choice=required", requestID)
+					writeOpenAIError(w, http.StatusBadGateway, "router_error", "model did not return a parsable tool decision while tool_choice required a call")
+					return
+				}
+				log.Printf("[req-trace] id=%s stage=router_undecidable fallback=answer text_len=%d", requestID, len(routeRes.Text))
+				calls, parsed = nil, true
 			}
 		}
 		calls = filterCompletedCalls(calls, ledger)
@@ -1984,8 +1998,10 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 					return
 				}
 			}
-			http.Error(w, "model did not select a required tool after constrained retry", http.StatusBadGateway)
-			return
+			// 强制模式下重试仍未选出工具：过去直接 502。但此时模型通常已经
+			// 给出了可用的文字答案，直接失败会把整轮对话丢掉。降级为普通回答，
+			// 让客户端自行决定是否重试，比返回 502 更接近 OpenAI 的语义。
+			log.Printf("[req-trace] id=%s stage=router_required_exhausted fallback=answer", requestID)
 		}
 	}
 	answerReq := buildAnswerRequest(answerPrompt, tone, body, ledger, planningMode)
