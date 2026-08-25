@@ -2348,6 +2348,21 @@ if (response.output_text) {
           <div class="card-body">
             <label class="form-label" for="proxyInput">代理地址（一行一个，支持批量粘贴）</label>
             <textarea class="form-input" id="proxyInput" rows="4" placeholder="http://user:pass@host:port&#10;socks5://127.0.0.1:1080&#10;https://proxy.example.com:443"></textarea>
+            <div class="form-row" style="margin-top:var(--sp-3)">
+              <div class="form-group">
+                <label class="form-label" for="proxyAddScheme">兜底协议（仅用于没写前缀的行）</label>
+                <select class="form-input" id="proxyAddScheme">
+                  <option value="http">HTTP</option>
+                  <option value="https">HTTPS</option>
+                  <option value="socks5">SOCKS5</option>
+                </select>
+              </div>
+              <div class="form-group" style="display:flex;align-items:flex-end">
+                <label class="form-hint" style="display:flex;align-items:center;gap:6px">
+                  <input type="checkbox" id="proxyAddSkipCheck"> 跳过入池校验
+                </label>
+              </div>
+            </div>
             <div class="btn-row" style="margin-top:var(--sp-3)">
               <button type="button" class="btn primary" onclick="proxyAdd()"><svg class="ico ico-sm" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M5 12h14"/> <path d="M12 5v14"/></svg> 添加</button>
             </div>
@@ -4919,7 +4934,7 @@ function proxyRow(x){
     <td class="num t-time">${x.failures||0}</td>
     <td class="t-time">${x.cooldownUntil?esc(fmtTime(x.cooldownUntil)):'-'}</td>
     <td class="actions">
-      <button class="btn btn-sm" onclick="proxyCheckOne('${escAttr(x.url)}')" aria-label="检查代理 ${esc(x.url)}">检查</button>
+      <button class="btn btn-sm" onclick="proxyCheckOne('${escAttr(x.url)}','${escAttr(id)}')" aria-label="检查代理 ${esc(x.url)}">检查</button>
       <button class="btn btn-sm danger" onclick="proxyRemove('${escAttr(id)}','${escAttr(x.url)}')" ${id?'':'disabled'} aria-label="删除代理 ${esc(x.url)}">删除</button>
     </td>
   </tr>`;
@@ -5040,7 +5055,10 @@ async function proxyAdd(){
   const raw=$('proxyInput').value.trim();
   if(!raw)return showNotice('请输入代理地址','error');
   try{
-    const d=await api('/api/admin/proxy-pool',{method:'POST',body:JSON.stringify({urls:[raw]})});
+    // 兜底协议只作用于没写 scheme:// 的行；带前缀的行以自己的前缀为准。
+    const scheme=$('proxyAddScheme')?.value||'http';
+    const skipCheck=$('proxyAddSkipCheck')?.checked||false;
+    const d=await api('/api/admin/proxy-pool',{method:'POST',body:JSON.stringify({urls:[raw],scheme,skipCheck})});
     // 部分成功现在是正常结果：坏节点被单独列出，好节点照常入池。
     const bad=d.rejected||[];
     let msg='已添加 '+(d.added||0)+' 个代理';
@@ -5052,6 +5070,8 @@ async function proxyAdd(){
     }
     showNotice(msg,bad.length?'warn':'success');
     if(d.added)$('proxyInput').value='';
+    // 后端为了让新出口立刻有状态，可能只回传新加的那几条；这里统一重新拉
+    // 全量，保证列表完整。
     loadProxies();
   }catch(e){showNotice(e.message,'error');}
 }
@@ -5106,14 +5126,29 @@ async function proxyFreeImport(){
   }catch(e){termLine('拉取失败：'+e.message,'err');showNotice(e.message,'error');}
   finally{if(button)button.disabled=false;}
 }
-async function proxyCheckOne(url){
+async function proxyCheckOne(url,id){
   try{
-    const d=await api('/api/admin/proxy-pool?action=check',{method:'PUT',body:JSON.stringify({url})});
-    const rec=(d.proxies||[]).find(x=>x.url===url);
+    // 只探测这一个出口。过去这里走全量检查，点一个出口会把整池重新探一遍，
+    // 30s 预算被老出口占满，反而看不到自己想看的那个。
+    const q=id?('&ids='+encodeURIComponent(id)):'';
+    const d=await api('/api/admin/proxy-pool?action=check'+q,{method:'PUT',body:JSON.stringify({url})});
+    const returned=d.proxies||[];
+    const rec=returned.find(x=>(id&&x.id===id))||returned.find(x=>x.url===url);
     if(rec&&rec.health==='reachable')showNotice('连通正常：'+rec.latencyMs+' ms','success');
     else showNotice(rec&&rec.lastError?rec.lastError:'连通失败','error');
-    loadProxies();
+    // 定向检查只返回被探的那几条，按 id 合并进现有行；整表替换会让其它出口
+    // 从列表里消失。
+    if(id&&returned.length&&proxyAllRows.length)mergeProxyRows(returned);
+    else loadProxies();
   }catch(e){showNotice(e.message,'error');}
+}
+// mergeProxyRows 用部分结果就地更新对应行，其余行保持不变。
+function mergeProxyRows(partial){
+  const byId=new Map(partial.filter(x=>x&&x.id).map(x=>[x.id,x]));
+  if(!byId.size){loadProxies();return;}
+  proxyAllRows=proxyAllRows.map(row=>byId.get(row.id)||row);
+  proxyAllRows=proxySortByTier(proxyAllRows);
+  renderProxyPage();
 }
 async function proxyCheckAll(){
   termOpen('proxy check — m365-copilot2api');
