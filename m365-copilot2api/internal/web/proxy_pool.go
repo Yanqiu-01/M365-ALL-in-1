@@ -3,6 +3,7 @@ package web
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"m365-copilot2api/internal/outbound"
 	"net/http"
 	"strings"
@@ -110,26 +111,49 @@ func (s *Server) addManualProxies(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, 400, "invalid_request_error", "proxy address is required")
 		return
 	}
+	// 逐条判定，互不牵连。此前任何一条校验失败就 return，导致粘贴 10 个节点、
+	// 只有 1 个不通，整批 10 个全部被拒 —— 用户看到的就是「添加 IP 时一个节点
+	// 不过，整条都被拒绝」。准入门槛本身要保留（一批死出口曾把 502 率从 0.1%
+	// 抬到 63.8%），但它应该只筛掉坏的那几个。
+	accepted := make([]string, 0, len(candidates))
+	rejected := make([]map[string]any, 0)
 	for _, candidate := range candidates {
-		// Admission gate. A batch of dead exits once took the 502 rate from
-		// 0.1% to 63.8% precisely because AddProxy only parsed the URL.
-		if !body.SkipCheck {
-			ctx, cancel := context.WithTimeout(r.Context(), proxyAdmissionTimeout)
-			err := outbound.ValidateProxyCandidate(ctx, candidate)
-			cancel()
-			if err != nil {
-				writeOpenAIError(w, 400, "invalid_request_error", err.Error()+"（确认该出口可用可在请求体加 "+`"skipCheck":true`+" 跳过校验）")
-				return
-			}
+		if body.SkipCheck {
+			accepted = append(accepted, candidate)
+			continue
 		}
+		ctx, cancel := context.WithTimeout(r.Context(), proxyAdmissionTimeout)
+		err := freeProxyCandidateValidator(ctx, candidate)
+		cancel()
+		if err != nil {
+			// 出口地址本身可能带凭据，回给浏览器的只用脱敏后的 host:port。
+			rejected = append(rejected, map[string]any{
+				"proxy":  outbound.RedactProxyURL(candidate),
+				"reason": err.Error(),
+			})
+			continue
+		}
+		accepted = append(accepted, candidate)
 	}
 
-	added, err := s.appendProxyPool(candidates)
+	// 全军覆没时仍然报 400：这时用户的输入确实没有一个可用，静默返回 200
+	// 会让人以为添加成功了。
+	if len(accepted) == 0 {
+		writeOpenAIError(w, 400, "invalid_request_error",
+			fmt.Sprintf("%d 个出口全部未通过校验；确认出口可用可在请求体加 %s 跳过校验", len(rejected), `"skipCheck":true`))
+		return
+	}
+
+	added, err := s.appendProxyPool(accepted)
 	if err != nil {
 		writeOpenAIError(w, 500, "storage_error", err.Error())
 		return
 	}
-	jsonOut(w, map[string]any{"ok": true, "added": added, "proxies": outbound.ProxyPoolStatusRedacted()})
+	jsonOut(w, map[string]any{
+		"ok": true, "added": added,
+		"accepted": len(accepted), "rejected": rejected,
+		"proxies": outbound.ProxyPoolStatusRedacted(),
+	})
 }
 
 func splitProxyInput(inputs []string) []string {

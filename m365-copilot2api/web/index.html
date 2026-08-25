@@ -2341,7 +2341,6 @@ if (response.output_text) {
           </div>
           <div class="page-head-actions">
             <button type="button" class="btn" id="proxyReassignBtn" onclick="proxyHotReassign()"><svg class="ico ico-sm" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/> <path d="M3 3v5h5"/></svg> 热重新分配账号与节点</button>
-            <button type="button" class="btn" onclick="proxyCheckAll()"><svg class="ico ico-sm" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M22 12h-2.48a2 2 0 0 0-1.93 1.46l-2.35 8.36a.25.25 0 0 1-.48 0L9.24 2.18a.25.25 0 0 0-.48 0l-2.35 8.36A2 2 0 0 1 4.49 12H2"/></svg> 全部健康检查</button>
           </div>
         </div>
         <div class="card">
@@ -2378,13 +2377,25 @@ if (response.output_text) {
           </div>
         </div>
         <div class="card">
-          <div class="card-head"><h3 class="card-title">代理列表</h3><div class="btn-row"><span class="form-hint" id="proxySelectedCount">未选择</span><button type="button" class="btn danger" id="proxyDeleteSelectedBtn" onclick="proxyDeleteSelected()" disabled>删除选中</button></div></div>
+          <div class="card-head"><h3 class="card-title">代理列表</h3><div class="btn-row"><span class="form-hint" id="proxySelectedCount">未选择</span><button type="button" class="btn" id="proxyCheckAllBtn" onclick="proxyCheckAll()">检查全部</button><button type="button" class="btn danger" id="proxyDeleteSelectedBtn" onclick="proxyDeleteSelected()" disabled>删除选中</button></div></div>
           <div class="table-wrap">
             <table class="table compact">
               <caption class="sr-only">代理池列表与健康状态</caption>
               <thead><tr><th scope="col"><input id="proxySelectAll" type="checkbox" onchange="proxyToggleAll(this.checked)" aria-label="选择全部代理"></th><th scope="col">地址</th><th scope="col">状态</th><th scope="col" class="num">延迟</th><th scope="col" class="num">失败次数</th><th scope="col">冷却至</th><th scope="col" class="actions">操作</th></tr></thead>
               <tbody id="proxyRows"><tr aria-hidden="true"><td><span class="skel w-30"></span></td><td><span class="skel w-80"></span></td><td><span class="skel w-40"></span></td><td><span class="skel w-30"></span></td><td><span class="skel w-30"></span></td><td><span class="skel w-60"></span></td><td><span class="skel w-40"></span></td></tr></tbody>
             </table>
+          </div>
+          <div class="btn-row" style="margin-top:var(--sp-3);align-items:center;flex-wrap:wrap;gap:var(--sp-2)">
+            <label class="form-hint" for="proxyPageSize">每页</label>
+            <select class="form-input" id="proxyPageSize" style="width:auto" onchange="proxySetPageSize(this.value)">
+              <option value="10">10</option><option value="20" selected>20</option>
+              <option value="50">50</option><option value="100">100</option>
+              <option value="0">全部</option>
+            </select>
+            <button type="button" class="btn btn-sm" id="proxyPrevBtn" onclick="proxyGoPage(-1)">上一页</button>
+            <span class="form-hint" id="proxyPageInfo">-</span>
+            <button type="button" class="btn btn-sm" id="proxyNextBtn" onclick="proxyGoPage(1)">下一页</button>
+            <span class="form-hint" id="proxyTierSummary"></span>
           </div>
         </div>
       </section>
@@ -4887,15 +4898,19 @@ async function cleanupAll(){
 }
 
 const proxySelectedIDs=new Set();
+let proxyAllRows=[],proxyPageSize=20,proxyPageNo=1;
 function proxyRow(x){
   const id=String(x.id||'');
   const inCooldown=x.cooldownUntil&&new Date(x.cooldownUntil)>new Date();
   const selected=id&&proxySelectedIDs.has(id);
   const badge=x.health==='reachable'?'<span class="badge ok">正常</span>':x.health==='unreachable'?'<span class="badge err">不可达</span>':x.health==='upstream_error'?'<span class="badge warn">上游异常</span>':'<span class="badge">未检测</span>';
+  // 隔离原因要能一眼看出：拒绝会一直拒绝，超时可能只是慢，处置方式不同。
+  const tierRank=proxyTierRank(x);
+  const tierTag=tierRank===0?'':'<span class="badge '+(tierRank===1?'warn':'err')+'">'+esc(proxyTierLabel(tierRank))+'</span>';
   return `<tr>
     <td><input type="checkbox" data-proxy-id="${escAttr(id)}" ${id?'':'disabled'} ${selected?'checked':''} onchange="proxyToggleSelected(this.dataset.proxyId,this.checked)" aria-label="选择代理 ${escAttr(x.url)}"></td>
     <td><code class="mono-cell cell-trunc w-lg" title="${esc(x.url)}">${esc(x.url)}</code>${inCooldown?'<div class="t-dim">冷却中</div>':''}</td>
-    <td>${badge}</td>
+    <td>${badge}${tierTag?' '+tierTag:''}</td>
     <td class="num t-time">${x.latencyMs>0?x.latencyMs+' ms':'-'}</td>
     <td class="num t-time">${x.failures||0}</td>
     <td class="t-time">${x.cooldownUntil?esc(fmtTime(x.cooldownUntil)):'-'}</td>
@@ -4929,15 +4944,90 @@ function pruneProxySelection(proxies){
   const active=new Set((proxies||[]).map(x=>String(x.id||'')).filter(Boolean));
   [...proxySelectedIDs].forEach(id=>{if(!active.has(id))proxySelectedIDs.delete(id);});
 }
+// 冷却隔离分档。后端 List() 的 tierName 就是选路时用的档位，面板必须
+// 用同一口径 —— 冷却中的出口 state 仍是 live，按 state 排会把刚断掉的节点
+// 摆在健康列表最前面。
+// 0 正常 / 1 观察中 / 2 秒拒(<100ms 拒绝) / 3 超时熔断
+function proxyTierRank(x){
+  const tier=String(x.tierName||'');
+  if(tier==='live')return 0;
+  if(tier==='suspect')return 1;
+  // 隔离池内部再分列：拒绝和超时是相反的两种故障。
+  return x.refused?2:3;
+}
+function proxyTierLabel(rank){
+  return ['正常','观察中','拒绝','超时熔断'][rank]||'未知';
+}
+function proxySortByTier(list){
+  return list.map((x,i)=>({x,i,r:proxyTierRank(x)}))
+    .sort((a,b)=>a.r-b.r
+      ||(a.x.latencyMs>0?a.x.latencyMs:1e9)-(b.x.latencyMs>0?b.x.latencyMs:1e9)
+      ||a.i-b.i)
+    .map(e=>e.x);
+}
+function proxySetPageSize(v){
+  proxyPageSize=Math.max(0,parseInt(v,10)||0);
+  proxyPageNo=1;
+  renderProxyPage();
+}
+function proxyGoPage(delta){
+  proxyPageNo=proxyPageNo+delta;
+  renderProxyPage();
+}
+function renderProxyPage(){
+  const all=proxyAllRows;
+  const body=$('proxyRows');
+  if(!body)return;
+  if(!all.length){
+    body.innerHTML=emptyRow(7,'globe','没有配置代理','当前请求将直连上游；可在上方手动添加或拉取经质量筛选的公开节点');
+    const info=$('proxyPageInfo');if(info)info.textContent='-';
+    const sum=$('proxyTierSummary');if(sum)sum.textContent='';
+    const prev=$('proxyPrevBtn'),next=$('proxyNextBtn');
+    if(prev)prev.disabled=true;if(next)next.disabled=true;
+    updateProxySelectionUI();
+    return;
+  }
+  const size=proxyPageSize>0?proxyPageSize:all.length;
+  const pages=Math.max(1,Math.ceil(all.length/size));
+  if(proxyPageNo>pages)proxyPageNo=pages;
+  if(proxyPageNo<1)proxyPageNo=1;
+  const start=(proxyPageNo-1)*size;
+  const slice=all.slice(start,start+size);
+  // 每档的第一行插一个分组抬头，让隔离池在视觉上和正常节点分开。
+  let lastRank=-1,html='';
+  slice.forEach(x=>{
+    const r=proxyTierRank(x);
+    if(r!==lastRank){
+      lastRank=r;
+      const n=all.filter(y=>proxyTierRank(y)===r).length;
+      html+='<tr class="t-dim"><td colspan="7"><strong>'+esc(proxyTierLabel(r))+'</strong> · '+n+' 个</td></tr>';
+    }
+    html+=proxyRow(x);
+  });
+  body.innerHTML=html;
+  const info=$('proxyPageInfo');
+  if(info)info.textContent='第 '+proxyPageNo+' / '+pages+' 页 · 共 '+all.length+' 个';
+  const prev=$('proxyPrevBtn'),next=$('proxyNextBtn');
+  if(prev)prev.disabled=proxyPageNo<=1;
+  if(next)next.disabled=proxyPageNo>=pages;
+  const sum=$('proxyTierSummary');
+  if(sum){
+    const counts=[0,0,0,0];
+    all.forEach(x=>{counts[proxyTierRank(x)]++;});
+    sum.textContent='正常 '+counts[0]+' · 观察 '+counts[1]+' · 拒绝 '+counts[2]+' · 熔断 '+counts[3];
+  }
+  updateProxySelectionUI();
+}
 async function loadProxies(){
   try{
     const d=await api('/api/admin/proxy-pool');
     const p=d.proxies||[];
     pruneProxySelection(p);
-    $('proxyRows').innerHTML=p.length?p.map(proxyRow).join(''):emptyRow(7,'globe','没有配置代理','当前请求将直连上游；可在上方手动添加或拉取经质量筛选的公开节点');
-    updateProxySelectionUI();
+    proxyAllRows=proxySortByTier(p);
+    renderProxyPage();
   }catch(e){
     proxySelectedIDs.clear();
+    proxyAllRows=[];
     $('proxyRows').innerHTML=errorRow(7,e.message);
     updateProxySelectionUI();
   }
@@ -4947,7 +5037,18 @@ async function proxyAdd(){
   if(!raw)return showNotice('请输入代理地址','error');
   try{
     const d=await api('/api/admin/proxy-pool',{method:'POST',body:JSON.stringify({urls:[raw]})});
-    showNotice('已添加 '+d.added+' 个代理','success');$('proxyInput').value='';loadProxies();
+    // 部分成功现在是正常结果：坏节点被单独列出，好节点照常入池。
+    const bad=d.rejected||[];
+    let msg='已添加 '+(d.added||0)+' 个代理';
+    if(bad.length){
+      msg+='；'+bad.length+' 个未通过校验';
+      termOpen('proxy add — m365-copilot2api');
+      termLine('已入池 '+(d.added||0)+' 个，未通过 '+bad.length+' 个：');
+      bad.forEach(b=>termLine('  '+(b.proxy||'?')+' — '+(b.reason||'校验失败'),'warn'));
+    }
+    showNotice(msg,bad.length?'warn':'success');
+    if(d.added)$('proxyInput').value='';
+    loadProxies();
   }catch(e){showNotice(e.message,'error');}
 }
 async function proxyRemove(id,label){
