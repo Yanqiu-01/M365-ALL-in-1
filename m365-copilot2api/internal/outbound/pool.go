@@ -495,6 +495,7 @@ func (c *pooledConn) Close() error {
 func (p *Pool) List() []map[string]any {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	now := time.Now()
 	out := make([]map[string]any, 0, len(p.entries))
 	for _, e := range p.entries {
 		lastCheckedAt := ""
@@ -508,9 +509,55 @@ func (p *Pool) List() []map[string]any {
 			"id": e.id(), "state": e.stateName(), "score": roundScore(e.score),
 			"medianLatencyMs": e.medianLatency.Milliseconds(), "wsOk": e.wsOK,
 			"lastCheckedAt": lastCheckedAt, "consecutiveFailures": e.consecutiveFailures,
+			// tier/tierName 是选路时真正用的分档，之前只存在于进程内部，
+			// 面板拿不到，只能自己按 state 猜 —— 于是 UI 的分组和实际选路口径
+			// 不一致。冷却中的出口 state 仍是 live，但 tier 已是 evicted。
+			"tier": e.tier(now), "tierName": tierName(e.tier(now)),
+			"cooldownRemainingMs": cooldownRemainingMs(e.cooldown, now),
+			"refused":             isRefusalError(e.lastError),
 		})
 	}
 	return out
+}
+
+// tierName gives the selection tier a stable name for the admin API. The
+// dashboard groups exits by this instead of re-deriving it from state: an exit in
+// cooldown still reports state=live, so a UI that groups by state shows a broken
+// exit at the top of the healthy list.
+func tierName(tier int) string {
+	switch tier {
+	case tierLive:
+		return "live"
+	case tierSuspect:
+		return "suspect"
+	default:
+		return "evicted"
+	}
+}
+
+// cooldownRemainingMs reports how long an exit stays isolated. 0 means it is not
+// in cooldown.
+func cooldownRemainingMs(cooldown, now time.Time) int64 {
+	if cooldown.IsZero() || !now.Before(cooldown) {
+		return 0
+	}
+	return now.Sub(cooldown).Milliseconds() * -1
+}
+
+// isRefusalError separates "refused outright" from "timed out". They look the
+// same in a flat list yet mean opposite things: a refusal answers in a few
+// milliseconds and will keep refusing, while a timeout may just be a slow path.
+func isRefusalError(lastError string) bool {
+	if lastError == "" {
+		return false
+	}
+	e := strings.ToLower(lastError)
+	for _, marker := range []string{"refused", "reset", "forbidden", "407", "403", "denied", "unauthorized"} {
+		if strings.Contains(e, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func roundScore(v float64) float64 {

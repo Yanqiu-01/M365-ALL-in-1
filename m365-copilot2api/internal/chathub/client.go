@@ -313,6 +313,15 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 		if attachErr := <-attachCh; attachErr != nil {
 			return Result{}, fmt.Errorf("upload attachment: %w", attachErr)
 		}
+		// 没拿到 docId 的附件必须从 payload 里剔除，并把原因如实告诉模型。
+		// 否则空 docId 会被原样发上去，模型答「我没看到任何图片」，用户完全
+		// 无法从回答里看出「其实是上传失败了」。
+		kept, dropped := partitionUploadedAttachments(req.Attachments)
+		if dropped > 0 {
+			log.Printf("chathub attachments dropped=%d kept=%d (upload did not return docId)", dropped, len(kept))
+			req.Attachments = kept
+			req.Text = req.Text + fmt.Sprintf("\n\n[系统提示] 本轮有 %d 个图片附件上传失败，未能送达。请如实告知用户附件上传失败、需要重新发送，不要声称没有收到附件。", dropped)
+		}
 	}
 
 	payload := chatPayload(req.Text, req.SessionID, req.ConversationID, requestID, req.Tone, firstTurn, req.Attachments, req.Tools, req.ToolChoice, req.MCPServerURL)
@@ -568,6 +577,26 @@ func buildWSURL(acc Account, sessionID, conversationID, requestID string) (strin
 	// Gorilla/url will encode " to %22 which MS accepts.
 	u := fmt.Sprintf("%s/%s@%s?%s", wsBase, acc.OID, acc.TID, q.Encode())
 	return u, nil
+}
+
+// partitionUploadedAttachments 分出真正拿到 docId 的附件。
+//
+// uploadAttachments 对每个失败分支都用 continue 继续处理下一个附件，整个函数
+// 仍返回 nil。这个设计本身是对的（一个附件坏掉不该让整轮请求失败），但调用方
+// 之前没有区分「上传成功」和「上传失败但被跳过」，于是空 docId 的附件照样进了
+// payload。实测微软 UploadFile 对 1x1 退化 PNG 返回 500 InternalError，
+// 而 64x64 / 256x256 正常 —— 这条路径是真实可触发的。
+func partitionUploadedAttachments(attachments []Attachment) ([]Attachment, int) {
+	kept := make([]Attachment, 0, len(attachments))
+	dropped := 0
+	for _, a := range attachments {
+		if a.Type == "image" && a.DocID == "" {
+			dropped++
+			continue
+		}
+		kept = append(kept, a)
+	}
+	return kept, dropped
 }
 
 func (c *Client) uploadAttachments(ctx context.Context, acc Account, conversationID string, attachments []Attachment) error {
