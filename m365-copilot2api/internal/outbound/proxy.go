@@ -275,6 +275,32 @@ func ProxyPoolStatusRedacted() []map[string]any {
 	return items
 }
 
+// CheckSelectedProxies 只探测给定 id 的出口，供「新增后立刻显示状态」使用。
+func CheckSelectedProxies(ctx context.Context, ids []string) []map[string]any {
+	p := CurrentPool()
+	if p == nil {
+		return []map[string]any{}
+	}
+	items := p.CheckSelected(ctx, ids)
+	for _, item := range items {
+		if raw, ok := item["url"].(string); ok {
+			item["url"] = redactProxyDisplay(raw)
+		}
+	}
+	return items
+}
+
+// ProxyIDsForRawURLs 把原始出口 URL 映射成脱敏的稳定 id。
+func ProxyIDsForRawURLs(raws []string) []string {
+	out := make([]string, 0, len(raws))
+	for _, raw := range raws {
+		if id := proxyEntryID(raw); id != "" {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
 func AddProxy(raw string) error {
 	clientsMu.RLock()
 	p := proxyPool

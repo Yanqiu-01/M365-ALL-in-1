@@ -1,6 +1,7 @@
 package outbound
 
 import (
+	"strings"
 	"bufio"
 	"context"
 	"crypto/rand"
@@ -297,23 +298,62 @@ func logProbe(raw string, result probeResult) {
 // bounded only by the slowest exit in the pool.
 const checkAllBudget = 30 * time.Second
 
+// checkAllMaxConcurrency 是手工检查的并发上限。后台守护刻意保守（默认 6）以
+// 免持续压微软，但手工检查是一次性的前台操作，用户在等结果，所以放宽。
+const checkAllMaxConcurrency = 48
+
 // CheckAll probes every exit. Probes run concurrently under the same cap the
-// background guard uses (<=20 against Microsoft); the previous sequential loop
-// spent 10s per exit and made the admin handler hang on a large pool.
+// background guard uses; the previous sequential loop spent 10s per exit and
+// made the admin handler hang on a large pool.
 func (p *Pool) CheckAll(ctx context.Context) []map[string]any {
+	return p.CheckSelected(ctx, nil)
+}
+
+// CheckSelected 只探测 ids 指定的出口；ids 为空时退化为全量探测。
+//
+// 为什么需要它：新增出口后前端过去调的是全量检查，于是
+//   - 每次加一个 IP 都把池里所有老 IP 重新探一遍（用户可见的「触发老IP重新检测」）；
+//   - 30s 总预算被老出口占满，新出口常常轮不到，列表里反而没有状态；
+//   - 池子越大越慢。
+// 按 id 定向探测把这三件事一起解决：只探新加的那几个。
+func (p *Pool) CheckSelected(ctx context.Context, ids []string) []map[string]any {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	ctx, cancelAll := context.WithTimeout(ctx, checkAllBudget)
 	defer cancelAll()
 
+	wanted := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		if id = strings.TrimSpace(id); id != "" {
+			wanted[id] = struct{}{}
+		}
+	}
+
 	p.mu.Lock()
-	targets := make([]*poolEntry, len(p.entries))
-	copy(targets, p.entries)
+	targets := make([]*poolEntry, 0, len(p.entries))
+	for _, e := range p.entries {
+		if len(wanted) == 0 {
+			targets = append(targets, e)
+			continue
+		}
+		if _, ok := wanted[e.id()]; ok {
+			targets = append(targets, e)
+		}
+	}
 	p.mu.Unlock()
 
 	timing := guardTimingFromEnv()
-	semaphore := make(chan struct{}, guardConcurrency())
+	// 手工检查是用户在等结果的前台操作，可以比后台守护更激进：探测是纯网络
+	// 等待，几乎不吃 CPU。并发取「出口数」与上限的较小值，小批量时一轮打完。
+	limit := guardConcurrency()
+	if n := len(targets); n > limit {
+		if n > checkAllMaxConcurrency {
+			n = checkAllMaxConcurrency
+		}
+		limit = n
+	}
+	semaphore := make(chan struct{}, limit)
 	var wg sync.WaitGroup
 	for _, entry := range targets {
 		wg.Add(1)
@@ -333,7 +373,20 @@ func (p *Pool) CheckAll(ctx context.Context) []map[string]any {
 		}(entry)
 	}
 	wg.Wait()
-	return p.List()
+	if len(wanted) == 0 {
+		return p.List()
+	}
+	// 定向检查只返回被探测的那几条。返回全池会让前端把没探过的老出口一起
+	// 重新渲染，"新 IP 没状态、老 IP 状态变了" 就是这么来的。
+	filtered := make([]map[string]any, 0, len(wanted))
+	for _, item := range p.List() {
+		if id, _ := item["id"].(string); id != "" {
+			if _, ok := wanted[id]; ok {
+				filtered = append(filtered, item)
+			}
+		}
+	}
+	return filtered
 }
 
 // probeRoundBudget is the wall clock a full round may take: three sequential

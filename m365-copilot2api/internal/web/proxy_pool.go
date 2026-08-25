@@ -44,7 +44,17 @@ func (s *Server) proxyPool(w http.ResponseWriter, r *http.Request) {
 			jsonOut(w, map[string]any{"ok": true, "proxies": []map[string]any{}})
 			return
 		}
-		jsonOut(w, map[string]any{"ok": true, "proxies": p.CheckAll(r.Context())})
+		// ?ids=a,b,c 只检查这几个出口。前端「单个检查」用它，避免点一个
+		// 出口就把整池重新探一遍。不带 ids 时仍是全量检查。
+		var ids []string
+		if raw := strings.TrimSpace(r.URL.Query().Get("ids")); raw != "" {
+			for _, part := range strings.Split(raw, ",") {
+				if id := strings.TrimSpace(part); id != "" {
+					ids = append(ids, id)
+				}
+			}
+		}
+		jsonOut(w, map[string]any{"ok": true, "proxies": p.CheckSelected(r.Context(), ids)})
 		return
 	}
 	switch r.Method {
@@ -99,17 +109,31 @@ func (s *Server) addManualProxies(w http.ResponseWriter, r *http.Request) {
 		// SkipCheck is the escape hatch: it admits an exit without probing,
 		// for an exit that is known good but temporarily unreachable from here.
 		SkipCheck bool `json:"skipCheck"`
+		// Scheme 是没有写协议前缀那些行的兜底协议。买来的 IP 单子有的带
+		// socks5:// 前缀、有的就是裸 1.2.3.4:8080，后者过去直接被
+		// outbound.New 拒掉（"must be a complete socks5://, http://, or
+		// https:// URL"），整批 500。带前缀的行始终以自己的前缀为准。
+		Scheme string `json:"scheme"`
 	}
 	if json.NewDecoder(http.MaxBytesReader(w, r.Body, 64*1024)).Decode(&body) != nil {
 		writeOpenAIError(w, 400, "invalid_request_error", "bad json")
 		return
 	}
 
+	fallbackScheme, schemeErr := normalizeFreeProxyScheme(body.Scheme)
+	if schemeErr != nil {
+		writeOpenAIError(w, 400, "invalid_request_error", schemeErr.Error())
+		return
+	}
 	urls := append(append([]string(nil), body.URLs...), body.URL)
 	candidates := splitProxyInput(urls)
 	if len(candidates) == 0 {
 		writeOpenAIError(w, 400, "invalid_request_error", "proxy address is required")
 		return
+	}
+	// 补齐缺失的协议前缀。混合单子（部分带前缀、部分不带）也能一次导入。
+	for i := range candidates {
+		candidates[i] = applyFallbackProxyScheme(candidates[i], fallbackScheme)
 	}
 	// 逐条判定，互不牵连。此前任何一条校验失败就 return，导致粘贴 10 个节点、
 	// 只有 1 个不通，整批 10 个全部被拒 —— 用户看到的就是「添加 IP 时一个节点
@@ -149,11 +173,40 @@ func (s *Server) addManualProxies(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, 500, "storage_error", err.Error())
 		return
 	}
+	// 新增后立刻探测**只有新加的那几个**，让它们马上有状态。
+	// 过去前端加完要另点一次「检查全部」，那会把池里所有老出口重新探一遍，
+	// 既慢又把 30s 预算占满，新出口反而常常没状态。
+	proxies := outbound.ProxyPoolStatusRedacted()
+	if added > 0 && !body.SkipCheck {
+		if ids := outbound.ProxyIDsForRawURLs(accepted); len(ids) > 0 {
+			if probed := outbound.CheckSelectedProxies(r.Context(), ids); len(probed) > 0 {
+				proxies = probed
+			}
+		}
+	}
 	jsonOut(w, map[string]any{
 		"ok": true, "added": added,
 		"accepted": len(accepted), "rejected": rejected,
-		"proxies": outbound.ProxyPoolStatusRedacted(),
+		"proxies": proxies,
 	})
+}
+
+// applyFallbackProxyScheme 给没有协议前缀的出口补上兜底协议。
+//
+// 已经带 scheme:// 的原样返回 —— 单子里混着 socks5:// 和裸 ip:port 时，
+// 每行都以自己写的为准，只有没写的才用兜底值。
+func applyFallbackProxyScheme(candidate, fallback string) string {
+	candidate = strings.TrimSpace(candidate)
+	if candidate == "" {
+		return candidate
+	}
+	if strings.Contains(candidate, "://") {
+		return candidate
+	}
+	if fallback == "" {
+		fallback = "http"
+	}
+	return fallback + "://" + candidate
 }
 
 func splitProxyInput(inputs []string) []string {
