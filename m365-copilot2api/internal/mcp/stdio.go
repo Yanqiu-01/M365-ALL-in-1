@@ -24,6 +24,7 @@ type StdioClient struct {
 // opts 保留用于未来的启动选项，当前忽略。
 func StartStdio(ctx context.Context, command string, args []string, opts any) (*StdioClient, error) {
 	cmd := exec.CommandContext(ctx, command, args...)
+	hideChildWindow(cmd)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, err

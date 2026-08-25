@@ -279,6 +279,9 @@ type nativePanelExecProcess struct{ cmd *exec.Cmd }
 func (nativePanelExecRunner) Start(ctx context.Context, spec nativePanelCommand) (nativePanelProcess, io.ReadCloser, error) {
 	cmd := exec.CommandContext(ctx, spec.Program, spec.Args...)
 	cmd.Dir, cmd.Env, cmd.Stdin = spec.Dir, spec.Env, nil
+	// 注册/OAuth 脚本必须静默运行：主程序已 FreeConsole，若不显式抑制，
+	// Windows 会为每个控制台子进程新建一个可见的黑框窗口。
+	hideChildWindow(cmd)
 	out, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, nil, err
@@ -320,6 +323,8 @@ func (p nativePanelExecProcess) KillTree() error {
 		defer cancel()
 		cmd := exec.CommandContext(ctx, "taskkill", "/PID", strconv.Itoa(p.cmd.Process.Pid), "/T", "/F")
 		cmd.Stdout, cmd.Stderr = io.Discard, io.Discard
+		// 停止任务时同样不要闪窗。
+		hideChildWindow(cmd)
 		if err := cmd.Run(); err == nil {
 			return nil
 		}
