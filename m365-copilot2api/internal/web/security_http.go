@@ -32,6 +32,25 @@ func securityHeaders(next http.Handler) http.Handler {
 //
 // /workbench 是唯一的例外，且不是复原产物：见下方 case 处的说明。
 func (s *Server) rootPage(w http.ResponseWriter, r *http.Request) {
+	// /favicon.ico 由用户指定的壁纸（琉璃神社壁纸包 2025年11月号 编号05）生成，
+	// 与 APK 原始行为无关，属有意扩展。Content-Type 必须显式声明，否则浏览器
+	// 不会把响应识别为图标。
+	if r.URL.Path == "/favicon.ico" && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
+		f, err := os.Open("web/favicon.ico")
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		defer f.Close()
+		st, err := f.Stat()
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "image/x-icon")
+		http.ServeContent(w, r, "favicon.ico", st.ModTime(), f)
+		return
+	}
 	var name string
 	switch r.URL.Path {
 	case "/", "/login":

@@ -28,14 +28,18 @@ func TestWebAssetsMatchAPKSet(t *testing.T) {
 	sort.Strings(got)
 
 	want := []string{"debug.html", "index.html", "login.html"}
-	extra := []string{"workbench.html"} // 有意新增，见函数注释
-	allowed := append(append([]string{}, want...), extra...)
+	extraHTML := []string{"workbench.html"}          // 有意新增，见函数注释
+	extraAssets := []string{"favicon.ico"}           // 有意新增：站点图标（壁纸编号05生成）
+	allowed := append(append([]string{}, want...), extraHTML...)
+	allowed = append(allowed, extraAssets...)
+	sort.Strings(allowed)
 	if strings.Join(got, ",") != strings.Join(allowed, ",") {
-		t.Errorf("web/ 内容为 %v，期望 %v（APK 三件 + 有意新增的 workbench）", got, allowed)
+		t.Errorf("web/ 内容为 %v，期望 %v（APK 三件 + 有意新增的 workbench/favicon）", got, allowed)
 	}
 
 	// 逐个确认非空且是 HTML 文档。
-	for _, name := range allowed {
+	htmlDocs := append(append([]string{}, want...), extraHTML...)
+	for _, name := range htmlDocs {
 		body, err := os.ReadFile(filepath.Join("../../web", name))
 		if err != nil {
 			t.Fatal(err)
