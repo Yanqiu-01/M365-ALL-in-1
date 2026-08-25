@@ -1,0 +1,23 @@
+# Cloudflare Tunnel template
+
+This is a configuration template only. It does not create a tunnel, log in to Cloudflare, publish DNS, or install a service.
+
+```yaml
+# config.example.yml
+# Replace the placeholder tunnel UUID and credentials path locally.
+tunnel: replace-with-local-tunnel-id
+credentials-file: C:\\Users\\YOUR_USER\\.cloudflared\\replace-with-local-credentials.json
+
+ingress:
+  - hostname: replace-with-your-private-hostname
+    service: http://127.0.0.1:4141
+  - service: http_status:404
+```
+
+## Safety requirements
+
+- Keep the local listener at `127.0.0.1:4141`.
+- Require Cloudflare Access or an equivalent identity-aware policy before allowing users to reach the administrative console.
+- Do not put Microsoft OAuth tokens, the administrator password, or API keys in this file.
+- Use a separate private hostname and do not publish it until authentication, route authorization, diagnostics, and rate limits have been reviewed.
+- Run `cloudflared tunnel ingress validate` against a local copy before deployment; this project does not run that command automatically.
