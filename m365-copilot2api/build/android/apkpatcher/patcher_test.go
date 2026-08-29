@@ -138,6 +138,19 @@ func TestSmaliPatchesOnOriginalAPK(t *testing.T) {
 	if !strings.Contains(main, "Lcom/m365/gateway/FlareSolver;-><init>") {
 		t.Fatal("hidden FlareSolver WebView was not started")
 	}
+	flare, err := readFile(filepath.Join(work, "smali", "com", "m365", "gateway", "FlareSolver.smali"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(flare, "setAcceptThirdPartyCookies") {
+		t.Fatal("Turnstile WebView must accept third-party cookies")
+	}
+	if !strings.Contains(flare, "gw/data/flare/ready") {
+		t.Fatal("ready marker missing")
+	}
+	if !strings.Contains(flare, "Landroid/widget/FrameLayout;") {
+		t.Fatal("visible overlay missing")
+	}
 }
 
 func TestReplaceOnceRejectsAmbiguousNeedle(t *testing.T) {

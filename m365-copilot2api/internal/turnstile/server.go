@@ -117,14 +117,11 @@ type localSolution struct {
 }
 
 func solveLocal(ctx context.Context, page string) (localSolution, error) {
-	if dir := flareDir(); dir != "" {
-		if solved, err := solveViaWebView(ctx, dir, page); err == nil {
-			return solved, nil
-		} else if !errors.Is(err, errNoWebView) {
-			return localSolution{}, err
-		}
+	dir := flareDir()
+	if dir == "" {
+		return localSolution{}, errors.New("内置 FlareSolverr 需要 App 数据目录。请打开修改版M365 后再注册")
 	}
-	return localSolution{}, errors.New("内置 FlareSolverr 需要 App 内的隐藏 WebView。请打开修改版M365 后再注册")
+	return solveViaWebView(ctx, dir, page)
 }
 
 func flareDir() string {
@@ -135,10 +132,7 @@ func flareDir() string {
 	return filepath.Join(root, "flare")
 }
 
-var (
-	errNoWebView = errors.New("webview solver is not running")
-	webviewMu    sync.Mutex
-)
+var webviewMu sync.Mutex
 
 func solveViaWebView(ctx context.Context, dir, page string) (localSolution, error) {
 	webviewMu.Lock()
@@ -146,11 +140,17 @@ func solveViaWebView(ctx context.Context, dir, page string) (localSolution, erro
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return localSolution{}, err
 	}
+	ready := filepath.Join(dir, "ready")
+	if _, err := os.Stat(ready); err != nil {
+		return localSolution{}, errors.New("验证页还没启动。请先打开修改版M365 主界面，等几秒后再点开始注册")
+	}
 	id := fmt.Sprintf("%d", time.Now().UnixNano())
 	job := filepath.Join(dir, "job")
 	tmp := filepath.Join(dir, "job.tmp")
 	result := filepath.Join(dir, "result")
+	status := filepath.Join(dir, "status")
 	_ = os.Remove(result)
+	_ = os.Remove(status)
 	if err := os.WriteFile(tmp, []byte(id+"\n"+page+"\n"), 0o600); err != nil {
 		return localSolution{}, err
 	}
@@ -160,16 +160,18 @@ func solveViaWebView(ctx context.Context, dir, page string) (localSolution, erro
 	defer os.Remove(job)
 	ticker := time.NewTicker(250 * time.Millisecond)
 	defer ticker.Stop()
-	seenJob := false
+	jobTaken := false
+	pageLoaded := false
 	for {
 		select {
 		case <-ctx.Done():
-			return localSolution{}, fmt.Errorf("WebView 求解超时: %w", ctx.Err())
+			return localSolution{}, timeoutError(jobTaken, pageLoaded)
 		case <-ticker.C:
-			if _, err := os.Stat(job); err == nil {
-				seenJob = true
-			} else if seenJob {
-				// poller consumed the job; keep waiting for result
+			if _, err := os.Stat(job); err != nil {
+				jobTaken = true
+			}
+			if body, err := os.ReadFile(status); err == nil && strings.Contains(string(body), "loaded") {
+				pageLoaded = true
 			}
 			body, err := os.ReadFile(result)
 			if err != nil {
@@ -182,9 +184,20 @@ func solveViaWebView(ctx context.Context, dir, page string) (localSolution, erro
 			_ = os.Remove(result)
 			token := strings.TrimSpace(lines[1])
 			if token == "" {
-				return localSolution{}, errors.New("WebView 未拿到 Turnstile token")
+				return localSolution{}, errors.New("验证页已打开，但没有拿到 Turnstile token")
 			}
 			return localSolution{Token: token, UserAgent: "M365-WebView"}, nil
 		}
+	}
+}
+
+func timeoutError(jobTaken, pageLoaded bool) error {
+	switch {
+	case !jobTaken:
+		return errors.New("验证页没有接到任务。请保持修改版M365 在前台，不要锁屏")
+	case !pageLoaded:
+		return errors.New("验证页没有打开注册站。请检查网络后重试")
+	default:
+		return errors.New("验证页已打开，但 Turnstile 没有给出 token。请在弹出的验证层里完成勾选")
 	}
 }

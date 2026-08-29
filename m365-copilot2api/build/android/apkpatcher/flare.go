@@ -42,6 +42,7 @@ func patchFlareSolver(work string) error {
 		"FlareSolver$Client.smali": flareClientSmali(),
 		"FlareSolver$Loop.smali":   flareLoopSmali,
 		"FlareSolver$Load.smali":   flareLoadSmali,
+		"FlareSolver$Hide.smali":   flareHideSmali,
 	}
 	for name, body := range files {
 		if err := writeFile(filepath.Join(packageDir, name), body); err != nil {
@@ -90,13 +91,14 @@ func patchFlareSolver(work string) error {
 	return nil
 }
 
-const flareWatchJS = `(function(){if(window.__m365Flare)return;window.__m365Flare=1;function grab(){var el=document.querySelector('input[name=cf-turnstile-response]');var v=el&&el.value;if(v&&v.length>20){M365Flare.done(v);return true;}return false;}function poke(){var nodes=document.querySelectorAll('.cf-turnstile,#turnstileBox,iframe[src*="challenges.cloudflare.com"]');for(var i=0;i<nodes.length;i++){try{nodes[i].click();}catch(e){}}}poke();if(grab())return;var n=0;setInterval(function(){n++;poke();grab();},500);})();`
+const flareWatchJS = `(function(){if(window.__m365Flare)return;window.__m365Flare=1;function grab(){var el=document.querySelector('input[name=cf-turnstile-response]');var v=el&&el.value;if(v&&v.length>20){M365Flare.done(v);return true;}return false;}if(grab())return;var n=0;setInterval(function(){n++;grab();},400);})();`
 
 const flareSolverSmali = `.class public Lcom/m365/gateway/FlareSolver;
 .super Ljava/lang/Object;
 .source "FlareSolver.java"
 
 .field final activity:Landroid/app/Activity;
+.field overlay:Landroid/widget/FrameLayout;
 .field web:Landroid/webkit/WebView;
 .field volatile running:Z
 .field currentId:Ljava/lang/String;
@@ -112,58 +114,110 @@ const flareSolverSmali = `.class public Lcom/m365/gateway/FlareSolver;
 .end method
 
 .method public start()V
-    .locals 4
+    .locals 6
 
     const/4 v0, 0x1
 
     iput-boolean v0, p0, Lcom/m365/gateway/FlareSolver;->running:Z
 
-    new-instance v0, Landroid/webkit/WebView;
-
     iget-object v1, p0, Lcom/m365/gateway/FlareSolver;->activity:Landroid/app/Activity;
 
-    invoke-direct {v0, v1}, Landroid/webkit/WebView;-><init>(Landroid/content/Context;)V
+    new-instance v0, Landroid/widget/FrameLayout;
 
-    iput-object v0, p0, Lcom/m365/gateway/FlareSolver;->web:Landroid/webkit/WebView;
+    invoke-direct {v0, v1}, Landroid/widget/FrameLayout;-><init>(Landroid/content/Context;)V
 
-    invoke-virtual {v0}, Landroid/webkit/WebView;->getSettings()Landroid/webkit/WebSettings;
+    iput-object v0, p0, Lcom/m365/gateway/FlareSolver;->overlay:Landroid/widget/FrameLayout;
 
-    move-result-object v1
+    const-string v2, "#F0111827"
 
-    const/4 v2, 0x1
+    invoke-static {v2}, Landroid/graphics/Color;->parseColor(Ljava/lang/String;)I
 
-    invoke-virtual {v1, v2}, Landroid/webkit/WebSettings;->setJavaScriptEnabled(Z)V
+    move-result v2
 
-    invoke-virtual {v1, v2}, Landroid/webkit/WebSettings;->setDomStorageEnabled(Z)V
+    invoke-virtual {v0, v2}, Landroid/widget/FrameLayout;->setBackgroundColor(I)V
 
-    invoke-virtual {v1, v2}, Landroid/webkit/WebSettings;->setDatabaseEnabled(Z)V
+    const/16 v2, 0x8
 
-    new-instance v1, Lcom/m365/gateway/FlareSolver$Client;
+    invoke-virtual {v0, v2}, Landroid/widget/FrameLayout;->setVisibility(I)V
 
-    invoke-direct {v1, p0}, Lcom/m365/gateway/FlareSolver$Client;-><init>(Lcom/m365/gateway/FlareSolver;)V
+    new-instance v2, Landroid/webkit/WebView;
 
-    invoke-virtual {v0, v1}, Landroid/webkit/WebView;->setWebViewClient(Landroid/webkit/WebViewClient;)V
+    invoke-direct {v2, v1}, Landroid/webkit/WebView;-><init>(Landroid/content/Context;)V
 
-    new-instance v1, Lcom/m365/gateway/FlareSolver$Bridge;
+    iput-object v2, p0, Lcom/m365/gateway/FlareSolver;->web:Landroid/webkit/WebView;
 
-    invoke-direct {v1, p0}, Lcom/m365/gateway/FlareSolver$Bridge;-><init>(Lcom/m365/gateway/FlareSolver;)V
+    invoke-virtual {v2}, Landroid/webkit/WebView;->getSettings()Landroid/webkit/WebSettings;
 
-    const-string v2, "M365Flare"
+    move-result-object v3
 
-    invoke-virtual {v0, v1, v2}, Landroid/webkit/WebView;->addJavascriptInterface(Ljava/lang/Object;Ljava/lang/String;)V
+    const/4 v4, 0x1
 
-    new-instance v1, Landroid/widget/LinearLayout$LayoutParams;
+    invoke-virtual {v3, v4}, Landroid/webkit/WebSettings;->setJavaScriptEnabled(Z)V
 
-    const/4 v2, 0x1
+    invoke-virtual {v3, v4}, Landroid/webkit/WebSettings;->setDomStorageEnabled(Z)V
 
-    const/4 v3, 0x1
+    invoke-virtual {v3, v4}, Landroid/webkit/WebSettings;->setDatabaseEnabled(Z)V
 
-    invoke-direct {v1, v2, v3}, Landroid/widget/LinearLayout$LayoutParams;-><init>(II)V
+    invoke-virtual {v3, v4}, Landroid/webkit/WebSettings;->setJavaScriptCanOpenWindowsAutomatically(Z)V
 
-    iget-object v2, p0, Lcom/m365/gateway/FlareSolver;->activity:Landroid/app/Activity;
+    const/4 v5, 0x0
 
-    invoke-virtual {v2, v0, v1}, Landroid/app/Activity;->addContentView(Landroid/view/View;Landroid/view/ViewGroup$LayoutParams;)V
+    invoke-virtual {v3, v5}, Landroid/webkit/WebSettings;->setMediaPlaybackRequiresUserGesture(Z)V
 
+    invoke-virtual {v3, v5}, Landroid/webkit/WebSettings;->setMixedContentMode(I)V
+
+    const-string v5, "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
+
+    invoke-virtual {v3, v5}, Landroid/webkit/WebSettings;->setUserAgentString(Ljava/lang/String;)V
+
+    invoke-static {}, Landroid/webkit/CookieManager;->getInstance()Landroid/webkit/CookieManager;
+
+    move-result-object v3
+
+    invoke-virtual {v3, v4}, Landroid/webkit/CookieManager;->setAcceptCookie(Z)V
+
+    invoke-virtual {v3, v2, v4}, Landroid/webkit/CookieManager;->setAcceptThirdPartyCookies(Landroid/webkit/WebView;Z)V
+
+    new-instance v3, Lcom/m365/gateway/FlareSolver$Client;
+
+    invoke-direct {v3, p0}, Lcom/m365/gateway/FlareSolver$Client;-><init>(Lcom/m365/gateway/FlareSolver;)V
+
+    invoke-virtual {v2, v3}, Landroid/webkit/WebView;->setWebViewClient(Landroid/webkit/WebViewClient;)V
+
+    new-instance v3, Lcom/m365/gateway/FlareSolver$Bridge;
+
+    invoke-direct {v3, p0}, Lcom/m365/gateway/FlareSolver$Bridge;-><init>(Lcom/m365/gateway/FlareSolver;)V
+
+    const-string v4, "M365Flare"
+
+    invoke-virtual {v2, v3, v4}, Landroid/webkit/WebView;->addJavascriptInterface(Ljava/lang/Object;Ljava/lang/String;)V
+
+    new-instance v3, Landroid/widget/FrameLayout$LayoutParams;
+
+    const/4 v4, -0x1
+
+    invoke-direct {v3, v4, v4}, Landroid/widget/FrameLayout$LayoutParams;-><init>(II)V
+
+    invoke-virtual {v0, v2, v3}, Landroid/widget/FrameLayout;->addView(Landroid/view/View;Landroid/view/ViewGroup$LayoutParams;)V
+
+    new-instance v2, Landroid/widget/FrameLayout$LayoutParams;
+
+    invoke-direct {v2, v4, v4}, Landroid/widget/FrameLayout$LayoutParams;-><init>(II)V
+
+    invoke-virtual {v1, v0, v2}, Landroid/app/Activity;->addContentView(Landroid/view/View;Landroid/view/ViewGroup$LayoutParams;)V
+
+    :try_start_0
+    invoke-virtual {p0}, Lcom/m365/gateway/FlareSolver;->readyFile()Ljava/io/File;
+
+    move-result-object v0
+
+    const-string v1, "1\n"
+
+    invoke-static {v0, v1}, Lcom/m365/gateway/FlareSolver;->writeFile(Ljava/io/File;Ljava/lang/String;)V
+    :try_end_0
+    .catch Ljava/lang/Exception; {:try_start_0 .. :try_end_0} :catch_0
+
+    :catch_0
     new-instance v0, Ljava/lang/Thread;
 
     new-instance v1, Lcom/m365/gateway/FlareSolver$Loop;
@@ -207,6 +261,42 @@ const flareSolverSmali = `.class public Lcom/m365/gateway/FlareSolver;
     move-result-object v1
 
     const-string v2, "gw/data/flare/result"
+
+    invoke-direct {v0, v1, v2}, Ljava/io/File;-><init>(Ljava/io/File;Ljava/lang/String;)V
+
+    return-object v0
+.end method
+
+.method readyFile()Ljava/io/File;
+    .locals 3
+
+    new-instance v0, Ljava/io/File;
+
+    iget-object v1, p0, Lcom/m365/gateway/FlareSolver;->activity:Landroid/app/Activity;
+
+    invoke-virtual {v1}, Landroid/app/Activity;->getFilesDir()Ljava/io/File;
+
+    move-result-object v1
+
+    const-string v2, "gw/data/flare/ready"
+
+    invoke-direct {v0, v1, v2}, Ljava/io/File;-><init>(Ljava/io/File;Ljava/lang/String;)V
+
+    return-object v0
+.end method
+
+.method statusFile()Ljava/io/File;
+    .locals 3
+
+    new-instance v0, Ljava/io/File;
+
+    iget-object v1, p0, Lcom/m365/gateway/FlareSolver;->activity:Landroid/app/Activity;
+
+    invoke-virtual {v1}, Landroid/app/Activity;->getFilesDir()Ljava/io/File;
+
+    move-result-object v1
+
+    const-string v2, "gw/data/flare/status"
 
     invoke-direct {v0, v1, v2}, Ljava/io/File;-><init>(Ljava/io/File;Ljava/lang/String;)V
 
@@ -364,6 +454,18 @@ const flareBridgeSmali = `.class Lcom/m365/gateway/FlareSolver$Bridge;
     .catch Ljava/lang/Exception; {:try_start_0 .. :try_end_0} :catch_0
 
     :catch_0
+    iget-object p1, p0, Lcom/m365/gateway/FlareSolver$Bridge;->this$0:Lcom/m365/gateway/FlareSolver;
+
+    iget-object v0, p1, Lcom/m365/gateway/FlareSolver;->overlay:Landroid/widget/FrameLayout;
+
+    if-eqz v0, :done
+
+    new-instance v1, Lcom/m365/gateway/FlareSolver$Hide;
+
+    invoke-direct {v1, v0}, Lcom/m365/gateway/FlareSolver$Hide;-><init>(Landroid/view/View;)V
+
+    invoke-virtual {v0, v1}, Landroid/widget/FrameLayout;->post(Ljava/lang/Runnable;)Z
+
     :done
     return-void
 .end method
@@ -403,6 +505,20 @@ func flareClientSmali() string {
 
     invoke-virtual {p1, v0, v1}, Landroid/webkit/WebView;->evaluateJavascript(Ljava/lang/String;Landroid/webkit/ValueCallback;)V
 
+    :try_start_0
+    iget-object p1, p0, Lcom/m365/gateway/FlareSolver$Client;->this$0:Lcom/m365/gateway/FlareSolver;
+
+    invoke-virtual {p1}, Lcom/m365/gateway/FlareSolver;->statusFile()Ljava/io/File;
+
+    move-result-object p1
+
+    const-string v0, "loaded\n"
+
+    invoke-static {p1, v0}, Lcom/m365/gateway/FlareSolver;->writeFile(Ljava/io/File;Ljava/lang/String;)V
+    :try_end_0
+    .catch Ljava/lang/Exception; {:try_start_0 .. :try_end_0} :catch_0
+
+    :catch_0
     return-void
 .end method
 `
@@ -493,7 +609,9 @@ const flareLoopSmali = `.class Lcom/m365/gateway/FlareSolver$Loop;
 
     new-instance v2, Lcom/m365/gateway/FlareSolver$Load;
 
-    invoke-direct {v2, v1, v0}, Lcom/m365/gateway/FlareSolver$Load;-><init>(Landroid/webkit/WebView;Ljava/lang/String;)V
+    iget-object v3, p0, Lcom/m365/gateway/FlareSolver$Loop;->this$0:Lcom/m365/gateway/FlareSolver;
+
+    invoke-direct {v2, v3, v0}, Lcom/m365/gateway/FlareSolver$Load;-><init>(Lcom/m365/gateway/FlareSolver;Ljava/lang/String;)V
 
     invoke-virtual {v1, v2}, Landroid/webkit/WebView;->post(Ljava/lang/Runnable;)Z
     :try_end_0
@@ -524,13 +642,13 @@ const flareLoadSmali = `.class Lcom/m365/gateway/FlareSolver$Load;
 
 .implements Ljava/lang/Runnable;
 
-.field final web:Landroid/webkit/WebView;
+.field final this$0:Lcom/m365/gateway/FlareSolver;
 .field final url:Ljava/lang/String;
 
-.method constructor <init>(Landroid/webkit/WebView;Ljava/lang/String;)V
+.method constructor <init>(Lcom/m365/gateway/FlareSolver;Ljava/lang/String;)V
     .locals 0
 
-    iput-object p1, p0, Lcom/m365/gateway/FlareSolver$Load;->web:Landroid/webkit/WebView;
+    iput-object p1, p0, Lcom/m365/gateway/FlareSolver$Load;->this$0:Lcom/m365/gateway/FlareSolver;
 
     iput-object p2, p0, Lcom/m365/gateway/FlareSolver$Load;->url:Ljava/lang/String;
 
@@ -542,11 +660,60 @@ const flareLoadSmali = `.class Lcom/m365/gateway/FlareSolver$Load;
 .method public run()V
     .locals 2
 
-    iget-object v0, p0, Lcom/m365/gateway/FlareSolver$Load;->web:Landroid/webkit/WebView;
+    iget-object v0, p0, Lcom/m365/gateway/FlareSolver$Load;->this$0:Lcom/m365/gateway/FlareSolver;
+
+    iget-object v0, v0, Lcom/m365/gateway/FlareSolver;->overlay:Landroid/widget/FrameLayout;
+
+    if-eqz v0, :load
+
+    const/4 v1, 0x0
+
+    invoke-virtual {v0, v1}, Landroid/widget/FrameLayout;->setVisibility(I)V
+
+    invoke-virtual {v0}, Landroid/widget/FrameLayout;->bringToFront()V
+
+    :load
+    iget-object v0, p0, Lcom/m365/gateway/FlareSolver$Load;->this$0:Lcom/m365/gateway/FlareSolver;
+
+    iget-object v0, v0, Lcom/m365/gateway/FlareSolver;->web:Landroid/webkit/WebView;
+
+    if-eqz v0, :done
 
     iget-object v1, p0, Lcom/m365/gateway/FlareSolver$Load;->url:Ljava/lang/String;
 
     invoke-virtual {v0, v1}, Landroid/webkit/WebView;->loadUrl(Ljava/lang/String;)V
+
+    :done
+    return-void
+.end method
+`
+
+const flareHideSmali = `.class Lcom/m365/gateway/FlareSolver$Hide;
+.super Ljava/lang/Object;
+.source "FlareSolver.java"
+
+.implements Ljava/lang/Runnable;
+
+.field final view:Landroid/view/View;
+
+.method constructor <init>(Landroid/view/View;)V
+    .locals 0
+
+    iput-object p1, p0, Lcom/m365/gateway/FlareSolver$Hide;->view:Landroid/view/View;
+
+    invoke-direct {p0}, Ljava/lang/Object;-><init>()V
+
+    return-void
+.end method
+
+.method public run()V
+    .locals 2
+
+    iget-object v0, p0, Lcom/m365/gateway/FlareSolver$Hide;->view:Landroid/view/View;
+
+    const/16 v1, 0x8
+
+    invoke-virtual {v0, v1}, Landroid/view/View;->setVisibility(I)V
 
     return-void
 .end method
