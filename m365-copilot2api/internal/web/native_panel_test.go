@@ -76,8 +76,7 @@ func TestRegisterNativePanelRoutesCoversRemovedPaths(t *testing.T) {
 	}
 }
 
-// 数据目录缺失时状态要如实报告。注册与批量 OAuth 的 Go 实现仍然可用，
-// 但 native_panel_ready 必须为 false，避免界面假装已经读到账密清单。
+// 数据目录即使一开始不存在也会被创建。注册与批量 OAuth 的 Go 实现始终可用。
 func TestNativePanelStateReportsUnsupportedFeatures(t *testing.T) {
 	manager := newNativePanelManager(nativePanelConfig{Root: filepath.Join(t.TempDir(), "missing")})
 	state := manager.state(nil)
@@ -86,11 +85,26 @@ func TestNativePanelStateReportsUnsupportedFeatures(t *testing.T) {
 			t.Errorf("state[%q] = %v, want true", key, state[key])
 		}
 	}
-	if ready, _ := state["native_panel_ready"].(bool); ready {
-		t.Error("缺失数据目录时 native_panel_ready 应为 false")
+	if ready, _ := state["native_panel_ready"].(bool); !ready {
+		t.Fatalf("auto-created data dir should be ready: %#v", state)
 	}
 	if _, exists := state["job"]; exists {
 		t.Error("任务机制已移除，state 不应再返回 job 字段")
+	}
+}
+
+func TestNativePanelPathsCreatesMissingDataDir(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "panel-data")
+	paths, err := nativePanelConfig{Root: root}.paths()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(paths.root, "config.json")); err != nil {
+		t.Fatalf("config.json not created: %v", err)
+	}
+	state := newNativePanelManager(nativePanelConfig{Root: root}).state(nil)
+	if ready, _ := state["native_panel_ready"].(bool); !ready {
+		t.Fatalf("auto-created data dir should be ready: %#v", state)
 	}
 }
 

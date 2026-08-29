@@ -1092,6 +1092,7 @@ textarea.form-input{min-height:80px;line-height:var(--lh-normal);resize:vertical
    -------------------------------------------------------------------------*/
 
 /* 关键指标卡：仪表盘首屏主层级，比 .stat 更重（图标 + 大数 + 副值） */
+.kpi-stack{grid-template-columns:1fr}
 .kpi{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:var(--sp-3);
   margin-bottom:var(--sp-4)}
 .kpi-card{background:var(--surface);
@@ -1826,6 +1827,7 @@ textarea.form-input{min-height:80px;line-height:var(--lh-normal);resize:vertical
       </div>
       <div class="topbar-right">
         <span class="topbar-status"><span class="status-dot" aria-hidden="true"></span> 运行中</span>
+        <button type="button" class="btn" onclick="refreshCurrentPage()"><svg class="ico ico-sm" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/> <path d="M3 3v5h5"/></svg> 刷新</button>
         <button type="button" class="btn" onclick="logout()"><svg class="ico ico-sm" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="m16 17 5-5-5-5"/> <path d="M21 12H9"/> <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/></svg> 退出</button>
       </div>
     </header>
@@ -2223,8 +2225,9 @@ if (response.output_text) {
             <span class="term-dot red" aria-hidden="true"></span><span class="term-dot yellow" aria-hidden="true"></span><span class="term-dot green" aria-hidden="true"></span>
             <span class="term-title" id="termTitle">cleanup — m365-copilot2api</span>
             <button type="button" class="term-clear" onclick="termClear()">清空</button>
+            <button type="button" class="term-clear" onclick="termClose()">关闭</button>
           </div>
-          <div class="term-body" id="termBody" role="log" aria-live="polite" aria-label="清理日志" tabindex="0"></div>
+          <div class="term-body" id="termBody" role="log" aria-live="polite" aria-label="运行日志" tabindex="0"></div>
         </div>
         <!-- 左列表 / 右详情双栏；<900px 详情转为全屏覆盖，靠返回键回列表 -->
         <div class="conv-split">
@@ -2262,7 +2265,7 @@ if (response.output_text) {
         </div>
         <!-- 置顶实时指标：TPM 为尾随 60 秒窗口的真实速率，并发为当前在途请求数。
              数据来自 /api/admin/live-metrics；端点缺失时显示 --，不影响下方表格。 -->
-        <div class="kpi" aria-live="polite">
+        <div class="kpi kpi-stack" aria-live="polite">
           <div class="kpi-card">
             <span class="kpi-ico"><svg class="ico ico-lg" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M12 2v20"/> <path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg></span>
             <span class="kpi-main">
@@ -2347,29 +2350,29 @@ if (response.output_text) {
           </div>
         </div>
         <div class="card">
-          <div class="card-head"><h3 class="card-title">免费节点拉取</h3><span class="badge info">质量守护</span></div>
+          <div class="card-head"><h3 class="card-title">M365 代理猎手</h3><span class="badge info">CONNECT · TLS · ChatHub</span></div>
           <div class="card-body">
-            <label class="form-label" for="proxyFreeSourceURL">来源 URL（纯文本或 HTML 表格页均可）</label>
-            <input class="form-input" id="proxyFreeSourceURL" type="url" inputmode="url" autocomplete="off" placeholder="https://www.kuaidaili.com/free/inha/">
+            <p class="form-hint" style="margin-bottom:var(--sp-3)">内置代理猎手：抓取公开来源，识别 HTTP/HTTPS/SOCKS5，并用与独立猎手相同的质量门（登录面 + 业务域 + ChatHub Upgrade）筛选后入池。</p>
+            <label class="form-label" for="proxyHunterSources">来源网址（一行一个，可改）</label>
+            <textarea class="form-input" id="proxyHunterSources" rows="6"></textarea>
             <div class="form-row" style="margin-top:var(--sp-3)">
               <div class="form-group">
-                <label class="form-label" for="proxyFreeScheme">兜底协议（仅当某行没写协议时使用）</label>
-                <select class="form-input" id="proxyFreeScheme"><option value="http">HTTP</option><option value="https">HTTPS</option><option value="socks5">SOCKS5</option></select>
+                <label class="form-label" for="proxyHunterScheme">兜底协议</label>
+                <select class="form-input" id="proxyHunterScheme"><option value="http">HTTP</option><option value="https">HTTPS</option><option value="socks5">SOCKS5</option></select>
               </div>
               <div class="form-group">
-                <label class="form-label" for="proxyFreeLimit">本次质量筛选上限</label>
-                <input class="form-input" id="proxyFreeLimit" type="number" min="1" max="200" value="50">
+                <label class="form-label" for="proxyHunterLimit">探测上限</label>
+                <input class="form-input" id="proxyHunterLimit" type="number" min="1" max="200" value="80">
               </div>
               <div class="form-group">
-                <label class="form-label" for="proxyFreePages">抓取页数</label>
-                <input class="form-input" id="proxyFreePages" type="number" min="1" max="500" value="20">
+                <label class="form-label" for="proxyHunterPages">每源抓取页数</label>
+                <input class="form-input" id="proxyHunterPages" type="number" min="1" max="40" value="3">
               </div>
             </div>
             <div class="btn-row">
-              <button type="button" class="btn primary" id="proxyFreeImportBtn" onclick="proxyFreeImport()">拉取并质量筛选导入</button>
+              <button type="button" class="btn primary" id="proxyHunterBtn" onclick="proxyHunterImport()">开始猎取并导入</button>
             </div>
-            <p class="form-hint" style="margin-top:var(--sp-2)">支持三种排布：<code>HTTP 1.2.3.4 80</code>（协议/IP/端口分列，购买的 IP 与快代理等表格页即此形态）、<code>1.2.3.4:8080</code>、<code>socks5://1.2.3.4:1080</code>。HTML 表格会自动剥标签、忽略表头，每行以该行自带的协议为准。</p>
-            <p class="form-hint">仅接受公网地址；去重后逐个以 M365 登录面探测，失败节点不会入池。快代理这类站点<strong>每页只有 12 条</strong>，产量由「抓取页数」决定 —— 实测 40 页可得约 2000 条候选。这类站点按来源 IP 限流，所以抓取是串行的（约 2.5 秒/页，40 页约 4 分半），页数越多越慢；被限流的页会自动退避重试。「筛选上限」限制的是实际探测条数（最多 200），探测比抓取慢得多，建议先小后大。</p>
+            <p class="form-hint" style="margin-top:var(--sp-2)">失败节点不会入池。来源站点常按 IP 限流，页数越大越慢。</p>
           </div>
         </div>
         <div class="card">
@@ -2398,6 +2401,22 @@ if (response.output_text) {
 
       <!-- ================= 能力评测 ================= -->
       <section id="page-benchmark" hidden>
+        <div class="card"><div class="card-body">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:var(--sp-3);gap:var(--sp-3);flex-wrap:wrap">
+            <div>
+              <b style="font-size:var(--fs-base)">可用性探测</b>
+              <p class="form-hint" style="margin-top:2px">对每个模型发一条最小请求，并发验证可用性</p>
+            </div>
+            <button type="button" class="btn" id="modelTestAllBtn" onclick="modelTestAll()"><svg class="ico ico-sm" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M14 2v6a2 2 0 0 0 .245.96l5.51 10.08A2 2 0 0 1 18 22H6a2 2 0 0 1-1.755-2.96l5.51-10.08A2 2 0 0 0 10 8V2"/> <path d="M6.453 15h11.094"/> <path d="M8.5 2h7"/></svg> 探测全部</button>
+          </div>
+          <div class="table-wrap">
+            <table class="table compact">
+              <caption class="sr-only">模型可用性探测结果</caption>
+              <thead><tr><th scope="col">模型</th><th scope="col">状态</th><th scope="col" class="num">耗时</th><th scope="col">回复</th></tr></thead>
+              <tbody id="modelTestRows"><tr aria-hidden="true"><td><span class="skel w-60"></span></td><td><span class="skel w-30"></span></td><td><span class="skel w-30"></span></td><td><span class="skel w-70"></span></td></tr></tbody>
+            </table>
+          </div>
+        </div></div>
         <div class="page-head">
           <div>
             <h2 class="page-title">能力评测</h2>
@@ -2430,22 +2449,7 @@ if (response.output_text) {
           <p class="bench-split" id="benchSplit"></p>
           <div class="bench-tasks" id="benchTasks" aria-live="polite"></div>
         </div></div>
-        <div class="card"><div class="card-body">
-          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:var(--sp-3);gap:var(--sp-3);flex-wrap:wrap">
-            <div>
-              <b style="font-size:var(--fs-base)">可用性探测</b>
-              <p class="form-hint" style="margin-top:2px">对每个模型发一条最小请求，并发验证可用性</p>
-            </div>
-            <button type="button" class="btn" id="modelTestAllBtn" onclick="modelTestAll()"><svg class="ico ico-sm" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M14 2v6a2 2 0 0 0 .245.96l5.51 10.08A2 2 0 0 1 18 22H6a2 2 0 0 1-1.755-2.96l5.51-10.08A2 2 0 0 0 10 8V2"/> <path d="M6.453 15h11.094"/> <path d="M8.5 2h7"/></svg> 探测全部</button>
-          </div>
-          <div class="table-wrap">
-            <table class="table compact">
-              <caption class="sr-only">模型可用性探测结果</caption>
-              <thead><tr><th scope="col">模型</th><th scope="col">状态</th><th scope="col" class="num">耗时</th><th scope="col">回复</th></tr></thead>
-              <tbody id="modelTestRows"><tr aria-hidden="true"><td><span class="skel w-60"></span></td><td><span class="skel w-30"></span></td><td><span class="skel w-30"></span></td><td><span class="skel w-70"></span></td></tr></tbody>
-            </table>
-          </div>
-        </div></div>
+
         <div class="card"><div class="card-body">
           <b style="font-size:var(--fs-base)">运行日志</b>
           <pre class="log-pre" id="benchLog" tabindex="0" aria-label="评测运行日志">开始评测后显示每一步工具调用。</pre>
@@ -2458,6 +2462,17 @@ if (response.output_text) {
           <div>
             <h2 class="page-title">设置</h2>
             <p class="page-sub">运行参数与诊断开关</p>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-head"><h3 class="card-title">设备与保活</h3><span class="card-note">原顶栏按钮已移到这里，避免挡住工作台</span></div>
+          <div class="card-body">
+            <p class="form-hint" style="margin-bottom:var(--sp-3)">保活、诊断和公网入口只在 Android 客户端生效。电脑浏览器上这些按钮没有对应的系统界面。</p>
+            <div class="btn-row" style="flex-wrap:wrap">
+              <button type="button" class="btn" onclick="nativeKeepAlive()">保活（忽略电池优化）</button>
+              <button type="button" class="btn" onclick="nativeOpenDiag()">诊断</button>
+              <button type="button" class="btn" onclick="nativeOpenTunnel()">公网</button>
+            </div>
           </div>
         </div>
         <!-- 外观：把原先硬编码在 CSS 里的三个旋钮（遮罩 / 卡片不透明度 /
@@ -3034,9 +3049,40 @@ function showPage(p){
   // 请求明细页：拉一次明细并启动实时指标轮询；离开该页时停轮询。
   if(p==='requests'){loadUsageLogs();startLiveMetrics();}else{stopLiveMetrics();}
   if(p==='conversations')loadConversations();
-  if(p==='proxies')loadProxies();
+  if(p==='proxies'){fillHunterSources();loadProxies();}
   if(p==='benchmark'){loadBenchmark();loadModelTest();}
   if(p==='settings')loadSettings();
+  const box=$('termBox');
+  if(box && !box.hidden && box.parentElement && box.parentElement.id!=='page-'+p){
+    termClose();
+  }
+}
+function refreshCurrentPage(){
+  const active=document.querySelector('.nav button.active');
+  const page=active && active.dataset.page;
+  if(page) showPage(page);
+  else location.reload();
+}
+function nativeKeepAlive(){
+  if(window.M365Native && typeof window.M365Native.keepAlive==='function'){
+    window.M365Native.keepAlive();
+    return;
+  }
+  showNotice('请在系统设置里忽略电池优化，或使用 Android 客户端的保活入口','info');
+}
+function nativeOpenDiag(){
+  if(window.M365Native && typeof window.M365Native.openDiag==='function'){
+    window.M365Native.openDiag();
+    return;
+  }
+  location.href='/debug';
+}
+function nativeOpenTunnel(){
+  if(window.M365Native && typeof window.M365Native.openTunnel==='function'){
+    window.M365Native.openTunnel();
+    return;
+  }
+  showNotice('公网入口仅 Android 客户端提供','info');
 }
 
 async function loadSettings(){
@@ -4894,7 +4940,34 @@ async function deleteCurrentConv(){
   }catch(e){showNotice(e.message,'error');}
 }
 
-function termOpen(title){$('termTitle').textContent=title;$('termBody').innerHTML='';$('termBox').style.display='block';}
+function termHostPage(){
+  const pages=['dashboard','accounts','apikeys','requests','conversations','proxies','benchmark','settings'];
+  for(const k of pages){
+    const sec=$('page-'+k);
+    if(sec && !sec.hidden) return sec;
+  }
+  return $('page-conversations');
+}
+function termOpen(title){
+  const box=$('termBox');
+  if(!box)return;
+  const host=termHostPage();
+  if(host && box.parentElement!==host){
+    const head=host.querySelector('.page-head');
+    if(head&&head.nextSibling) host.insertBefore(box, head.nextSibling);
+    else host.insertBefore(box, host.firstChild);
+  }
+  $('termTitle').textContent=title;
+  $('termBody').innerHTML='';
+  box.hidden=false;
+  box.style.display='block';
+}
+function termClose(){
+  const box=$('termBox');
+  if(!box)return;
+  box.hidden=true;
+  box.style.display='none';
+}
 function termLine(msg,cls){const d=document.createElement('div');if(cls)d.className=cls;d.textContent='> '+msg;$('termBody').appendChild(d);$('termBody').scrollTop=$('termBody').scrollHeight;}
 function termClear(){$('termBody').innerHTML='';}
 
@@ -5115,31 +5188,59 @@ function normalizeExternalHTTPURL(raw,label){
   if(target.username||target.password)throw Error(label+'不能包含用户名或密码');
   return target;
 }
-async function proxyFreeImport(){
-  let source;
-  try{source=normalizeExternalHTTPURL($('proxyFreeSourceURL').value,'公开文本来源 URL').href;}
-  catch(e){showNotice(e.message,'error');return;}
-  const rawLimit=Number.parseInt($('proxyFreeLimit').value,10);
-  const limit=Number.isFinite(rawLimit)?Math.min(200,Math.max(1,rawLimit)):50;
-  $('proxyFreeLimit').value=limit;
-  // 页数才是产量的决定因素：每页只有十几条，只抓一页最多就十几个候选。
-  const rawPages=Number.parseInt($('proxyFreePages').value,10);
-  const pages=Number.isFinite(rawPages)?Math.min(500,Math.max(1,rawPages)):20;
-  $('proxyFreePages').value=pages;
-  const button=$('proxyFreeImportBtn');
-  if(button)button.disabled=true;
-  termOpen('free proxy import — quality gate');
-  termLine('正在拉取 '+pages+' 页公开来源并执行 M365 质量筛选…');
-  try{
-    const d=await api('/api/admin/proxy-pool?action=free-import',{method:'POST',body:JSON.stringify({sourceUrl:source,scheme:$('proxyFreeScheme').value,limit,pages})});
-    const r=d.report||{};
-    termLine('实际抓取 '+(r.pages||1)+' 页；发现 '+(r.discovered||0)+' 条；格式无效 '+(r.invalid||0)+'；重复 '+(r.duplicates||0)+'；上限跳过 '+(r.limited||0)+'。','warn');
-    termLine('质量探测 '+(r.checked||0)+' 条；通过 '+(r.passed||0)+'；拒绝 '+(r.rejected||0)+'；导入 '+(r.imported||0)+'。',(r.imported||0)?'ok':'warn');
-    showNotice('质量筛选完成：导入 '+(r.imported||0)+' 个代理',(r.imported||0)?'success':'error');
-    loadProxies();
-  }catch(e){termLine('拉取失败：'+e.message,'err');showNotice(e.message,'error');}
-  finally{if(button)button.disabled=false;}
+const PROXY_HUNTER_SOURCES=[
+  'https://www.zdaye.com/free/',
+  'https://www.proxy-list.download/api/v1/get?type=http',
+  'https://www.proxy-list.download/api/v1/get?type=https',
+  'https://www.proxy-list.download/api/v1/get?type=socks5',
+  'https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/all/data.txt',
+  'https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt',
+  'https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt'
+];
+function fillHunterSources(){
+  const el=$('proxyHunterSources');
+  if(el && !el.value.trim()) el.value=PROXY_HUNTER_SOURCES.join('\n');
 }
+async function proxyHunterImport(){
+  fillHunterSources();
+  const sources=($('proxyHunterSources').value||'').split(/\n+/).map(s=>s.trim()).filter(Boolean);
+  if(!sources.length){showNotice('请填写至少一个来源网址','error');return;}
+  const rawLimit=Number.parseInt($('proxyHunterLimit').value,10);
+  const limit=Number.isFinite(rawLimit)?Math.min(200,Math.max(1,rawLimit)):80;
+  $('proxyHunterLimit').value=limit;
+  const rawPages=Number.parseInt($('proxyHunterPages').value,10);
+  const pages=Number.isFinite(rawPages)?Math.min(40,Math.max(1,rawPages)):3;
+  $('proxyHunterPages').value=pages;
+  const scheme=$('proxyHunterScheme').value||'http';
+  const button=$('proxyHunterBtn');
+  if(button)button.disabled=true;
+  termOpen('proxy hunter — m365');
+  termLine('开始猎取 '+sources.length+' 个来源…');
+  let imported=0, passed=0, checked=0, discovered=0;
+  try{
+    for(let i=0;i<sources.length;i++){
+      const source=sources[i];
+      termLine('['+(i+1)+'/'+sources.length+'] '+source);
+      try{
+        const d=await api('/api/admin/proxy-pool?action=free-import',{method:'POST',body:JSON.stringify({sourceUrl:source,scheme,limit,pages})});
+        const r=d.report||{};
+        discovered+=(r.discovered||0);
+        checked+=(r.checked||0);
+        passed+=(r.passed||0);
+        imported+=(r.imported||0);
+        termLine('  抓取 '+(r.pages||1)+' 页 · 发现 '+(r.discovered||0)+' · 通过 '+(r.passed||0)+' · 导入 '+(r.imported||0),(r.imported||0)?'ok':'warn');
+      }catch(e){
+        termLine('  失败：'+(e.message||e),'err');
+      }
+    }
+    termLine('合计：发现 '+discovered+' · 探测 '+checked+' · 通过 '+passed+' · 导入 '+imported, imported?'ok':'warn');
+    showNotice('猎手完成：导入 '+imported+' 个代理', imported?'success':'error');
+    loadProxies();
+  }finally{
+    if(button)button.disabled=false;
+  }
+}
+
 async function proxyCheckOne(url,id){
   try{
     // 只探测这一个出口。过去这里走全量检查，点一个出口会把整池重新探一遍，

@@ -52,7 +52,11 @@ type nativePanelConfig struct {
 func defaultNativePanelConfig() nativePanelConfig {
 	root := strings.TrimSpace(os.Getenv(nativePanelRootEnv))
 	if root == "" {
-		// Release layout: keep panel data beside the gateway executable.
+		// Android GatewayService 把 M365_DATA_DIR 指到 files/gw/data，那才是可写目录。
+		// 可执行文件在 nativeLibraryDir，旁边根本没有 M365-自用。
+		root = strings.TrimSpace(os.Getenv("M365_DATA_DIR"))
+	}
+	if root == "" {
 		if exe, err := os.Executable(); err == nil {
 			root = filepath.Join(filepath.Dir(exe), "M365-自用")
 		} else {
@@ -87,26 +91,52 @@ type nativePanelPaths struct {
 func (c nativePanelConfig) paths() (nativePanelPaths, error) {
 	root := strings.TrimSpace(c.Root)
 	if root == "" {
-		return nativePanelPaths{}, fmt.Errorf("%w: set %s or place the panel data directory beside the gateway executable", errNativePanelUnavailable, nativePanelRootEnv)
+		return nativePanelPaths{}, fmt.Errorf("%w: set %s or M365_DATA_DIR", errNativePanelUnavailable, nativePanelRootEnv)
 	}
 	abs, err := filepath.Abs(root)
 	if err != nil {
 		return nativePanelPaths{}, fmt.Errorf("%w: resolve data directory", errNativePanelUnavailable)
 	}
-	resolved, err := filepath.EvalSymlinks(abs)
-	if err != nil {
-		return nativePanelPaths{}, fmt.Errorf("%w: data directory is unavailable", errNativePanelUnavailable)
+	if err := os.MkdirAll(abs, 0o700); err != nil {
+		return nativePanelPaths{}, fmt.Errorf("%w: create data directory: %v", errNativePanelUnavailable, err)
+	}
+	resolved := abs
+	if link, err := filepath.EvalSymlinks(abs); err == nil && link != "" {
+		resolved = link
 	}
 	info, err := os.Stat(resolved)
 	if err != nil || !info.IsDir() {
 		return nativePanelPaths{}, fmt.Errorf("%w: data directory is unavailable", errNativePanelUnavailable)
 	}
 	configPath := filepath.Join(resolved, "config.json")
-	configInfo, err := os.Stat(configPath)
-	if err != nil || !configInfo.Mode().IsRegular() {
-		return nativePanelPaths{}, fmt.Errorf("%w: config.json is unavailable", errNativePanelUnavailable)
+	if err := ensureNativePanelConfigFile(configPath); err != nil {
+		return nativePanelPaths{}, err
 	}
 	return nativePanelPaths{root: resolved, configPath: configPath}, nil
+}
+
+func ensureNativePanelConfigFile(path string) error {
+	info, err := os.Stat(path)
+	if err == nil && info.Mode().IsRegular() {
+		return nil
+	}
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("%w: config.json is unavailable", errNativePanelUnavailable)
+	}
+	body := []byte(`{
+  "gateway": {"host": "127.0.0.1", "port": 4141},
+  "register": {
+    "email_domain": "",
+    "email_prefix": "",
+    "password": "",
+    "cred_file": "credentials.txt"
+  }
+}
+`)
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		return fmt.Errorf("%w: write default config.json: %v", errNativePanelUnavailable, err)
+	}
+	return nil
 }
 
 // nativePanelFileConfig 只保留 Go 侧真正会读的字段：网关地址用于状态展示，
