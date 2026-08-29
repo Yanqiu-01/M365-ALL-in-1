@@ -2119,7 +2119,7 @@ if (response.output_text) {
 <div class="card">
   <div class="card-head"><h3 class="card-title">注册新账号</h3><span class="card-note" id="panelRegState"></span></div>
   <div class="card-body">
-    <p class="form-hint" style="margin-bottom:var(--sp-2)">点「开始注册」后，网关先换 IP，再请求本机 FlareSolverr 过 Cloudflare，然后提交 /api/register。FlareSolverr 默认 http://127.0.0.1:8191/v1。只有求解失败时才需要打开注册页手动验证。</p>
+    <p class="form-hint" style="margin-bottom:var(--sp-2)">每个号都先联网过 Cloudflare、提交注册并写入本地账密；确认成功后再切飞行模式换 IP，给下一个号用。内置 FlareSolverr 用隐藏 WebView 过验证，不调用电脑 adb。</p>
     <div class="form-row">
       <div class="form-group"><label class="form-label" for="regSiteUrl">注册站点</label>
         <input class="form-input" id="regSiteUrl" type="url" placeholder="https://office.965007.xyz"></div>

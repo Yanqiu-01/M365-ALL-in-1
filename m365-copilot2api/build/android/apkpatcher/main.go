@@ -45,7 +45,10 @@ func run(cmd string, args []string) error {
 		if err := patchHideNativeChrome(args[0]); err != nil {
 			return err
 		}
-		return patchTurnstileCapture(args[0])
+		if err := patchTurnstileCapture(args[0]); err != nil {
+			return err
+		}
+		return patchFlareSolver(args[0])
 	case "password":
 		if len(args) != 2 {
 			return fmt.Errorf("usage: apkpatcher password <work> <secret-file>")

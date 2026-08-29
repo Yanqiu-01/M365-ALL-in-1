@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -68,5 +69,15 @@ func TestRotateClashSwitchesNodeThenProbesIP(t *testing.T) {
 func TestRotateRejectsUnknownMode(t *testing.T) {
 	if _, err := rotateGo(context.Background(), Request{Mode: "browser"}); err == nil {
 		t.Fatal("expected error")
+	}
+}
+
+func TestUseLocalAirplaneOnAndroidNeverLooksForAdb(t *testing.T) {
+	if useLocalAirplane() {
+		if err := toggleAirplane(context.Background(), "adb"); err == nil {
+			t.Fatal("expected local airplane-mode failure, not a silent adb success")
+		} else if strings.Contains(err.Error(), "adb airplane-mode") {
+			t.Fatalf("android/local path still called adb: %v", err)
+		}
 	}
 }

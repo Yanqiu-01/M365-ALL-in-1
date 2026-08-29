@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log"
 	"m365-copilot2api/internal/outbound"
+	"m365-copilot2api/internal/turnstile"
 	"m365-copilot2api/internal/web"
 	"net/http"
 	"os"
@@ -51,6 +52,15 @@ func main() {
 	// waitForProxyGuard blocks until the patrol has actually returned, so nothing
 	// outlives main.
 	waitForProxyGuard := outbound.StartProxyGuard(ctx)
+	go func() {
+		addr := "127.0.0.1:8191"
+		if v := os.Getenv("M365_FLARESOLVERR_LISTEN"); v != "" {
+			addr = v
+		}
+		if err := turnstile.Listen(ctx, addr); err != nil {
+			log.Printf("built-in FlareSolverr: %v", err)
+		}
+	}()
 	go func() {
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

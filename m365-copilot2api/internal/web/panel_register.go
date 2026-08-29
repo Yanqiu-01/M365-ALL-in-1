@@ -19,7 +19,8 @@ import (
 
 // panelRegisterRequest 是一次 Go 内置注册。Turnstile token 优先由本机
 // FlareSolverr 从注册页取出；调用方仍可手动提供 token 作为回退。
-// 换 IP 与 POST /api/register 由本机完成。
+// 每个号都先联网过 Cloudflare、提交 /api/register 并写入本地账密，
+// 确认成功后再换出口 IP，给下一个号用。
 type panelRegisterRequest struct {
 	Mode           string `json:"mode"`
 	Count          int    `json:"count"`
@@ -111,6 +112,17 @@ func (s *Server) runRegister(ctx context.Context, manager *nativePanelManager, r
 		return report, err
 	}
 
+	proxyURL := firstNonEmpty(request.Proxy, cfg.Register.PhoneSOCKS, cfg.Register.ClashProxy)
+	rotateReq := exitrotate.Request{
+		Mode:        mode,
+		PhoneSOCKS:  cfg.Register.PhoneSOCKS,
+		ClashAPI:    cfg.Register.ClashAPI,
+		ClashSecret: cfg.Register.ClashSecret,
+		ClashGroup:  cfg.Register.ClashGroup,
+		ClashProxy:  cfg.Register.ClashProxy,
+		ClashNode:   firstNonEmpty(request.Node, firstClashNode(cfg)),
+		ProbeProxy:  firstNonEmpty(request.Proxy, cfg.Register.ClashProxy, cfg.Register.PhoneSOCKS),
+	}
 	var lastIP string
 	for i := 0; i < count; i++ {
 		select {
@@ -128,30 +140,6 @@ func (s *Server) runRegister(ctx context.Context, manager *nativePanelManager, r
 			continue
 		}
 
-		rotateReq := exitrotate.Request{
-			Mode:        mode,
-			PrevIP:      lastIP,
-			PhoneSOCKS:  cfg.Register.PhoneSOCKS,
-			ClashAPI:    cfg.Register.ClashAPI,
-			ClashSecret: cfg.Register.ClashSecret,
-			ClashGroup:  cfg.Register.ClashGroup,
-			ClashProxy:  cfg.Register.ClashProxy,
-			ClashNode:   firstNonEmpty(request.Node, firstClashNode(cfg)),
-			ProbeProxy:  firstNonEmpty(request.Proxy, cfg.Register.ClashProxy, cfg.Register.PhoneSOCKS),
-		}
-		rotated, rotateErr := exitrotate.Rotate(ctx, rotateReq)
-		report.Rotate = &rotated
-		if rotateErr != nil && mode != "proxy" {
-			item.Status, item.Detail = "failed", "换 IP 失败: "+rotateErr.Error()
-			report.Failed++
-			report.Accounts = append(report.Accounts, item)
-			continue
-		}
-		if rotated.IP != "" {
-			lastIP = rotated.IP
-			item.IP = rotated.IP
-		}
-
 		displayBase := cfg.Register.DisplayBase
 		if displayBase <= 0 {
 			displayBase = 1
@@ -161,7 +149,10 @@ func (s *Server) runRegister(ctx context.Context, manager *nativePanelManager, r
 			emailStart = start
 		}
 		display := fmt.Sprintf("User%d", num-(emailStart-displayBase))
-		proxyURL := firstNonEmpty(request.Proxy, cfg.Register.PhoneSOCKS, cfg.Register.ClashProxy)
+		if ip, err := probeRegisterIP(ctx, proxyURL); err == nil {
+			item.IP = ip
+			lastIP = ip
+		}
 		token, tokenErr := resolveTurnstileToken(ctx, cfg, request.TurnstileToken, proxyURL)
 		if tokenErr != nil {
 			item.Status, item.Detail = "failed", tokenErr.Error()
@@ -185,10 +176,44 @@ func (s *Server) runRegister(ctx context.Context, manager *nativePanelManager, r
 		item.Status, item.Detail = "success", "registered"
 		report.Success++
 		report.Accounts = append(report.Accounts, item)
+
+		// 先联网过 CF、提交注册并写入本地账密，确认成功后再换出口，
+		// 给下一个号用。开着飞行模式是过不了 Turnstile 的。
+		if i < count-1 && mode != "proxy" {
+			rotateReq.PrevIP = lastIP
+			rotated, rotateErr := rotateExit(ctx, rotateReq)
+			report.Rotate = &rotated
+			if rotated.IP != "" {
+				lastIP = rotated.IP
+			}
+			if rotateErr != nil {
+				for j := i + 1; j < count; j++ {
+					nextNum := start + j
+					nextUser := fmt.Sprintf("%s%d", strings.TrimSpace(cfg.Register.EmailPrefix), nextNum)
+					nextEmail := nextUser + "@" + strings.TrimSpace(cfg.Register.EmailDomain)
+					report.Failed++
+					report.Accounts = append(report.Accounts, panelRegisterAccount{
+						Num: nextNum, Email: nextEmail, Status: "failed",
+						Detail: "上一号已写入本地，但换 IP 失败: " + rotateErr.Error(),
+					})
+				}
+				break
+			}
+		}
 	}
 	report.Total = len(report.Accounts)
 	report.OK = report.Failed == 0 && report.Success > 0
 	return report, nil
+}
+
+var rotateExit = exitrotate.Rotate
+
+func probeRegisterIP(ctx context.Context, proxyURL string) (string, error) {
+	result, err := rotateExit(ctx, exitrotate.Request{Mode: "proxy", ProbeProxy: proxyURL})
+	if err != nil {
+		return "", err
+	}
+	return result.IP, nil
 }
 
 func resolveTurnstileToken(ctx context.Context, cfg nativePanelFileConfig, supplied, proxyURL string) (string, error) {

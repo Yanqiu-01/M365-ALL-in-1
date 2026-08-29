@@ -2,7 +2,7 @@ package exitrotate
 
 // 换出口 IP。原 Python 注册脚本在每次 /api/register 前做这件事：
 //
-//   phone  adb 切飞行模式，走手机 SOCKS5
+//   phone  本机切飞行模式（Android 上绝不调用电脑端 adb），走手机 SOCKS5
 //   clash  PUT Clash 外部控制接口切节点
 //   proxy  调用方自己换代理 URL，这里只负责探测出口 IP
 //
@@ -170,13 +170,25 @@ func rotatePhone(ctx context.Context, req Request) (Result, error) {
 }
 
 func toggleAirplane(ctx context.Context, adbPath string) error {
-	if runtime.GOOS == "android" {
-		if err := runCmd(ctx, "cmd", "connectivity", "airplane-mode", "enable"); err == nil {
+	if useLocalAirplane() {
+		var last error
+		for _, pair := range localAirplaneToggles() {
+			if err := runCmd(ctx, pair[0][0], pair[0][1:]...); err != nil {
+				last = err
+				continue
+			}
 			if err := wait(ctx, phoneSettle); err != nil {
 				return err
 			}
-			return runCmd(ctx, "cmd", "connectivity", "airplane-mode", "disable")
+			if err := runCmd(ctx, pair[1][0], pair[1][1:]...); err != nil {
+				return fmt.Errorf("关闭飞行模式失败: %w", err)
+			}
+			return nil
 		}
+		if last == nil {
+			last = errors.New("no local airplane-mode command")
+		}
+		return fmt.Errorf("本机无法切换飞行模式: %w。请改用 Clash 节点或当前代理，或手动开关飞行模式", last)
 	}
 	adb := firstNonEmpty(adbPath, "adb")
 	if err := runCmd(ctx, adb, "shell", "cmd", "connectivity", "airplane-mode", "enable"); err != nil {
@@ -189,6 +201,57 @@ func toggleAirplane(ctx context.Context, adbPath string) error {
 		return fmt.Errorf("adb airplane-mode disable: %w", err)
 	}
 	return nil
+}
+
+func useLocalAirplane() bool {
+	if runtime.GOOS == "android" {
+		return true
+	}
+	_, err := os.Stat("/system/bin/cmd")
+	return err == nil
+}
+
+func localAirplaneToggles() [][2][]string {
+	cmdBin := firstExisting("/system/bin/cmd", "cmd")
+	settingsBin := firstExisting("/system/bin/settings", "settings")
+	suBin := firstExisting("/system/xbin/su", "/system/bin/su", "su")
+	var pairs [][2][]string
+	if cmdBin != "" {
+		pairs = append(pairs, [2][]string{
+			{cmdBin, "connectivity", "airplane-mode", "enable"},
+			{cmdBin, "connectivity", "airplane-mode", "disable"},
+		})
+	}
+	if suBin != "" && cmdBin != "" {
+		pairs = append(pairs, [2][]string{
+			{suBin, "-c", cmdBin + " connectivity airplane-mode enable"},
+			{suBin, "-c", cmdBin + " connectivity airplane-mode disable"},
+		})
+	}
+	if settingsBin != "" {
+		pairs = append(pairs, [2][]string{
+			{settingsBin, "put", "global", "airplane_mode_on", "1"},
+			{settingsBin, "put", "global", "airplane_mode_on", "0"},
+		})
+	}
+	return pairs
+}
+
+func firstExisting(paths ...string) string {
+	for _, path := range paths {
+		if path == "" {
+			continue
+		}
+		if _, err := os.Stat(path); err == nil {
+			return path
+		}
+		if !strings.Contains(path, "/") {
+			if looked, err := exec.LookPath(path); err == nil {
+				return looked
+			}
+		}
+	}
+	return ""
 }
 
 func rotateClash(ctx context.Context, req Request) (Result, error) {

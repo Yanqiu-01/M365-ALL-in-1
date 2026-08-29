@@ -29,6 +29,7 @@ import (
 	"sync"
 
 	"m365-copilot2api/internal/auth"
+	"m365-copilot2api/internal/turnstile"
 )
 
 const (
@@ -167,7 +168,7 @@ func defaultNativePanelFileConfig() nativePanelFileConfig {
 	cfg.Gateway.Host = "127.0.0.1"
 	cfg.Gateway.Port = 4141
 	cfg.Register.SiteURL = "https://office.965007.xyz"
-	cfg.Register.FlareSolverrURL = "http://127.0.0.1:8191/v1"
+	cfg.Register.FlareSolverrURL = turnstile.DefaultEndpoint
 	cfg.Register.EmailDomain = "office.bo.edu.kg"
 	cfg.Register.EmailPrefix = "24s05"
 	cfg.Register.Password = "***REMOVED-CREDENTIAL***"
@@ -385,7 +386,7 @@ func nativePanelValidEmail(email string) bool {
 
 func (m *nativePanelManager) state(server *Server) map[string]any {
 	// register_supported / batch_oauth_supported 告诉前端：Go 内置实现可用。
-	// 注册仍需要调用方提供 Turnstile token；批量 OAuth 走 ROPC / 设备码 / PKCE。
+	// 注册由内置 FlareSolverr 取 token；批量 OAuth 走 ROPC / 设备码 / PKCE。
 	state := map[string]any{
 		"native_panel":             true,
 		"native_panel_ready":       false,

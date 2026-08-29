@@ -156,11 +156,29 @@ fn rotate_phone(req: &Request) -> std::result::Result<Result, String> {
 }
 
 fn toggle_airplane(adb: &str) -> std::result::Result<(), String> {
-    if cfg!(target_os = "android") {
-        if run(&["cmd", "connectivity", "airplane-mode", "enable"]).is_ok() {
+    if cfg!(target_os = "android") || std::path::Path::new("/system/bin/cmd").exists() {
+        let cmd = if std::path::Path::new("/system/bin/cmd").exists() {
+            "/system/bin/cmd"
+        } else {
+            "cmd"
+        };
+        if run(&[cmd, "connectivity", "airplane-mode", "enable"]).is_ok() {
             thread::sleep(Duration::from_secs(3));
-            return run(&["cmd", "connectivity", "airplane-mode", "disable"]);
+            return run(&[cmd, "connectivity", "airplane-mode", "disable"])
+                .map_err(|e| format!("关闭飞行模式失败: {e}"));
         }
+        let su = ["/system/xbin/su", "/system/bin/su", "su"]
+            .into_iter()
+            .find(|p| *p == "su" || std::path::Path::new(p).exists());
+        if let Some(su) = su {
+            let enable = format!("{cmd} connectivity airplane-mode enable");
+            let disable = format!("{cmd} connectivity airplane-mode disable");
+            if run(&[su, "-c", &enable]).is_ok() {
+                thread::sleep(Duration::from_secs(3));
+                return run(&[su, "-c", &disable]).map_err(|e| format!("关闭飞行模式失败: {e}"));
+            }
+        }
+        return Err("本机无法切换飞行模式。请改用 Clash 节点或当前代理，或手动开关飞行模式".into());
     }
     let bin = if adb.trim().is_empty() { "adb" } else { adb };
     run(&[bin, "shell", "cmd", "connectivity", "airplane-mode", "enable"])?;

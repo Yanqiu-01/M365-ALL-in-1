@@ -55,6 +55,9 @@ func TestSmaliPatchesOnOriginalAPK(t *testing.T) {
 	if err := patchTurnstileCapture(work); err != nil {
 		t.Fatal(err)
 	}
+	if err := patchFlareSolver(work); err != nil {
+		t.Fatal(err)
+	}
 	secret := filepath.Join(t.TempDir(), "admin.txt")
 	if err := patchAdminPassword(work, secret); err != nil {
 		t.Fatal(err)
@@ -106,6 +109,9 @@ func TestSmaliPatchesOnOriginalAPK(t *testing.T) {
 	if !strings.Contains(manifest, `package="com.m365.gateway.pkcego"`) {
 		t.Fatal(manifest[:200])
 	}
+	if !strings.Contains(manifest, "android.permission.CHANGE_NETWORK_STATE") {
+		t.Fatal("CHANGE_NETWORK_STATE missing")
+	}
 	if !strings.Contains(stringsXML, ">修改版M365<") {
 		t.Fatal(stringsXML)
 	}
@@ -118,6 +124,19 @@ func TestSmaliPatchesOnOriginalAPK(t *testing.T) {
 	}
 	if strings.TrimSpace(string(got)) != defaultAdminPassword {
 		t.Fatalf("secret file = %q", got)
+	}
+	if _, err := os.Stat(filepath.Join(work, "smali", "com", "m365", "gateway", "FlareSolver.smali")); err != nil {
+		t.Fatal(err)
+	}
+	gw, err := readFile(filepath.Join(work, "smali", "com", "m365", "gateway", "GatewayService.smali"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(gw, `const-string v8, "PATH"`) {
+		t.Fatal("gateway process PATH was not set")
+	}
+	if !strings.Contains(main, "Lcom/m365/gateway/FlareSolver;-><init>") {
+		t.Fatal("hidden FlareSolver WebView was not started")
 	}
 }
 

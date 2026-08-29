@@ -10,7 +10,18 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"m365-copilot2api/internal/exitrotate"
 )
+
+func stubRotate(t *testing.T) {
+	t.Helper()
+	old := rotateExit
+	t.Cleanup(func() { rotateExit = old })
+	rotateExit = func(ctx context.Context, req exitrotate.Request) (exitrotate.Result, error) {
+		return exitrotate.Result{OK: true, Mode: req.Mode, IP: "1.1.1.1"}, nil
+	}
+}
 
 func writePanelConfig(t *testing.T, root, siteURL string) {
 	t.Helper()
@@ -35,6 +46,7 @@ func writePanelConfig(t *testing.T, root, siteURL string) {
 }
 
 func TestRunRegisterPostsAndWritesCredentials(t *testing.T) {
+	stubRotate(t)
 	var got map[string]any
 	site := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/register" {
@@ -73,6 +85,7 @@ func TestRunRegisterPostsAndWritesCredentials(t *testing.T) {
 }
 
 func TestRunRegisterUsesFlareSolverrWhenTokenMissing(t *testing.T) {
+	stubRotate(t)
 	var got map[string]any
 	site := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/register" {
@@ -125,6 +138,7 @@ func TestRunRegisterUsesFlareSolverrWhenTokenMissing(t *testing.T) {
 }
 
 func TestRunRegisterReportsFlareSolverrFailure(t *testing.T) {
+	stubRotate(t)
 	root := t.TempDir()
 	writePanelConfig(t, root, "http://127.0.0.1:1")
 	cfgPath := filepath.Join(root, "config.json")
@@ -151,6 +165,65 @@ func TestRunRegisterReportsFlareSolverrFailure(t *testing.T) {
 	}
 	if !strings.Contains(report.Accounts[0].Detail, "FlareSolverr") {
 		t.Fatalf("detail = %q", report.Accounts[0].Detail)
+	}
+}
+
+func TestRunRegisterRotatesOnlyAfterSuccessfulWrite(t *testing.T) {
+	var events []string
+	site := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		events = append(events, "register")
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "upn": "ok"})
+	}))
+	defer site.Close()
+	old := rotateExit
+	t.Cleanup(func() { rotateExit = old })
+	rotateExit = func(ctx context.Context, req exitrotate.Request) (exitrotate.Result, error) {
+		events = append(events, req.Mode)
+		return exitrotate.Result{OK: true, Mode: req.Mode, IP: "8.8.8.8"}, nil
+	}
+
+	root := t.TempDir()
+	writePanelConfig(t, root, site.URL)
+	_, err := (&Server{}).runRegister(context.Background(), newNativePanelManager(nativePanelConfig{Root: root}), panelRegisterRequest{
+		Mode: "phone", Count: 2, StartNum: 5026, TurnstileToken: "token-from-browser",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"proxy", "register", "phone", "proxy", "register"}
+	if strings.Join(events, ",") != strings.Join(want, ",") {
+		t.Fatalf("order = %v, want %v", events, want)
+	}
+}
+
+func TestRunRegisterDoesNotRotateAfterFailure(t *testing.T) {
+	var events []string
+	site := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		events = append(events, "register")
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "message": "taken"})
+	}))
+	defer site.Close()
+	old := rotateExit
+	t.Cleanup(func() { rotateExit = old })
+	rotateExit = func(ctx context.Context, req exitrotate.Request) (exitrotate.Result, error) {
+		events = append(events, req.Mode)
+		return exitrotate.Result{OK: true, Mode: req.Mode, IP: "8.8.8.8"}, nil
+	}
+	root := t.TempDir()
+	writePanelConfig(t, root, site.URL)
+	report, err := (&Server{}).runRegister(context.Background(), newNativePanelManager(nativePanelConfig{Root: root}), panelRegisterRequest{
+		Mode: "phone", Count: 2, StartNum: 5026, TurnstileToken: "token-from-browser",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Success != 0 || report.Failed != 2 {
+		t.Fatalf("report = %#v", report)
+	}
+	for _, event := range events {
+		if event == "phone" {
+			t.Fatalf("airplane-mode ran after a failed register: %v", events)
+		}
 	}
 }
 
