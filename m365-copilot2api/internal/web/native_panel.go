@@ -123,16 +123,8 @@ func ensureNativePanelConfigFile(path string) error {
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("%w: config.json is unavailable", errNativePanelUnavailable)
 	}
-	body := []byte(`{
-  "gateway": {"host": "127.0.0.1", "port": 4141},
-  "register": {
-    "email_domain": "",
-    "email_prefix": "",
-    "password": "",
-    "cred_file": "credentials.txt"
-  }
-}
-`)
+	body, _ := json.MarshalIndent(defaultNativePanelFileConfig(), "", "  ")
+	body = append(body, '\n')
 	if err := os.WriteFile(path, body, 0o600); err != nil {
 		return fmt.Errorf("%w: write default config.json: %v", errNativePanelUnavailable, err)
 	}
@@ -169,6 +161,71 @@ type nativePanelFileConfig struct {
 	} `json:"register"`
 }
 
+func defaultNativePanelFileConfig() nativePanelFileConfig {
+	var cfg nativePanelFileConfig
+	cfg.Gateway.Host = "127.0.0.1"
+	cfg.Gateway.Port = 4141
+	cfg.Register.SiteURL = "https://office.965007.xyz"
+	cfg.Register.EmailDomain = "office.bo.edu.kg"
+	cfg.Register.EmailPrefix = "24s05"
+	cfg.Register.Password = "***REMOVED-CREDENTIAL***"
+	cfg.Register.PlanID = "1"
+	cfg.Register.DomainID = "1"
+	cfg.Register.EmailStartNum = 1000
+	cfg.Register.DisplayBase = 1
+	cfg.Register.CredentialFile = "credentials.txt"
+	return cfg
+}
+
+func (p nativePanelPaths) saveConfig(cfg nativePanelFileConfig) error {
+	if strings.TrimSpace(cfg.Register.CredentialFile) == "" {
+		cfg.Register.CredentialFile = "credentials.txt"
+	}
+	body, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode panel configuration: %w", err)
+	}
+	body = append(body, '\n')
+	if err := os.WriteFile(p.configPath, body, 0o600); err != nil {
+		return fmt.Errorf("write panel configuration: %w", err)
+	}
+	return nil
+}
+
+type nativePanelRegisterConfigRequest struct {
+	SiteURL       string `json:"siteUrl"`
+	EmailDomain   string `json:"emailDomain"`
+	EmailPrefix   string `json:"emailPrefix"`
+	Password      string `json:"password"`
+	EmailStartNum int    `json:"emailStartNum"`
+}
+
+func (m *nativePanelManager) saveRegisterConfig(req nativePanelRegisterConfigRequest) (nativePanelFileConfig, error) {
+	paths, cfg, err := m.panelData()
+	if err != nil {
+		return nativePanelFileConfig{}, err
+	}
+	if v := strings.TrimSpace(req.SiteURL); v != "" {
+		cfg.Register.SiteURL = strings.TrimRight(v, "/")
+	}
+	if v := strings.TrimSpace(req.EmailDomain); v != "" {
+		cfg.Register.EmailDomain = strings.TrimPrefix(v, "@")
+	}
+	if v := strings.TrimSpace(req.EmailPrefix); v != "" {
+		cfg.Register.EmailPrefix = v
+	}
+	if v := strings.TrimSpace(req.Password); v != "" {
+		cfg.Register.Password = v
+	}
+	if req.EmailStartNum > 0 {
+		cfg.Register.EmailStartNum = req.EmailStartNum
+	}
+	if err := paths.saveConfig(cfg); err != nil {
+		return nativePanelFileConfig{}, err
+	}
+	return cfg, nil
+}
+
 func (p nativePanelPaths) loadConfig() (nativePanelFileConfig, error) {
 	f, err := os.Open(p.configPath)
 	if err != nil {
@@ -179,7 +236,49 @@ func (p nativePanelPaths) loadConfig() (nativePanelFileConfig, error) {
 	if err := json.NewDecoder(io.LimitReader(f, nativePanelMaxConfig)).Decode(&cfg); err != nil {
 		return nativePanelFileConfig{}, fmt.Errorf("%w: panel configuration is invalid", errNativePanelUnavailable)
 	}
+	if applyRegisterDefaults(&cfg) {
+		_ = p.saveConfig(cfg)
+	}
 	return cfg, nil
+}
+
+func applyRegisterDefaults(cfg *nativePanelFileConfig) bool {
+	if cfg == nil {
+		return false
+	}
+	def := defaultNativePanelFileConfig()
+	changed := false
+	fill := func(dst *string, src string) {
+		if strings.TrimSpace(*dst) == "" && src != "" {
+			*dst = src
+			changed = true
+		}
+	}
+	fill(&cfg.Register.SiteURL, def.Register.SiteURL)
+	fill(&cfg.Register.EmailDomain, def.Register.EmailDomain)
+	fill(&cfg.Register.EmailPrefix, def.Register.EmailPrefix)
+	fill(&cfg.Register.Password, def.Register.Password)
+	if strings.TrimSpace(cfg.Register.CredentialFile) == "" {
+		cfg.Register.CredentialFile = def.Register.CredentialFile
+		changed = true
+	}
+	if cfg.Register.PlanID == "" {
+		cfg.Register.PlanID = def.Register.PlanID
+		changed = true
+	}
+	if cfg.Register.DomainID == "" {
+		cfg.Register.DomainID = def.Register.DomainID
+		changed = true
+	}
+	if cfg.Gateway.Host == "" {
+		cfg.Gateway.Host = def.Gateway.Host
+		changed = true
+	}
+	if cfg.Gateway.Port == 0 {
+		cfg.Gateway.Port = def.Gateway.Port
+		changed = true
+	}
+	return changed
 }
 
 func nativePanelExpandHome(raw string) string {
@@ -330,6 +429,8 @@ func (m *nativePanelManager) state(server *Server) map[string]any {
 	state["email_prefix"] = strings.TrimSpace(cfg.Register.EmailPrefix)
 	state["email_domain"] = strings.TrimSpace(cfg.Register.EmailDomain)
 	state["email_start_num"] = cfg.Register.EmailStartNum
+	state["site_url"] = strings.TrimSpace(cfg.Register.SiteURL)
+	state["register_password"] = cfg.Register.Password
 	return state
 }
 
@@ -402,6 +503,29 @@ func (c *nativePanelController) ServeHTTP(w http.ResponseWriter, r *http.Request
 			return
 		}
 		jsonOut(w, c.manager.state(c.server))
+	case "/api/admin/panel/config":
+		if r.Method != http.MethodPost && r.Method != http.MethodPut {
+			w.Header().Set("Allow", "POST, PUT")
+			writeOpenAIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "POST or PUT required")
+			return
+		}
+		var body nativePanelRegisterConfigRequest
+		if !nativePanelDecodeJSON(w, r, &body, false) {
+			return
+		}
+		cfg, err := c.manager.saveRegisterConfig(body)
+		if err != nil {
+			writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+			return
+		}
+		jsonOut(w, map[string]any{
+			"ok":             true,
+			"register_ready": cfg.registerReady(),
+			"siteUrl":        cfg.Register.SiteURL,
+			"emailDomain":    cfg.Register.EmailDomain,
+			"emailPrefix":    cfg.Register.EmailPrefix,
+			"emailStartNum":  cfg.Register.EmailStartNum,
+		})
 	case "/api/admin/panel/register":
 		if r.Method != http.MethodPost {
 			w.Header().Set("Allow", http.MethodPost)
@@ -496,6 +620,7 @@ func (s *Server) RegisterNativePanelRoutes(mux *http.ServeMux) {
 		"/api/admin/panel/oauth",
 		"/api/admin/panel/oauth/batch",
 		"/api/admin/panel/register",
+		"/api/admin/panel/config",
 	}
 	for path := range nativePanelRemovedRoutes {
 		paths = append(paths, path)

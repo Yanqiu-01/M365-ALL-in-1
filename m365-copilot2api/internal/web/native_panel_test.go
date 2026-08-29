@@ -62,6 +62,7 @@ func TestRegisterNativePanelRoutesCoversRemovedPaths(t *testing.T) {
 		"/api/admin/panel/state",
 		"/api/admin/panel/oauth",
 		"/api/admin/panel/register",
+		"/api/admin/panel/config",
 		"/api/admin/panel/oauth/batch",
 		"/api/admin/panel/job/poll",
 		"/api/admin/panel/job/stop",
@@ -105,6 +106,48 @@ func TestNativePanelPathsCreatesMissingDataDir(t *testing.T) {
 	state := newNativePanelManager(nativePanelConfig{Root: root}).state(nil)
 	if ready, _ := state["native_panel_ready"].(bool); !ready {
 		t.Fatalf("auto-created data dir should be ready: %#v", state)
+	}
+	if ready, _ := state["register_ready"].(bool); !ready {
+		t.Fatalf("default register config should be ready: %#v", state)
+	}
+	if state["site_url"] != "https://office.965007.xyz" || state["email_prefix"] != "24s05" {
+		t.Fatalf("default register fields = %#v", state)
+	}
+}
+
+func TestNativePanelSaveRegisterConfig(t *testing.T) {
+	root := t.TempDir()
+	manager := newNativePanelManager(nativePanelConfig{Root: root})
+	cfg, err := manager.saveRegisterConfig(nativePanelRegisterConfigRequest{
+		SiteURL: "https://office.example.test/", EmailDomain: "@office.example.test",
+		EmailPrefix: "user", Password: "changed", EmailStartNum: 2000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Register.SiteURL != "https://office.example.test" {
+		t.Fatalf("site url = %q", cfg.Register.SiteURL)
+	}
+	if cfg.Register.EmailDomain != "office.example.test" || cfg.Register.EmailPrefix != "user" || cfg.Register.Password != "changed" {
+		t.Fatalf("saved = %#v", cfg.Register)
+	}
+	if cfg.Register.EmailStartNum != 2000 {
+		t.Fatalf("start num = %d", cfg.Register.EmailStartNum)
+	}
+}
+
+func TestNativePanelLoadFillsEmptyRegisterFields(t *testing.T) {
+	root := t.TempDir()
+	empty := `{"gateway":{"host":"127.0.0.1","port":4141},"register":{"email_domain":"","email_prefix":"","password":"","cred_file":"credentials.txt"}}`
+	if err := os.WriteFile(filepath.Join(root, "config.json"), []byte(empty), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	state := newNativePanelManager(nativePanelConfig{Root: root}).state(nil)
+	if ready, _ := state["register_ready"].(bool); !ready {
+		t.Fatalf("empty config should be filled with defaults: %#v", state)
+	}
+	if state["site_url"] != "https://office.965007.xyz" {
+		t.Fatalf("site_url = %v", state["site_url"])
 	}
 }
 

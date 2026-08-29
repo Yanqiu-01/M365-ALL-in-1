@@ -268,6 +268,10 @@ func (s *Server) adminSettings(w http.ResponseWriter, r *http.Request) {
 			writeOpenAIError(w, 400, "invalid_request_error", e.Error())
 			return
 		}
+		if e := outbound.Configure(v.OutboundProxy); e != nil {
+			writeOpenAIError(w, 400, "invalid_request_error", e.Error())
+			return
+		}
 		chathub.SetClientProfile(v.ClientProfile)
 		chathub.EnableWireCapture(v.CaptureRouterFrames)
 		jsonOut(w, map[string]any{"ok": true, "settings": v})

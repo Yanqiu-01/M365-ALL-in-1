@@ -1092,9 +1092,11 @@ textarea.form-input{min-height:80px;line-height:var(--lh-normal);resize:vertical
    -------------------------------------------------------------------------*/
 
 /* 关键指标卡：仪表盘首屏主层级，比 .stat 更重（图标 + 大数 + 副值） */
-.kpi-stack{grid-template-columns:1fr}
 .kpi{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:var(--sp-3);
   margin-bottom:var(--sp-4)}
+.kpi.kpi-stack{grid-template-columns:1fr}
+details.card>summary{display:flex;align-items:center;justify-content:space-between;gap:var(--sp-2)}
+details.card>summary::-webkit-details-marker{display:none}
 .kpi-card{background:var(--surface);
   -webkit-backdrop-filter:blur(calc(var(--glass-blur) * 1.5)) saturate(180%);backdrop-filter:blur(calc(var(--glass-blur) * 1.5)) saturate(180%);
   border:1px solid var(--surface-border);border-radius:var(--radius);
@@ -1387,6 +1389,7 @@ textarea.form-input{min-height:80px;line-height:var(--lh-normal);resize:vertical
 
   /* 合并后的仪表盘 KPI 降两列 */
   .kpi{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .kpi.kpi-stack{grid-template-columns:1fr}
   /* 对话：列表铺满，详情升为全屏覆盖层，靠返回按钮回列表 */
   .conv-split{grid-template-columns:1fr}
   .conv-list-body{max-height:none}
@@ -1481,6 +1484,7 @@ textarea.form-input{min-height:80px;line-height:var(--lh-normal);resize:vertical
 
   .kpi{grid-template-columns:repeat(2,minmax(0,1fr));gap:var(--sp-2);
     margin-bottom:var(--sp-3)}
+  .kpi.kpi-stack{grid-template-columns:1fr}
   .kpi-card{padding:var(--sp-3);gap:var(--sp-2)}
   .kpi-ico{width:30px;height:30px}
   .kpi-value{font-size:calc(21px * var(--fs-scale))}
@@ -2116,6 +2120,21 @@ if (response.output_text) {
   <div class="card-head"><h3 class="card-title">注册新账号</h3><span class="card-note" id="panelRegState"></span></div>
   <div class="card-body">
     <p class="form-hint" style="margin-bottom:var(--sp-2)">Go 内置注册：先换出口 IP（手机飞行模式 / Clash 节点 / 当前代理），再 POST 站点 /api/register。Cloudflare Turnstile token 仍须从浏览器拿到，网关不再内嵌 Chromium。</p>
+    <div class="form-row">
+      <div class="form-group"><label class="form-label" for="regSiteUrl">注册站点</label>
+        <input class="form-input" id="regSiteUrl" type="url" placeholder="https://office.965007.xyz"></div>
+      <div class="form-group"><label class="form-label" for="regEmailDomain">邮箱域名</label>
+        <input class="form-input" id="regEmailDomain" placeholder="office.bo.edu.kg"></div>
+    </div>
+    <div class="form-row">
+      <div class="form-group"><label class="form-label" for="regEmailPrefix">邮箱前缀</label>
+        <input class="form-input" id="regEmailPrefix" placeholder="24s05"></div>
+      <div class="form-group"><label class="form-label" for="regPassword">统一密码</label>
+        <input class="form-input" id="regPassword" type="password" autocomplete="new-password" placeholder="注册账号密码"></div>
+    </div>
+    <div class="btn-row" style="margin-bottom:var(--sp-3)">
+      <button type="button" class="btn" onclick="saveRegisterConfig()">保存注册配置</button>
+    </div>
     <div style="display:flex;gap:var(--sp-3);flex-wrap:wrap;align-items:flex-end">
       <div class="form-group" style="margin:0;min-width:130px"><label class="form-label" for="regMode">注册模式</label>
         <select class="form-input" id="regMode"><option value="phone">手机换IP</option><option value="clash">Clash 节点</option><option value="proxy">当前代理</option></select></div>
@@ -2370,6 +2389,7 @@ if (response.output_text) {
               </div>
             </div>
             <div class="btn-row">
+              <button type="button" class="btn" onclick="saveHunterSources()">保存来源</button>
               <button type="button" class="btn primary" id="proxyHunterBtn" onclick="proxyHunterImport()">开始猎取并导入</button>
             </div>
             <p class="form-hint" style="margin-top:var(--sp-2)">失败节点不会入池。来源站点常按 IP 限流，页数越大越慢。</p>
@@ -2417,6 +2437,9 @@ if (response.output_text) {
             </table>
           </div>
         </div></div>
+        <details class="card" id="benchDetails">
+        <summary class="card-head" style="cursor:pointer;list-style:none"><h3 class="card-title">能力评测（默认收起）</h3><span class="card-note">后端仍保留，点开后运行</span></summary>
+        <div class="card-body">
         <div class="page-head">
           <div>
             <h2 class="page-title">能力评测</h2>
@@ -2454,6 +2477,8 @@ if (response.output_text) {
           <b style="font-size:var(--fs-base)">运行日志</b>
           <pre class="log-pre" id="benchLog" tabindex="0" aria-label="评测运行日志">开始评测后显示每一步工具调用。</pre>
         </div></div>
+        </div>
+        </details>
       </section>
 
       <!-- ================= 设置 ================= -->
@@ -2590,6 +2615,17 @@ if (response.output_text) {
           </div>
         </div>
 
+        <div class="card">
+          <div class="card-head"><h3 class="card-title">保底出口</h3><span class="card-note">池子全挂时走这一条</span></div>
+          <div class="card-body">
+            <label class="form-label" for="setFallbackProxy">保底 / 直连出口</label>
+            <input class="form-input" id="setFallbackProxy" placeholder="socks5://127.0.0.1:1080 或留空直连">
+            <p class="form-hint">对应 M365_OUTBOUND_PROXY。代理池全部不可用时回落到这里；留空则本机直连。</p>
+          </div>
+        </div>
+        <details class="card" id="advancedSettings">
+        <summary class="card-head" style="cursor:pointer;list-style:none"><h3 class="card-title">高级运行参数</h3><span class="card-note">默认收起</span></summary>
+        <div class="card-body">
         <div class="set-grid">
         <div class="card"><div class="card-body">
           <p class="card-section-label">即时生效</p>
@@ -2749,6 +2785,8 @@ if (response.output_text) {
         <div class="btn-row" style="margin-top:var(--sp-4)">
           <button type="button" class="btn primary" onclick="saveSettings()">保存设置</button>
         </div>
+        </div>
+        </details>
       </section>
     </div>
   </main>
@@ -3049,7 +3087,7 @@ function showPage(p){
   // 请求明细页：拉一次明细并启动实时指标轮询；离开该页时停轮询。
   if(p==='requests'){loadUsageLogs();startLiveMetrics();}else{stopLiveMetrics();}
   if(p==='conversations')loadConversations();
-  if(p==='proxies'){fillHunterSources();loadProxies();}
+  if(p==='proxies'){fillHunterSources();restoreHunterPrefs();loadProxies();}
   if(p==='benchmark'){loadBenchmark();loadModelTest();}
   if(p==='settings')loadSettings();
   const box=$('termBox');
@@ -3119,6 +3157,7 @@ async function loadSettings(){
     setChk('setCleanupDisabled',s.autoCleanupDisabled);
     setVal('setPersistInterval',s.persistInterval);
     setChk('setHttpTraceVerbose',s.httpTraceVerbose);
+    setVal('setFallbackProxy', s.outboundProxy && s.outboundProxy.indexOf('***')>=0 ? '' : s.outboundProxy);
   }catch(e){showNotice(e.message,'error');}
 }
 
@@ -5199,7 +5238,29 @@ const PROXY_HUNTER_SOURCES=[
 ];
 function fillHunterSources(){
   const el=$('proxyHunterSources');
-  if(el && !el.value.trim()) el.value=PROXY_HUNTER_SOURCES.join('\n');
+  if(!el)return;
+  if(el.value.trim())return;
+  try{
+    const saved=localStorage.getItem('m365_hunter_sources');
+    if(saved && saved.trim()){el.value=saved;return;}
+  }catch(e){}
+  el.value=PROXY_HUNTER_SOURCES.join('\n');
+}
+function restoreHunterPrefs(){
+  const apply=(id,key)=>{ const el=$(id); if(!el)return; try{ const v=localStorage.getItem(key); if(v) el.value=v; }catch(e){} };
+  apply('proxyHunterLimit','m365_hunter_limit');
+  apply('proxyHunterPages','m365_hunter_pages');
+  apply('proxyHunterScheme','m365_hunter_scheme');
+}
+function saveHunterSources(){
+  const el=$('proxyHunterSources');
+  const value=(el?.value||'').trim();
+  if(!value){showNotice('来源不能为空','error');return;}
+  try{localStorage.setItem('m365_hunter_sources', value);}catch(e){}
+  try{localStorage.setItem('m365_hunter_limit', $('proxyHunterLimit')?.value||'');}catch(e){}
+  try{localStorage.setItem('m365_hunter_pages', $('proxyHunterPages')?.value||'');}catch(e){}
+  try{localStorage.setItem('m365_hunter_scheme', $('proxyHunterScheme')?.value||'');}catch(e){}
+  showNotice('猎手来源已保存到本机','success');
 }
 async function proxyHunterImport(){
   fillHunterSources();
@@ -5584,6 +5645,11 @@ async function saveSettings(){  try{
     put('autoCleanupDisabled',chk('setCleanupDisabled'));
     put('persistInterval',str('setPersistInterval'));
     put('httpTraceVerbose',chk('setHttpTraceVerbose'));
+    const fallback=str('setFallbackProxy');
+    const currentProxy=loadedSettings.outboundProxy||'';
+    const wasRedacted=String(currentProxy).indexOf('***')>=0;
+    if(wasRedacted){ if(fallback) put('outboundProxy', fallback); }
+    else if(fallback!==undefined && fallback!==currentProxy) put('outboundProxy', fallback);
     if(!Object.keys(body).length){showNotice('没有需要保存的改动','info');return;}
     const touched=Object.keys(body).filter(k=>restartFields.includes(k));
     if(touched.length&&!confirm('修改 '+touched.join('、')+' 需要重启服务，重启后需要重新登录。继续？'))return;
@@ -6134,10 +6200,30 @@ async function loadPanelState(){
       if(d.cred_num_min&&d.cred_num_max)bits.push('编号 '+d.cred_num_min+'-'+d.cred_num_max);
       note.textContent=bits.join(' · ');
     }
+    const fill=(id,val)=>{ const el=$(id); if(el && val && !el.value) el.value=val; };
+    fill('regSiteUrl', d.site_url);
+    fill('regEmailDomain', d.email_domain);
+    fill('regEmailPrefix', d.email_prefix);
+    fill('regPassword', d.register_password);
     const rs=$('regStartNum'),os=$('oauthStartNum');
     if(rs&&!rs.value&&d.cred_num_max)rs.value=d.cred_num_max+1;
+    else if(rs&&!rs.value&&d.email_start_num)rs.value=d.email_start_num;
     if(os&&!os.value&&d.cred_num_min)os.value=d.cred_num_min;
   }catch(e){}
+}
+async function saveRegisterConfig(){
+  const body={
+    siteUrl:($('regSiteUrl')?.value||'').trim(),
+    emailDomain:($('regEmailDomain')?.value||'').trim(),
+    emailPrefix:($('regEmailPrefix')?.value||'').trim(),
+    password:($('regPassword')?.value||'').trim(),
+    emailStartNum:parseInt($('regStartNum')?.value)||0
+  };
+  try{
+    const d=await api('/api/admin/panel/config',{method:'POST',body:JSON.stringify(body)});
+    showNotice(d.register_ready?'注册配置已保存':'已保存，但仍缺必填项','success');
+    loadPanelState();
+  }catch(e){showNotice(e.message||String(e),'error');}
 }
 async function panelStartRegister(){
   const body={mode:$('regMode')?.value||'phone',count:parseInt($('regCount')?.value)||1,startNum:parseInt($('regStartNum')?.value)||0,turnstileToken:($('regTurnstile')?.value||'').trim()};
