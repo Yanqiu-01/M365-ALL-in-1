@@ -62,16 +62,12 @@
 </style>
 </head>
 <body>
-<header><h1>M365 面板</h1><span class="sub">v3.0.1 · 注册 · 授权导入 · 调度 · 账本</span></header>
+<header><h1>M365 面板</h1><span class="sub">授权导入 · 调度 · 账本</span></header>
 <main>
   <div class="cards">
-    <div class="card"><h3>账密文件账号</h3><div class="big" id="credTotal">-</div></div>
+    <div class="card"><h3>账密文件账号</h3><div class="big" id="credTotal">-</div>
+      <div class="hint" id="credHint"></div></div>
     <div class="card"><h3>网关在线</h3><div class="big" id="gwOnline" data-err="0">-</div><div class="hint" id="gwHint"></div></div>
-    <div class="card"><h3>本地授权记录</h3><div class="big" id="oauthDone">-</div>
-      <div class="hint">失败 <span id="oauthFailCount">-</span> · 仅本机日志,账号是否可用以网关为准</div></div>
-    <div class="card"><h3>任务</h3><div class="big" id="jobState">空闲</div><div class="hint" id="jobKind"></div>
-      <div class="progress"><i id="jobProg"></i></div>
-      <p class="hint" id="jobStart"></p></div>
   </div>
 
   <section>
@@ -98,83 +94,39 @@
         <h3>贡献账本（近 30 天）</h3>
         <div class="table-wrap"><table>
           <thead><tr><th>资源账号</th><th>请求</th><th>成功 / 失败</th><th>Token</th><th>累计耗时</th></tr></thead>
-          <tbody id="ledgerRows"><tr><td colspan="5" class="mut">暂无数据</td></tr></tbody>
+          <tbody id="ledgerRows"><tr><td colspan="5" class="mut">近 30 天暂无调用记录</td></tr></tbody>
         </table></div>
       </div>
     </div>
   </section>
 
-  <div class="twocol">
-    <section>
-      <h2>注册新账号</h2>
-      <div class="row">
-        <label>出口方式</label>
-        <select id="regMode">
-          <option value="phone">手机 LTE (v3)</option>
-          <option value="clash">Clash 机场 (v2)</option>
-          <option value="proxy">DE 代理池 (v1)</option>
-        </select>
-        <label>数量</label>
-        <input id="regCount" type="number" min="1" max="20" value="1">
-        <button class="btn" id="regBtn" onclick="startRegister()">开始注册</button>
-      </div>
-      <p class="hint">每 IP 24h 仅成功 1 次。成功后账号写入 <b>桌面\IP出口\M365账密.txt</b>。</p>
-    </section>
-
-    <section>
-      <h2>OAuth 授权导入</h2>
-      <p class="hint">手机端优先使用网关原生授权。系统会先尝试无需浏览器的授权；如账号要求交互登录,将打开 Microsoft 登录页并由应用接收回调。</p>
-      <div class="row">
-        <input id="oauthEmail" type="email" autocomplete="username" placeholder="Microsoft 账号邮箱" style="min-width:240px;flex:1">
-        <input id="oauthPassword" type="password" autocomplete="current-password" placeholder="账号密码" style="min-width:200px;flex:1">
-        <button class="btn" id="oauthBtn" onclick="startNativeOauth()">手机授权导入</button>
-      </div>
-      <label class="hint" style="display:flex;align-items:center;gap:8px;margin-top:8px">
-        <input id="oauthSaveCredential" type="checkbox"> 将密码加密保存在本机,供以后重新授权使用
-      </label>
-      <div id="nativeOauthState" class="hint" style="margin-top:8px"></div>
-      <details>
-        <summary class="hint mut" style="cursor:pointer;margin-top:10px">桌面 Python 自动化兼容模式</summary>
-        <p class="hint">该模式依赖 Python、Playwright 和桌面 Chromium,不适用于当前仅包含 Go 网关的 Android APK。</p>
-        <div class="row" style="margin-top:6px">
-          <button class="btn gray" onclick="startOauth()">运行单账号 Python OAuth</button>
-          <button class="btn gray" onclick="startOauthBatch()">对未授权账号批量 OAuth</button>
-        </div>
-      </details>
-    </section>
-  </div>
-
   <section>
-    <h2>运行日志</h2>
-    <div class="row"><button class="btn gray" id="stopBtn" onclick="stopJob()">停止任务</button></div>
-    <pre class="log" id="jobLog"></pre>
+    <h2>OAuth 授权导入</h2>
+    <p class="hint">由网关内置的 Go 授权流程完成，不需要本机安装 Python 或浏览器自动化组件。系统会先尝试无需交互的授权；如账号要求交互登录,将打开 Microsoft 登录页并由应用接收回调。</p>
+    <div class="row">
+      <input id="oauthEmail" type="email" autocomplete="username" placeholder="Microsoft 账号邮箱" style="min-width:240px;flex:1">
+      <input id="oauthPassword" type="password" autocomplete="current-password" placeholder="账号密码" style="min-width:200px;flex:1">
+      <button class="btn" id="oauthBtn" onclick="startNativeOauth()">授权导入</button>
+    </div>
+    <label class="hint" style="display:flex;align-items:center;gap:8px;margin-top:8px">
+      <input id="oauthSaveCredential" type="checkbox"> 将密码加密保存在本机,供以后重新授权使用
+    </label>
+    <div id="nativeOauthState" class="hint" style="margin-top:8px"></div>
+    <p class="hint" style="margin-top:10px">账号注册与批量授权已不在网关内提供：原实现依赖 Python、Playwright 与桌面 Chromium，Android 环境无法运行。请在其他环境完成注册，再在此处逐个授权导入。</p>
   </section>
 
-  <div class="twocol">
-    <section><h2>网关在线账号</h2><div id="gwList" class="mut">–</div></section>
-    <section><h2>OAuth 进度 / 失败</h2><div id="oauthList" class="mut">–</div></section>
-  </div>
+  <section><h2>网关在线账号</h2><div id="gwList" class="mut">–</div></section>
 </main>
 <footer>M365 本地控制面板 · 所有凭据仅本机处理</footer>
 
 <script>
-let currentLogCount = 0;
-async function api(path, body){
-  const r = await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});
-  return r.json().catch(()=>({}));
-}
 function esc(s){return String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
 function pill(s){
   if(s==='online'||s==='success'||s==='ok'||s==='authenticated') return `<span class="pill on">${s}</span>`;
   if(s.includes('fail')||s.includes('err')||s.includes('exc')||s==='timeout'||s.includes('captcha')||s.includes('locked')) return `<span class="pill fail">${s}</span>`;
   return `<span class="pill mut">${s}</span>`;
 }
-async function startRegister(){
-  setBusy('regBtn',true);
-  const r = await api('/api/admin/panel/register',{mode:document.getElementById('regMode').value,count:document.getElementById('regCount').value});
-  if(!r.ok){alert(r.error||'启动失败');}
-  setBusy('regBtn',false); poll();
-}
+function setBusy(id,on){const el=document.getElementById(id);if(el)el.disabled=on;}
 let nativeOauthTimer = 0;
 function setNativeOauthState(text, bad=false){
   const el=document.getElementById('nativeOauthState');
@@ -210,7 +162,7 @@ async function startNativeOauth(){
   const saveCredential=document.getElementById('oauthSaveCredential').checked;
   if(!email||!password){alert('请输入邮箱和密码');return;}
   setBusy('oauthBtn',true);
-  setNativeOauthState('正在尝试手机原生授权…');
+  setNativeOauthState('正在通过网关内置授权流程处理…');
   try{
     const response=await fetch('/api/accounts/web/run-scripts',{
       method:'POST',
@@ -242,22 +194,6 @@ async function startNativeOauth(){
   }
   setBusy('oauthBtn',false);
 }
-async function startOauth(){
-  const email=document.getElementById('oauthEmail').value.trim();
-  if(!email){alert('请输入邮箱');return;}
-  setBusy('oauthBtn',true);
-  const r = await api('/api/admin/panel/oauth',{email});
-  if(!r.ok){alert(r.error||'启动失败');}
-  setBusy('oauthBtn',false); poll();
-}
-async function startOauthBatch(){
-  const r = await fetch('/api/admin/panel/oauth/batch',{method:'POST'});
-  const j = await r.json();
-  if(!j.ok) alert(j.error||'启动失败');
-  poll();
-}
-async function stopJob(){ await api('/api/admin/panel/job/stop'); poll(); }
-function setBusy(id,on){const el=document.getElementById(id);if(el)el.disabled=on;}
 async function refreshResources(){
   try{
     const [statusResponse,ledgerResponse]=await Promise.all([
@@ -293,45 +229,25 @@ async function refreshResources(){
   }
 }
 async function poll(){
-  // 先排空子进程 stdout, 让日志实时
-  try { await fetch('/api/admin/panel/job/poll'); } catch(e){}
   try{
     const response=await fetch('/api/admin/panel/state');
     if(!response.ok) throw new Error('HTTP '+response.status);
     const s=await response.json();
-    const oauthDone=Array.isArray(s.oauth_done)?s.oauth_done:[];
-    const oauthFails=Array.isArray(s.oauth_fails)?s.oauth_fails:[];
     const gwEmails=Array.isArray(s.gw_emails)?s.gw_emails:[];
-    const job=s.job||{running:false,kind:'',started:0,log:[]};
-    const jobLog=Array.isArray(job.log)?job.log:[];
     document.getElementById('credTotal').textContent = Number(s.cred_total||0);
     document.getElementById('gwOnline').textContent = Number(s.gw_online||0);
+    // 账密清单是账密补齐的数据来源；号段让用户确认清单覆盖范围。
+    const credHint=document.getElementById('credHint');
+    if(s.cred_num_min&&s.cred_num_max){
+      credHint.textContent='编号 '+s.cred_num_min+'-'+s.cred_num_max;
+    } else credHint.textContent = s.native_panel_ready?'':'未找到本机账密清单';
     const gwh=document.getElementById('gwHint');
     gwh.textContent = s.gw_error || s.native_panel_error || '';
     gwh.classList.toggle('bad', !!(s.gw_error||s.native_panel_error));
-    document.getElementById('oauthDone').textContent = oauthDone.length;
-    document.getElementById('oauthFailCount').textContent = oauthFails.length;
-    const js = document.getElementById('jobState');
-    js.textContent = job.running ? '运行中' : '空闲';
-    js.className = 'big ' + (job.running?'ok':'mut');
-    document.getElementById('jobKind').textContent = job.kind || '';
-    document.getElementById('jobStart').textContent = job.started?('开始 '+new Date(job.started*1000).toLocaleTimeString()):'';
     const gwl=document.getElementById('gwList');
     if(gwEmails.length){
       gwl.innerHTML = gwEmails.map(e=>`<div>${esc(e)}</div>`).join('');
     } else gwl.textContent = s.gw_error || '–';
-    const mapa={};
-    oauthDone.forEach(r=>mapa[r.email]=['online',r]);
-    oauthFails.forEach(r=>{if(!mapa[r.email])mapa[r.email]=['fail',r];});
-    const olist=document.getElementById('oauthList');
-    const emails=Object.keys(mapa).sort();
-    olist.innerHTML = emails.length?emails.map(e=>`<div>${esc(e)} ${pill(mapa[e][0])}</div>`).join(''):'–';
-    const log=document.getElementById('jobLog');
-    if(jobLog.length!==currentLogCount){
-      log.textContent = jobLog.join('\n');
-      currentLogCount = jobLog.length;
-      log.scrollTop = log.scrollHeight;
-    }
   }catch(error){
     const gwh=document.getElementById('gwHint');
     gwh.textContent='面板状态暂不可用: '+error.message;

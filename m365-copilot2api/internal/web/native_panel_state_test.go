@@ -21,7 +21,7 @@ func TestNativePanelStateReturnsCompleteGatewayEmailSet(t *testing.T) {
 		}
 	}
 
-	manager := newNativePanelManager(nativePanelConfig{}, nil)
+	manager := newNativePanelManager(nativePanelConfig{})
 	state := manager.state(&Server{tokens: store})
 	emails, ok := state["gw_emails"].([]string)
 	if !ok {

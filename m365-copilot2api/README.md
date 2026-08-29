@@ -57,7 +57,6 @@
 > assets/web/     APK 内嵌前端副本，内容与 web/ 一致
 > build/pc/       PC 端构建脚本
 > build/android/  安卓端 APK 重打包、冒烟测试、smali 补丁
-> audit/          APK 二进制取证证据（pclntab 函数表、rodata 字符串、评分器实测常量）
 > docs/           部署文档、安全审计、界面截图
 > scripts/        运维与协议探针脚本
 > tools/          apktool 等自研分析工具
@@ -68,14 +67,13 @@
 > 逐处比对**重建**出来的，并以那个 APK 的运行行为作为唯一基准 —— 而不是以上游
 > 源码为基准。因此部分实现刻意保留了与上游不同的形状。`internal/` 下有一批回归测试
 > 专门断言「APK 中不存在的东西不得被重新引入」（例如连接复用层、`conversation.html`），
-> 修改前先读 `audit/FULL-AUDIT-2026-08-19.md` 与 `RECOVERY_README.md`。
+> 修改后应运行完整 Go 测试,并验证 Android APK 的签名、包名、版本号及真机功能。
 >
 > 已修复的主要问题记录在提交历史里，包括：连接复用导致的随机失败、错误码映射
 > 回归、评测任务提示词被压缩、路由决策解析对输出格式过于敏感、工具结果截断导致
 > 模型无法读取完整源码、以及一批评分器误判。
 >
-> 一次只读审计的结论见 [`AUDIT-2.24.23.md`](AUDIT-2.24.23.md)，其中三项已修复，
-> 并列出了仍未验证的部分（沙箱无法运行 `go test -race`，并发安全未经验证）。
+> 历史问题、修复结果和仍未验证的部分以 Git 提交记录与当前回归测试为准。
 >
 > 免责声明与上游一致，见下文。
 
@@ -501,7 +499,6 @@ m365-copilot2api/
 │       ├── qemu-smoke.sh       # QEMU AArch64 冒烟测试
 │       ├── patch-diag-cookie.py# smali 补丁（已停用，保留供验证）
 │       └── README-v2.md · README-v3.md
-├── audit/                 # APK 二进制取证证据（被 internal/ 回归测试引用）
 ├── docs/                  # 部署文档、安全审计、界面截图
 ├── scripts/               # 运维与协议探针脚本
 │   ├── e2e_test.py        # 端到端测试
