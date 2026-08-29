@@ -2119,7 +2119,7 @@ if (response.output_text) {
 <div class="card">
   <div class="card-head"><h3 class="card-title">注册新账号</h3><span class="card-note" id="panelRegState"></span></div>
   <div class="card-body">
-    <p class="form-hint" style="margin-bottom:var(--sp-2)">Go 内置注册：先换出口 IP（手机飞行模式 / Clash 节点 / 当前代理），再 POST 站点 /api/register。Cloudflare Turnstile token 仍须从浏览器拿到，网关不再内嵌 Chromium。</p>
+    <p class="form-hint" style="margin-bottom:var(--sp-2)">先点「打开注册页」，在站点里完成 Cloudflare 人机验证。Android 客户端会自动提取 token 并返回本页，然后再点「开始注册」。网关负责换 IP 并提交 /api/register。</p>
     <div class="form-row">
       <div class="form-group"><label class="form-label" for="regSiteUrl">注册站点</label>
         <input class="form-input" id="regSiteUrl" type="url" placeholder="https://office.965007.xyz"></div>
@@ -2142,8 +2142,9 @@ if (response.output_text) {
         <input class="form-input" id="regStartNum" type="number" min="1" placeholder="5026"></div>
       <div class="form-group" style="margin:0;width:80px"><label class="form-label" for="regCount">数量</label>
         <input class="form-input" id="regCount" type="number" min="1" max="20" value="1"></div>
-      <div class="form-group" style="margin:0;flex:1;min-width:220px"><label class="form-label" for="regTurnstile">Turnstile token</label>
-        <input class="form-input" id="regTurnstile" placeholder="从注册页 input[name=cf-turnstile-response] 复制"></div>
+      <div class="form-group" style="margin:0;flex:1;min-width:220px"><label class="form-label" for="regTurnstile">人机验证</label>
+        <input class="form-input" id="regTurnstile" readonly placeholder="点「打开注册页」完成验证后自动填入"></div>
+      <button type="button" class="btn" onclick="openRegisterPage()">打开注册页</button>
       <button type="button" class="btn primary" onclick="panelStartRegister()">开始注册</button>
     </div>
     <p class="form-hint" id="regResult" aria-live="polite" style="margin-top:var(--sp-2)"></p>
@@ -6176,10 +6177,12 @@ function enterApp(){
   $('login').hidden=true;
   $('app').style.display='flex';
   $('app').hidden=false;
-  showPage('dashboard');
+  const captured=consumeTurnstileFromHash();
+  showPage(captured?'accounts':'dashboard');
   loadStats();
   loadOnboarding();
 }
+window.addEventListener('hashchange',()=>{ if(consumeTurnstileFromHash()) showPage('accounts'); });
 function showLogin(){
   $('login').style.display='grid';
   $('login').hidden=false;
@@ -6225,8 +6228,46 @@ async function saveRegisterConfig(){
     loadPanelState();
   }catch(e){showNotice(e.message||String(e),'error');}
 }
+function registerSiteUrl(){
+  return ($('regSiteUrl')?.value||'').trim().replace(/\/$/,'') || 'https://office.965007.xyz';
+}
+function consumeTurnstileFromHash(){
+  let token='';
+  try{
+    const hash=String(location.hash||'');
+    const m=hash.match(/turnstile=([^&]+)/);
+    if(m) token=decodeURIComponent(m[1]);
+  }catch(e){}
+  if(!token){
+    try{ token=sessionStorage.getItem('m365_turnstile_token')||''; }catch(e){}
+  }
+  if(!token) return false;
+  const el=$('regTurnstile');
+  if(el) el.value=token;
+  try{ sessionStorage.setItem('m365_turnstile_token', token); }catch(e){}
+  try{ history.replaceState(null,'',location.pathname+location.search); }catch(e){}
+  showNotice('已提取人机验证，可以开始注册','success');
+  return true;
+}
+function openRegisterPage(){
+  const url=registerSiteUrl();
+  if(window.M365Native && typeof window.M365Native.openUrl==='function'){
+    window.M365Native.openUrl(url);
+    showNotice('已打开注册页，完成人机验证后会自动返回','info');
+    return;
+  }
+  window.open(url,'_blank','noopener,noreferrer');
+  showNotice('请在打开的注册页完成验证。Android 客户端会自动提取 token。','info');
+}
 async function panelStartRegister(){
-  const body={mode:$('regMode')?.value||'phone',count:parseInt($('regCount')?.value)||1,startNum:parseInt($('regStartNum')?.value)||0,turnstileToken:($('regTurnstile')?.value||'').trim()};
+  consumeTurnstileFromHash();
+  const token=($('regTurnstile')?.value||'').trim();
+  if(!token){
+    showNotice('还没有人机验证，请先打开注册页完成验证','error');
+    openRegisterPage();
+    return;
+  }
+  const body={mode:$('regMode')?.value||'phone',count:parseInt($('regCount')?.value)||1,startNum:parseInt($('regStartNum')?.value)||0,turnstileToken:token};
   const out=$('regResult');
   if(out)out.textContent='提交注册…';
   try{

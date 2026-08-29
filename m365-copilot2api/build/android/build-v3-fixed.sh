@@ -166,6 +166,7 @@ PY
 # 注入系统文档选择器及回调,使背景图片和面板内文件导入可用。
 python3 "$REPO/build/android/patch-webview-file-chooser.py" "$OUT/work"
 python3 "$REPO/build/android/patch-hide-native-chrome.py" "$OUT/work"
+python3 "$REPO/build/android/patch-turnstile-capture.py" "$OUT/work"
 
 # 诊断页 cookie 持久化补丁已停用：2.24.15 实测点击「网关诊断」直接闪退。
 # 注入位置在构造函数与登录回调内，寄存器/异常表处理不当会导致 Activity
