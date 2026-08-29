@@ -1,0 +1,26 @@
+!!brut.androlib.meta.MetaInfo
+apkFileName: M365-ALL-in-1-v3.1.0-local-data-fixed-arm64.apk
+compressionType: false
+doNotCompress:
+- resources.arsc
+- png
+- lib/arm64-v8a/libm365.so
+- lib/arm64-v8a/libcloudflared.so
+isFrameworkApk: false
+packageInfo:
+  forcedPackageId: '127'
+  renameManifestPackage: null
+sdkInfo:
+  minSdkVersion: '26'
+  targetSdkVersion: '33'
+sharedLibrary: false
+sparseResources: false
+unknownFiles: {}
+usesFramework:
+  ids:
+  - 1
+  tag: null
+version: 2.7.0-dirty
+versionInfo:
+  versionCode: '87'
+  versionName: 3.1.0

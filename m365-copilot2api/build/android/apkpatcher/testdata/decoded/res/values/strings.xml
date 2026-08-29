@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="action_stop">停止</string>
+    <string name="app_name">M365 ALL-in-1 3.1.0</string>
+    <string name="channel_name">网关运行状态</string>
+    <string name="default_admin_password">***REMOVED-CREDENTIAL***</string>
+    <string name="notif_running">网关运行中 · http://127.0.0.1:4141</string>
+    <string name="notif_starting">网关启动中…</string>
+    <string name="notif_stopped">网关已停止</string>
+</resources>

@@ -72,12 +72,85 @@ func TestRunRegisterPostsAndWritesCredentials(t *testing.T) {
 	}
 }
 
-func TestRunRegisterRequiresTurnstileToken(t *testing.T) {
+func TestRunRegisterUsesFlareSolverrWhenTokenMissing(t *testing.T) {
+	var got map[string]any
+	site := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/register" {
+			http.NotFound(w, r)
+			return
+		}
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &got)
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "upn": "24s055026@office.example.test"})
+	}))
+	defer site.Close()
+	flare := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"status": "ok",
+			"solution": map[string]any{
+				"response": `<input name="cf-turnstile-response" value="flare-solved-token-abcdefghij">`,
+			},
+		})
+	}))
+	defer flare.Close()
+
+	root := t.TempDir()
+	writePanelConfig(t, root, site.URL)
+	cfgPath := filepath.Join(root, "config.json")
+	raw, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg map[string]any
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	reg := cfg["register"].(map[string]any)
+	reg["flaresolverr_url"] = flare.URL
+	body, _ := json.Marshal(cfg)
+	if err := os.WriteFile(cfgPath, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	report, err := (&Server{}).runRegister(context.Background(), newNativePanelManager(nativePanelConfig{Root: root}), panelRegisterRequest{Mode: "proxy", Count: 1, StartNum: 5026})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !report.OK || report.Success != 1 {
+		t.Fatalf("report = %#v", report)
+	}
+	if got["turnstileToken"] != "flare-solved-token-abcdefghij" {
+		t.Fatalf("payload = %#v", got)
+	}
+}
+
+func TestRunRegisterReportsFlareSolverrFailure(t *testing.T) {
 	root := t.TempDir()
 	writePanelConfig(t, root, "http://127.0.0.1:1")
-	_, err := (&Server{}).runRegister(context.Background(), newNativePanelManager(nativePanelConfig{Root: root}), panelRegisterRequest{Mode: "proxy", Count: 1})
-	if err == nil || !strings.Contains(err.Error(), "turnstileToken") {
-		t.Fatalf("err = %v", err)
+	cfgPath := filepath.Join(root, "config.json")
+	raw, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg map[string]any
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	reg := cfg["register"].(map[string]any)
+	reg["flaresolverr_url"] = "http://127.0.0.1:1/v1"
+	body, _ := json.Marshal(cfg)
+	if err := os.WriteFile(cfgPath, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	report, err := (&Server{}).runRegister(context.Background(), newNativePanelManager(nativePanelConfig{Root: root}), panelRegisterRequest{Mode: "proxy", Count: 1, StartNum: 5026})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.OK || report.Failed != 1 {
+		t.Fatalf("report = %#v", report)
+	}
+	if !strings.Contains(report.Accounts[0].Detail, "FlareSolverr") {
+		t.Fatalf("detail = %q", report.Accounts[0].Detail)
 	}
 }
 

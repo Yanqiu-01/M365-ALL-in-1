@@ -113,6 +113,9 @@ func TestNativePanelPathsCreatesMissingDataDir(t *testing.T) {
 	if state["site_url"] != "https://office.965007.xyz" || state["email_prefix"] != "24s05" {
 		t.Fatalf("default register fields = %#v", state)
 	}
+	if state["flaresolverr_url"] != "http://127.0.0.1:8191/v1" {
+		t.Fatalf("flaresolverr_url = %v", state["flaresolverr_url"])
+	}
 }
 
 func TestNativePanelSaveRegisterConfig(t *testing.T) {
@@ -121,6 +124,7 @@ func TestNativePanelSaveRegisterConfig(t *testing.T) {
 	cfg, err := manager.saveRegisterConfig(nativePanelRegisterConfigRequest{
 		SiteURL: "https://office.example.test/", EmailDomain: "@office.example.test",
 		EmailPrefix: "user", Password: "changed", EmailStartNum: 2000,
+		FlareSolverrURL: "http://127.0.0.1:18191/v1",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -133,6 +137,9 @@ func TestNativePanelSaveRegisterConfig(t *testing.T) {
 	}
 	if cfg.Register.EmailStartNum != 2000 {
 		t.Fatalf("start num = %d", cfg.Register.EmailStartNum)
+	}
+	if cfg.Register.FlareSolverrURL != "http://127.0.0.1:18191/v1" {
+		t.Fatalf("flaresolverr = %q", cfg.Register.FlareSolverrURL)
 	}
 }
 
@@ -148,6 +155,9 @@ func TestNativePanelLoadFillsEmptyRegisterFields(t *testing.T) {
 	}
 	if state["site_url"] != "https://office.965007.xyz" {
 		t.Fatalf("site_url = %v", state["site_url"])
+	}
+	if state["flaresolverr_url"] != "http://127.0.0.1:8191/v1" {
+		t.Fatalf("flaresolverr_url = %v", state["flaresolverr_url"])
 	}
 }
 

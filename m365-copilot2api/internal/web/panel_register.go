@@ -14,10 +14,12 @@ import (
 
 	"m365-copilot2api/internal/exitrotate"
 	"m365-copilot2api/internal/outbound"
+	"m365-copilot2api/internal/turnstile"
 )
 
-// panelRegisterRequest 是一次 Go 内置注册。Turnstile token 仍须由调用方从
-// 浏览器拿到：网关不再内嵌 Chromium。换 IP 与 POST /api/register 由本机完成。
+// panelRegisterRequest 是一次 Go 内置注册。Turnstile token 优先由本机
+// FlareSolverr 从注册页取出；调用方仍可手动提供 token 作为回退。
+// 换 IP 与 POST /api/register 由本机完成。
 type panelRegisterRequest struct {
 	Mode           string `json:"mode"`
 	Count          int    `json:"count"`
@@ -79,11 +81,6 @@ func (s *Server) runRegister(ctx context.Context, manager *nativePanelManager, r
 	if !cfg.registerReady() {
 		return report, errors.New("注册配置不完整：需要 site_url、email_domain、email_prefix、password")
 	}
-	token := strings.TrimSpace(request.TurnstileToken)
-	if token == "" {
-		return report, errors.New("缺少 turnstileToken。Cloudflare Turnstile 仍须由浏览器产生 token，网关只负责换 IP 与提交 /api/register")
-	}
-
 	start := request.StartNum
 	if start <= 0 {
 		start = cfg.Register.EmailStartNum
@@ -164,7 +161,15 @@ func (s *Server) runRegister(ctx context.Context, manager *nativePanelManager, r
 			emailStart = start
 		}
 		display := fmt.Sprintf("User%d", num-(emailStart-displayBase))
-		if err := postRegister(ctx, cfg, username, display, token, firstNonEmpty(request.Proxy, cfg.Register.PhoneSOCKS, cfg.Register.ClashProxy)); err != nil {
+		proxyURL := firstNonEmpty(request.Proxy, cfg.Register.PhoneSOCKS, cfg.Register.ClashProxy)
+		token, tokenErr := resolveTurnstileToken(ctx, cfg, request.TurnstileToken, proxyURL)
+		if tokenErr != nil {
+			item.Status, item.Detail = "failed", tokenErr.Error()
+			report.Failed++
+			report.Accounts = append(report.Accounts, item)
+			continue
+		}
+		if err := postRegister(ctx, cfg, username, display, token, proxyURL); err != nil {
 			item.Status, item.Detail = "failed", err.Error()
 			report.Failed++
 			report.Accounts = append(report.Accounts, item)
@@ -184,6 +189,29 @@ func (s *Server) runRegister(ctx context.Context, manager *nativePanelManager, r
 	report.Total = len(report.Accounts)
 	report.OK = report.Failed == 0 && report.Success > 0
 	return report, nil
+}
+
+func resolveTurnstileToken(ctx context.Context, cfg nativePanelFileConfig, supplied, proxyURL string) (string, error) {
+	if token := strings.TrimSpace(supplied); token != "" {
+		return token, nil
+	}
+	endpoint := strings.TrimSpace(cfg.Register.FlareSolverrURL)
+	if endpoint == "" {
+		endpoint = turnstile.DefaultEndpoint
+	}
+	page := strings.TrimRight(strings.TrimSpace(cfg.Register.SiteURL), "/")
+	if page == "" {
+		return "", errors.New("缺少注册页地址，无法请求 FlareSolverr")
+	}
+	solved, err := turnstile.Solve(ctx, turnstile.Request{
+		Endpoint: endpoint,
+		PageURL:  page,
+		Proxy:    proxyURL,
+	})
+	if err != nil {
+		return "", err
+	}
+	return solved.Token, nil
 }
 
 func firstClashNode(cfg nativePanelFileConfig) string {

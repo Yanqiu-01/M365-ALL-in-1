@@ -91,87 +91,15 @@ for f in index.html login.html debug.html panel.html workbench.html; do
   [ -f "$REPO/web/$f" ] && cp "$REPO/web/$f" "$OUT/work/assets/web/$f"
 done
 
-python3 - "$OUT/work" "$OLD_PKG" "$NEW_PKG" "$NEW_LABEL" "$VERSION_CODE" "$VERSION_NAME" <<'PY'
-import pathlib, re, sys
-root = pathlib.Path(sys.argv[1])
-old_pkg, new_pkg, label = sys.argv[2:5]
-version_code, version_name = sys.argv[5:7]
-
-manifest_path = root / 'AndroidManifest.xml'
-s = manifest_path.read_text(encoding='utf-8')
-if f'package="{old_pkg}"' in s:
-    s = s.replace(f'package="{old_pkg}"', f'package="{new_pkg}"', 1)
-elif f'package="{new_pkg}"' not in s:
-    raise SystemExit(f'expected package not found: {old_pkg} or {new_pkg}')
-# Provider authority 是应用私有标识，必须与 provider 内部常量同步。
-s = s.replace(f'"{old_pkg}.wake"', f'"{new_pkg}.wake"')
-# dex 中的组件类仍是 com.m365.gateway.*。改成完整类名，不能让
-# Android 按新 package 把 .MainActivity 解析成不存在的 gateway3.MainActivity。
-for component in ('MainActivity', 'AuthActivity', 'DiagActivity', 'TunnelActivity',
-                  'WakeProvider', 'GatewayService', 'KeepAliveReceiver', 'BootReceiver'):
-    s = s.replace(f'android:name=".{component}"',
-                  f'android:name="{old_pkg}.{component}"')
-# 应用内广播 action 与新包隔离，避免两个版本互相唤醒。
-for action in ('KEEPALIVE', 'START', 'STOP', 'TUNNEL_START'):
-    s = s.replace(f'"{old_pkg}.{action}"', f'"{new_pkg}.{action}"')
-manifest_path.write_text(s, encoding='utf-8')
-
-strings_path = root / 'res/values/strings.xml'
-s = strings_path.read_text(encoding='utf-8')
-s = re.sub(r'<string name="app_name">[^<]*</string>',
-           f'<string name="app_name">{label}</string>', s, count=1)
-strings_path.write_text(s, encoding='utf-8')
-
-yml_path = root / 'apktool.yml'
-s = yml_path.read_text(encoding='utf-8')
-s = re.sub(r"versionCode: '[^']*'", f"versionCode: '{version_code}'", s, count=1)
-s = re.sub(r'versionName: .*', f'versionName: {version_name}', s, count=1)
-yml_path.write_text(s, encoding='utf-8')
-
-# 所有 smali 中的应用私有 action、WakeProvider 的 authority/MIME 常量。
-smali_dirs = [path for path in root.glob('smali*') if path.is_dir()]
-for smali_dir in smali_dirs:
-    for path in smali_dir.rglob('*.smali'):
-        text = path.read_text(encoding='utf-8')
-        old = text
-        text = text.replace(f'{old_pkg}.KEEPALIVE', f'{new_pkg}.KEEPALIVE')
-        text = text.replace(f'{old_pkg}.START', f'{new_pkg}.START')
-        text = text.replace(f'{old_pkg}.STOP', f'{new_pkg}.STOP')
-        text = text.replace(f'{old_pkg}.TUNNEL_START', f'{new_pkg}.TUNNEL_START')
-        text = text.replace(f'{old_pkg}.wake', f'{new_pkg}.wake')
-        if text != old:
-            path.write_text(text, encoding='utf-8')
-
-# 静态一致性检查：manifest 里的组件必须在 dex/smali 中存在，且不能
-# 因改包名再次留下相对组件名或旧的应用私有标识。
-components = ('MainActivity', 'AuthActivity', 'DiagActivity', 'TunnelActivity',
-              'WakeProvider', 'GatewayService', 'KeepAliveReceiver', 'BootReceiver')
-manifest_after = manifest_path.read_text(encoding='utf-8')
-for component in components:
-    # manifest 的应用包名原为 com.m365.gateway3,但组件类仍位于
-    # com.m365.gateway,因此组件存在性检查必须使用实际 dex 类路径。
-    suffix = 'com/m365/gateway/' + component + '.smali'
-    if not any((smali_dir / suffix).exists() for smali_dir in smali_dirs):
-        raise SystemExit(f'component class missing: {suffix}')
-if re.search(r'android:name="\.(?:' + '|'.join(components) + r')"', manifest_after):
-    raise SystemExit('relative application component remains in manifest')
-for token in (f'{old_pkg}.wake', f'{old_pkg}.KEEPALIVE', f'{old_pkg}.START',
-              f'{old_pkg}.STOP', f'{old_pkg}.TUNNEL_START'):
-    for path in [manifest_path, *[p for d in smali_dirs for p in d.rglob('*.smali')]]:
-        if token in path.read_text(encoding='utf-8', errors='ignore'):
-            raise SystemExit(f'old private identity remains: {token} in {path}')
-PY
-
-# Android WebView 默认使用普通 WebChromeClient,无法处理 HTML 文件选择器。
-# 注入系统文档选择器及回调,使背景图片和面板内文件导入可用。
-python3 "$REPO/build/android/patch-webview-file-chooser.py" "$OUT/work"
-python3 "$REPO/build/android/patch-hide-native-chrome.py" "$OUT/work"
-python3 "$REPO/build/android/patch-turnstile-capture.py" "$OUT/work"
+PATCHER="$OUT/apkpatcher"
+GOTOOLCHAIN=local GOPROXY=off "$GO_BIN" build -trimpath -buildvcs=false -o "$PATCHER" "$REPO/build/android/apkpatcher"
+"$PATCHER" identity "$OUT/work" "$OLD_PKG" "$NEW_PKG" "$NEW_LABEL" "$VERSION_CODE" "$VERSION_NAME"
+"$PATCHER" smali "$OUT/work"
 
 # 诊断页 cookie 持久化补丁已停用：2.24.15 实测点击「网关诊断」直接闪退。
 # 注入位置在构造函数与登录回调内，寄存器/异常表处理不当会导致 Activity
 # 初始化即崩溃。保留脚本供后续验证，但不再参与构建。
-# python3 "$REPO/build/android/patch-diag-cookie.py" "$OUT/work/smali"
+# apkpatcher 不再包含诊断页 cookie 补丁：2.24.15 实测点击「网关诊断」直接闪退。
 
 # 3.0.0 稳定版保留原 APK 已存在的原生 OAuth 按钮与 AuthActivity，
 # 不再注入“网关就绪后自动拉起 OAuth”。2.24.25-first-run-oauth-safe
@@ -184,33 +112,14 @@ fi
 
 # 原始 APK 的管理密码资源中含有用户曾提供的密码。每次构建生成独立随机管理密码,
 # 恢复值只写入输出目录中的 0600 文件,不将用户的 Microsoft 账号密码打入 APK。
-python3 "$REPO/build/android/patch-random-admin-password.py" \
-  "$OUT/work" "$OUT/local-admin-password.txt"
+"$PATCHER" password "$OUT/work" "$OUT/local-admin-password.txt"
 
 printf '%s\n' '== 4/6 打包（必须使用 aapt2）=='
 apktool b "$OUT/work" --use-aapt2 -o "$OUT/unsigned.apk"
 
 # apktool 会丢失 native ZIP entry 的执行权限。恢复为原 APK 的 0700，
 # 再交给 zipalign；否则 ProcessBuilder 可能因权限不足启动失败。
-python3 - "$SRC" "$OUT/unsigned.apk" "$OUT/unsigned-mode.apk" <<'PY'
-import os, sys, zipfile
-original, source, target = sys.argv[1:4]
-with zipfile.ZipFile(source, 'r') as zin, zipfile.ZipFile(target, 'w') as zout:
-    for item in zin.infolist():
-        data = zin.read(item.filename)
-        info = zipfile.ZipInfo(item.filename, item.date_time)
-        info.comment = item.comment
-        info.extra = item.extra
-        info.compress_type = item.compress_type
-        info.create_system = item.create_system
-        info.flag_bits = item.flag_bits
-        info.internal_attr = item.internal_attr
-        info.external_attr = item.external_attr
-        if item.filename.startswith('lib/') and item.filename.endswith('.so'):
-            info.create_system = 3
-            info.external_attr = 0o100700 << 16
-        zout.writestr(info, data)
-PY
+"$PATCHER" zipmode "$OUT/unsigned.apk" "$OUT/unsigned-mode.apk"
 zipalign -p -f 4 "$OUT/unsigned-mode.apk" "$OUT/aligned.apk"
 zipalign -c 4 "$OUT/aligned.apk" >/dev/null
 
@@ -233,19 +142,7 @@ apksigner sign --ks "$KS" --ks-key-alias "$KS_ALIAS" \
 printf '%s\n' '== 6/6 验证 =='
 apksigner verify "$OUT/$APK_NAME"
 aapt dump badging "$OUT/$APK_NAME" | grep -E '^package|application-label|launchable-activity|native-code'
-python3 - "$SRC" "$OUT/$APK_NAME" <<'PY'
-import hashlib, sys, zipfile
-old, new = (zipfile.ZipFile(p) for p in sys.argv[1:3])
-h = lambda z, n: hashlib.sha256(z.read(n)).hexdigest()
-so = 'lib/arm64-v8a/libm365.so'
-cf = 'lib/arm64-v8a/libcloudflared.so'
-print('libm365.so 已替换 :', h(old, so) != h(new, so))
-print('libcloudflared 未动:', h(old, cf) == h(new, cf))
-for n in (so, cf):
-    i = new.getinfo(n)
-    print(n, 'mode=', oct((i.external_attr >> 16) & 0xffff), 'compress=', i.compress_type)
-print('条目数            :', len(old.namelist()), '->', len(new.namelist()))
-PY
+"$PATCHER" verify "$SRC" "$OUT/$APK_NAME"
 (
   cd "$OUT"
   sha256sum "$APK_NAME" | tee "$APK_NAME.sha256"

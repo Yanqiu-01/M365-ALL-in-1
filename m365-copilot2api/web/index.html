@@ -2119,12 +2119,16 @@ if (response.output_text) {
 <div class="card">
   <div class="card-head"><h3 class="card-title">注册新账号</h3><span class="card-note" id="panelRegState"></span></div>
   <div class="card-body">
-    <p class="form-hint" style="margin-bottom:var(--sp-2)">先点「打开注册页」，在站点里完成 Cloudflare 人机验证。Android 客户端会自动提取 token 并返回本页，然后再点「开始注册」。网关负责换 IP 并提交 /api/register。</p>
+    <p class="form-hint" style="margin-bottom:var(--sp-2)">点「开始注册」后，网关先换 IP，再请求本机 FlareSolverr 过 Cloudflare，然后提交 /api/register。FlareSolverr 默认 http://127.0.0.1:8191/v1。只有求解失败时才需要打开注册页手动验证。</p>
     <div class="form-row">
       <div class="form-group"><label class="form-label" for="regSiteUrl">注册站点</label>
         <input class="form-input" id="regSiteUrl" type="url" placeholder="https://office.965007.xyz"></div>
       <div class="form-group"><label class="form-label" for="regEmailDomain">邮箱域名</label>
         <input class="form-input" id="regEmailDomain" placeholder="office.bo.edu.kg"></div>
+    </div>
+    <div class="form-row">
+      <div class="form-group"><label class="form-label" for="regFlareSolverr">FlareSolverr</label>
+        <input class="form-input" id="regFlareSolverr" type="url" placeholder="http://127.0.0.1:8191/v1"></div>
     </div>
     <div class="form-row">
       <div class="form-group"><label class="form-label" for="regEmailPrefix">邮箱前缀</label>
@@ -2142,8 +2146,8 @@ if (response.output_text) {
         <input class="form-input" id="regStartNum" type="number" min="1" placeholder="5026"></div>
       <div class="form-group" style="margin:0;width:80px"><label class="form-label" for="regCount">数量</label>
         <input class="form-input" id="regCount" type="number" min="1" max="20" value="1"></div>
-      <div class="form-group" style="margin:0;flex:1;min-width:220px"><label class="form-label" for="regTurnstile">人机验证</label>
-        <input class="form-input" id="regTurnstile" readonly placeholder="点「打开注册页」完成验证后自动填入"></div>
+      <div class="form-group" style="margin:0;flex:1;min-width:220px"><label class="form-label" for="regTurnstile">手动 token（可选）</label>
+        <input class="form-input" id="regTurnstile" placeholder="留空则由 FlareSolverr 自动获取"></div>
       <button type="button" class="btn" onclick="openRegisterPage()">打开注册页</button>
       <button type="button" class="btn primary" onclick="panelStartRegister()">开始注册</button>
     </div>
@@ -6208,6 +6212,7 @@ async function loadPanelState(){
     fill('regEmailDomain', d.email_domain);
     fill('regEmailPrefix', d.email_prefix);
     fill('regPassword', d.register_password);
+    fill('regFlareSolverr', d.flaresolverr_url);
     const rs=$('regStartNum'),os=$('oauthStartNum');
     if(rs&&!rs.value&&d.cred_num_max)rs.value=d.cred_num_max+1;
     else if(rs&&!rs.value&&d.email_start_num)rs.value=d.email_start_num;
@@ -6220,7 +6225,8 @@ async function saveRegisterConfig(){
     emailDomain:($('regEmailDomain')?.value||'').trim(),
     emailPrefix:($('regEmailPrefix')?.value||'').trim(),
     password:($('regPassword')?.value||'').trim(),
-    emailStartNum:parseInt($('regStartNum')?.value)||0
+    emailStartNum:parseInt($('regStartNum')?.value)||0,
+    flaresolverrUrl:($('regFlareSolverr')?.value||'').trim()
   };
   try{
     const d=await api('/api/admin/panel/config',{method:'POST',body:JSON.stringify(body)});
@@ -6262,11 +6268,6 @@ function openRegisterPage(){
 async function panelStartRegister(){
   consumeTurnstileFromHash();
   const token=($('regTurnstile')?.value||'').trim();
-  if(!token){
-    showNotice('还没有人机验证，请先打开注册页完成验证','error');
-    openRegisterPage();
-    return;
-  }
   const body={mode:$('regMode')?.value||'phone',count:parseInt($('regCount')?.value)||1,startNum:parseInt($('regStartNum')?.value)||0,turnstileToken:token};
   const out=$('regResult');
   if(out)out.textContent='提交注册…';

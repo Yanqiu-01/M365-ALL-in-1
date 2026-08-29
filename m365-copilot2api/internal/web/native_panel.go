@@ -9,8 +9,8 @@ package web
 //   - 数据目录（config.json、账密清单）仍然读取，供面板状态与账密补齐使用。
 //     目录位置由 M365_NATIVE_PANEL_ROOT 或已保存设置决定，属用户数据而非仓库代码。
 //   - 批量 OAuth 走 Go：ROPC → Device Code → PKCE，不再驱动浏览器填账密。
-//   - 注册走 Go：换 IP（Rust CLI 优先，Go 回退）+ POST /api/register。Turnstile
-//     token 仍须由调用方从浏览器拿到，网关不再内嵌 Chromium。
+//   - 注册走 Go：换 IP（Rust CLI 优先，Go 回退）+ FlareSolverr 取 Turnstile
+//     token + POST /api/register。调用方仍可手动提供 token 作为回退。
 //   - job/poll 与 job/stop 仍返回 501：已经没有可轮询的子进程。
 
 import (
@@ -139,22 +139,23 @@ type nativePanelFileConfig struct {
 		Port int    `json:"port"`
 	} `json:"gateway"`
 	Register struct {
-		SiteURL        string `json:"site_url"`
-		TurnstileSite  string `json:"turnstile_sitekey"`
-		EmailDomain    string `json:"email_domain"`
-		EmailPrefix    string `json:"email_prefix"`
-		Password       string `json:"password"`
-		PlanID         string `json:"plan_id"`
-		DomainID       string `json:"domain_id"`
-		EmailStartNum  int    `json:"email_start_num"`
-		DisplayBase    int    `json:"display_base"`
-		CredentialFile string `json:"cred_file"`
-		PhoneSOCKS     string `json:"phone_socks"`
-		ClashAPI       string `json:"clash_api"`
-		ClashSecret    string `json:"clash_secret"`
-		ClashGroup     string `json:"clash_group"`
-		ClashProxy     string `json:"clash_proxy"`
-		ClashNodes     []struct {
+		SiteURL         string `json:"site_url"`
+		TurnstileSite   string `json:"turnstile_sitekey"`
+		FlareSolverrURL string `json:"flaresolverr_url"`
+		EmailDomain     string `json:"email_domain"`
+		EmailPrefix     string `json:"email_prefix"`
+		Password        string `json:"password"`
+		PlanID          string `json:"plan_id"`
+		DomainID        string `json:"domain_id"`
+		EmailStartNum   int    `json:"email_start_num"`
+		DisplayBase     int    `json:"display_base"`
+		CredentialFile  string `json:"cred_file"`
+		PhoneSOCKS      string `json:"phone_socks"`
+		ClashAPI        string `json:"clash_api"`
+		ClashSecret     string `json:"clash_secret"`
+		ClashGroup      string `json:"clash_group"`
+		ClashProxy      string `json:"clash_proxy"`
+		ClashNodes      []struct {
 			Name     string `json:"name"`
 			ExpectIP string `json:"expect_ip"`
 		} `json:"clash_nodes"`
@@ -166,6 +167,7 @@ func defaultNativePanelFileConfig() nativePanelFileConfig {
 	cfg.Gateway.Host = "127.0.0.1"
 	cfg.Gateway.Port = 4141
 	cfg.Register.SiteURL = "https://office.965007.xyz"
+	cfg.Register.FlareSolverrURL = "http://127.0.0.1:8191/v1"
 	cfg.Register.EmailDomain = "office.bo.edu.kg"
 	cfg.Register.EmailPrefix = "24s05"
 	cfg.Register.Password = "***REMOVED-CREDENTIAL***"
@@ -193,11 +195,12 @@ func (p nativePanelPaths) saveConfig(cfg nativePanelFileConfig) error {
 }
 
 type nativePanelRegisterConfigRequest struct {
-	SiteURL       string `json:"siteUrl"`
-	EmailDomain   string `json:"emailDomain"`
-	EmailPrefix   string `json:"emailPrefix"`
-	Password      string `json:"password"`
-	EmailStartNum int    `json:"emailStartNum"`
+	SiteURL         string `json:"siteUrl"`
+	EmailDomain     string `json:"emailDomain"`
+	EmailPrefix     string `json:"emailPrefix"`
+	Password        string `json:"password"`
+	EmailStartNum   int    `json:"emailStartNum"`
+	FlareSolverrURL string `json:"flaresolverrUrl"`
 }
 
 func (m *nativePanelManager) saveRegisterConfig(req nativePanelRegisterConfigRequest) (nativePanelFileConfig, error) {
@@ -207,6 +210,9 @@ func (m *nativePanelManager) saveRegisterConfig(req nativePanelRegisterConfigReq
 	}
 	if v := strings.TrimSpace(req.SiteURL); v != "" {
 		cfg.Register.SiteURL = strings.TrimRight(v, "/")
+	}
+	if v := strings.TrimSpace(req.FlareSolverrURL); v != "" {
+		cfg.Register.FlareSolverrURL = strings.TrimRight(v, "/")
 	}
 	if v := strings.TrimSpace(req.EmailDomain); v != "" {
 		cfg.Register.EmailDomain = strings.TrimPrefix(v, "@")
@@ -255,6 +261,7 @@ func applyRegisterDefaults(cfg *nativePanelFileConfig) bool {
 		}
 	}
 	fill(&cfg.Register.SiteURL, def.Register.SiteURL)
+	fill(&cfg.Register.FlareSolverrURL, def.Register.FlareSolverrURL)
 	fill(&cfg.Register.EmailDomain, def.Register.EmailDomain)
 	fill(&cfg.Register.EmailPrefix, def.Register.EmailPrefix)
 	fill(&cfg.Register.Password, def.Register.Password)
@@ -430,6 +437,7 @@ func (m *nativePanelManager) state(server *Server) map[string]any {
 	state["email_domain"] = strings.TrimSpace(cfg.Register.EmailDomain)
 	state["email_start_num"] = cfg.Register.EmailStartNum
 	state["site_url"] = strings.TrimSpace(cfg.Register.SiteURL)
+	state["flaresolverr_url"] = strings.TrimSpace(cfg.Register.FlareSolverrURL)
 	state["register_password"] = cfg.Register.Password
 	return state
 }
