@@ -65,11 +65,9 @@ type runtimeSettings struct {
 	ToolPlanningMode    string         `json:"toolPlanningMode"`
 	CaptureRouterFrames bool           `json:"captureRouterFrames"`
 	ClientProfile       string         `json:"clientProfile"`
-	// NativePanelRoot/NativePanelPython persist where the local registration and
-	// OAuth workers live, so 4141 keeps working after a restart without relying on
-	// per-process environment variables. The matching env vars still win when set.
-	NativePanelRoot     string         `json:"nativePanelRoot,omitempty"`
-	NativePanelPython   string         `json:"nativePanelPython,omitempty"`
+	// NativePanelRoot persists where local panel data and configuration live.
+	// OAuth execution is built into the Go gateway and needs no Python runtime.
+	NativePanelRoot string `json:"nativePanelRoot,omitempty"`
 
 	// 以下字段对应既有的环境变量开关，之前只能改环境变量、无法在界面上调。
 	// 参照 grok2api 的配置分组（质量守护 / 并发 / 诊断 / 清理）补齐。
@@ -122,8 +120,7 @@ func defaultRuntimeSettings() runtimeSettings {
 		ModelMappings:    append([]modelMapping(nil), defaultModelMappings...),
 		ToolPlanningMode: toolPlanningMode(os.Getenv("M365_TOOL_PLANNING_MODE")),
 		ClientProfile:    "office",
-		NativePanelRoot:   strings.TrimSpace(os.Getenv(nativePanelRootEnv)),
-		NativePanelPython: strings.TrimSpace(os.Getenv(nativePanelPythonEnv)),
+		NativePanelRoot:  strings.TrimSpace(os.Getenv(nativePanelRootEnv)),
 	}
 }
 func settingsPath() string {

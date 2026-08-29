@@ -52,7 +52,7 @@ func TestNativePanelSingleJobStopAndPoll(t *testing.T) {
 	}
 
 	runner := &nativePanelFakeRunner{}
-	manager := newNativePanelManager(nativePanelConfig{Root: root, Python: "fake-python", LogCap: 4, PollLogCap: 2}, runner)
+	manager := newNativePanelManager(nativePanelConfig{Root: root, LogCap: 4, PollLogCap: 2}, runner)
 	if _, err := manager.start("oauth:batch", "oauth/oauth_batch.py", nil, nil); err != nil {
 		t.Fatalf("start: %v", err)
 	}
@@ -88,19 +88,14 @@ func TestNativePanelOriginAndBatchCompatibility(t *testing.T) {
 
 func TestPersistedNativePanelConfigPrefersEnvThenSettings(t *testing.T) {
 	t.Setenv(nativePanelRootEnv, "")
-	t.Setenv(nativePanelPythonEnv, "")
 	server := &Server{settings: &settingsStore{v: runtimeSettings{
-		NativePanelRoot:   filepath.Join("E:", "persisted", "worker"),
-		NativePanelPython: filepath.Join("C:", "persisted", "python.exe"),
+		NativePanelRoot: filepath.Join("E:", "persisted", "worker"),
 	}}}
 
-	// A restart with no environment variables must still find the worker.
+	// A restart with no environment variable must still find the panel data.
 	saved := persistedNativePanelConfig(server)
 	if saved.Root != filepath.Join("E:", "persisted", "worker") {
 		t.Fatalf("persisted root not used: %q", saved.Root)
-	}
-	if saved.Python != filepath.Join("C:", "persisted", "python.exe") {
-		t.Fatalf("persisted python not used: %q", saved.Python)
 	}
 
 	// An explicit environment override still wins over the stored value.
@@ -109,8 +104,8 @@ func TestPersistedNativePanelConfigPrefersEnvThenSettings(t *testing.T) {
 		t.Fatalf("environment override ignored: %q", overridden.Root)
 	}
 
-	// A server without settings must not panic and must keep the defaults.
-	if fallback := persistedNativePanelConfig(nil); fallback.Python == "" {
-		t.Fatal("nil server must still yield a usable python command")
+	// A server without settings must not panic and must keep a data root.
+	if fallback := persistedNativePanelConfig(nil); fallback.Root == "" {
+		t.Fatal("nil server must still yield a usable panel data root")
 	}
 }

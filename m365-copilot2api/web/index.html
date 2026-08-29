@@ -1814,7 +1814,7 @@ textarea.form-input{min-height:80px;line-height:var(--lh-normal);resize:vertical
       <button type="button" data-page="settings" onclick="showPage('settings')"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M9.671 4.136a2.34 2.34 0 0 1 4.659 0 2.34 2.34 0 0 0 3.319 1.915 2.34 2.34 0 0 1 2.33 4.033 2.34 2.34 0 0 0 0 3.831 2.34 2.34 0 0 1-2.33 4.033 2.34 2.34 0 0 0-3.319 1.915 2.34 2.34 0 0 1-4.659 0 2.34 2.34 0 0 0-3.32-1.915 2.34 2.34 0 0 1-2.33-4.033 2.34 2.34 0 0 0 0-3.831A2.34 2.34 0 0 1 6.35 6.051a2.34 2.34 0 0 0 3.319-1.915"/> <circle cx="12" cy="12" r="3"/></svg><span>设置</span></button>
     </nav>
 
-    <div class="sidebar-foot">v0.2.0</div>
+    <div class="sidebar-foot">v3.0.1</div>
   </aside>
 
   <main class="main">
@@ -2021,6 +2021,7 @@ if (response.output_text) {
             <p class="page-sub">授权和管理 Microsoft 账号</p>
           </div>
           <div class="page-head-actions">
+            <button type="button" class="btn" onclick="location.href='/panel'"><svg class="ico ico-sm" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M3 3v18h18"/><path d="M7 15h3v3H7zM12 10h3v8h-3zM17 6h3v12h-3z"/></svg> 账号池与贡献账本</button>
             <button type="button" class="btn primary" id="runScriptsBtn" onclick="openRunScripts()"><svg class="ico ico-sm" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M4 14a1 1 0 0 1-.78-1.63l9.9-10.2a.5.5 0 0 1 .86.46l-1.92 6.02A1 1 0 0 0 13 10h7a1 1 0 0 1 .78 1.63l-9.9 10.2a.5.5 0 0 1-.86-.46l1.92-6.02A1 1 0 0 0 11 14z"/></svg> 账密一键回调</button>
           </div>
         </div>
@@ -2047,6 +2048,15 @@ if (response.output_text) {
                 </div>
               </div>
             </div>
+            <div class="form-group" style="margin-top:var(--sp-3)">
+              <label class="form-label" for="rsAccountList">批量账号列表</label>
+              <textarea class="form-input" id="rsAccountList" rows="6" spellcheck="false" autocomplete="off" placeholder="每行一个账号,格式:账号----密码"></textarea>
+              <div class="btn-row" style="margin-top:var(--sp-2)">
+                <label class="btn" for="rsAccountFile" role="button">选择 .txt 文件</label>
+                <input id="rsAccountFile" type="file" accept=".txt,text/plain" onchange="loadRunScriptsAccountFile(this)" hidden>
+                <span class="form-hint" id="rsAccountFileHint">也可直接粘贴多行账号；空行会自动忽略</span>
+              </div>
+            </div>
             <p class="field-err" id="rsErr" hidden></p>
             <div class="btn-row">
               <button type="button" class="btn primary" id="rsSubmit" onclick="submitRunScripts()"><svg class="ico ico-sm" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M4 14a1 1 0 0 1-.78-1.63l9.9-10.2a.5.5 0 0 1 .86.46l-1.92 6.02A1 1 0 0 0 13 10h7a1 1 0 0 1 .78 1.63l-9.9 10.2a.5.5 0 0 1-.86-.46l1.92-6.02A1 1 0 0 0 11 14z"/></svg> 运行脚本并回调</button>
@@ -2058,9 +2068,12 @@ if (response.output_text) {
             <div id="rsProgress" style="margin-top:var(--sp-3)" aria-live="polite"></div>
           </div>
         </div>
-        <div class="card">
-          <div class="card-head"><h3 class="card-title">添加账号</h3></div>
-          <div class="card-body">
+        <div class="card" id="addAccountCard">
+          <button type="button" class="card-head" aria-expanded="false" onclick="const body=this.nextElementSibling;const expanded=body.hidden;body.hidden=!expanded;this.setAttribute('aria-expanded',String(expanded));this.querySelector('[data-collapse-label]').textContent=expanded?'收起':'展开'" style="width:100%;border:0;background:transparent;text-align:left;cursor:pointer">
+            <h3 class="card-title">添加账号</h3>
+            <span class="card-note" data-collapse-label>展开</span>
+          </button>
+          <div class="card-body" hidden>
             <div class="onb-steps" style="margin-bottom:var(--sp-4)">
               <div class="onb-step" style="cursor:default">
                 <span class="onb-step-num">1</span>
@@ -2101,7 +2114,7 @@ if (response.output_text) {
 <div class="card">
   <div class="card-head"><h3 class="card-title">注册新账号</h3><span class="card-note" id="panelRegState"></span></div>
   <div class="card-body">
-    <p class="form-hint" style="margin-bottom:var(--sp-2)">调用本地 M365 面板(127.0.0.1:8555)的注册脚本，在 office.965007.xyz 上自动创建 M365 账号。需要面板进程在运行。</p>
+    <p class="form-hint" style="margin-bottom:var(--sp-2)">调用当前 4141 网关内置的原生面板接口执行账号注册，不依赖独立的 8555 面板进程。桌面注册 worker 未安装时，该功能会明确显示不可用；Android 端的账号池、原生 OAuth、调度与账本仍可正常使用。</p>
     <div style="display:flex;gap:var(--sp-3);flex-wrap:wrap;align-items:flex-end">
       <div class="form-group" style="margin:0;min-width:130px">
         <label class="form-label" for="regMode">注册模式</label>
@@ -2187,12 +2200,13 @@ if (response.output_text) {
                 <option value="100">每页 100 条</option>
               </select>
               <button type="button" class="btn btn-sm" id="acctRefreshAll" onclick="refreshAllAccounts()">一键刷新令牌</button>
+              <button type="button" class="btn btn-sm danger" id="acctDeleteSelected" onclick="deleteSelectedAccounts()" disabled>删除所选账号</button>
             </div>
           </div>
           <div class="table-wrap">
             <table class="table">
               <caption class="sr-only">已授权的 Microsoft 账号列表</caption>
-              <thead><tr><th scope="col">账号</th><th scope="col">状态</th><th scope="col">账密</th><th scope="col">更新时间</th><th scope="col" class="actions">操作</th></tr></thead>
+              <thead><tr><th scope="col"><input id="accountSelectAll" type="checkbox" onchange="toggleAllVisibleAccounts(this.checked)" aria-label="选择当前页全部账号"></th><th scope="col">账号</th><th scope="col">状态</th><th scope="col">账密</th><th scope="col">更新时间</th><th scope="col" class="actions">操作</th></tr></thead>
               <tbody id="accountRows"><tr aria-hidden="true"><td><span class="skel-row"><span class="skel circle"></span><span class="skel w-60"></span></span></td><td><span class="skel w-40"></span></td><td><span class="skel w-30"></span></td><td><span class="skel w-70"></span></td><td><span class="skel w-30"></span></td></tr></tbody>
             </table>
           </div>
@@ -3215,6 +3229,33 @@ async function loadStats(){
 }
 
 let _accountsCache=[],_accountFilter='all';
+const _selectedAccountIds=new Set();
+function updateAccountSelectionUI(){
+  const btn=$('acctDeleteSelected');
+  if(btn){
+    btn.disabled=_selectedAccountIds.size===0;
+    btn.textContent=_selectedAccountIds.size?'删除所选账号 ('+_selectedAccountIds.size+')':'删除所选账号';
+  }
+  const all=$('accountSelectAll');
+  if(all){
+    const boxes=[...document.querySelectorAll('#accountRows input[data-account-id]')];
+    const checked=boxes.filter(x=>x.checked).length;
+    all.checked=boxes.length>0&&checked===boxes.length;
+    all.indeterminate=checked>0&&checked<boxes.length;
+  }
+}
+function toggleAccountSelected(id,checked){
+  if(!id)return;
+  if(checked)_selectedAccountIds.add(id);else _selectedAccountIds.delete(id);
+  updateAccountSelectionUI();
+}
+function toggleAllVisibleAccounts(checked){
+  document.querySelectorAll('#accountRows input[data-account-id]').forEach(box=>{
+    box.checked=checked;
+    if(checked)_selectedAccountIds.add(box.dataset.accountId);else _selectedAccountIds.delete(box.dataset.accountId);
+  });
+  updateAccountSelectionUI();
+}
 /* 分页只作用在「筛选 + 搜索之后」的结果集上；每页条数持久化。
    页码是 0-based，越界一律靠 renderAccounts() 里的钳制回收。 */
 const ACCT_PAGE_SIZE_KEY='m365.accountsPageSize';
@@ -3266,6 +3307,10 @@ function accountRowNode(x){
     elx('b',{cls:'cell-trunc',text:name,title:name}),
     elx('span',{cls:'cell-trunc',text:x.email||'',title:x.email||''}),
   ]});
+  const selectBox=elx('input',{attrs:{type:'checkbox','data-account-id':x.id,'aria-label':'选择账号 '+name}});
+  selectBox.checked=_selectedAccountIds.has(x.id);
+  selectBox.addEventListener('change',()=>toggleAccountSelected(x.id,selectBox.checked));
+  const tdSelect=elx('td',{kids:[selectBox]});
   const tdAcct=elx('td',{kids:[elx('div',{cls:'account-cell',kids:[avatar,meta]})]});
 
   const dot=elx('i',{cls:'status-dot',attrs:{style:'background:currentColor'}});
@@ -3289,7 +3334,7 @@ function accountRowNode(x){
       on:{click:()=>deleteAccount(x.id)}}),
   ]});
 
-  return elx('tr',{kids:[tdAcct,tdStatus,tdCred,tdTime,tdActions]});
+  return elx('tr',{kids:[tdSelect,tdAcct,tdStatus,tdCred,tdTime,tdActions]});
 }
 function renderAccounts(){
   const list=filteredAccounts();
@@ -3307,7 +3352,7 @@ function renderAccounts(){
     page.forEach(x=>tbody.appendChild(accountRowNode(x)));
   }else{
     const tr=elx('tr',{cls:'is-empty'});
-    const td=elx('td',{cls:'empty',attrs:{colspan:'5'}});
+    const td=elx('td',{cls:'empty',attrs:{colspan:'6'}});
     td.appendChild(_accountsCache.length
       ? emptyStateNode('search','没有匹配的账号','换个关键词，或把筛选切回「全部」')
       : emptyStateNode('users','还没有授权账号','点击上方「开始授权」或「账密一键回调」添加第一个 Microsoft 账号'));
@@ -3386,7 +3431,7 @@ async function loadAccounts(){
   }catch(e){
     const tbody=$('accountRows');
     tbody.textContent='';
-    const td=elx('td',{cls:'empty',attrs:{colspan:'5'}});
+    const td=elx('td',{cls:'empty',attrs:{colspan:'6'}});
     td.appendChild(errorStateNode(e.message));
     tbody.appendChild(elx('tr',{cls:'is-empty',kids:[td]}));
   }
@@ -3481,11 +3526,49 @@ async function syncCredentials(){
   finally{if(btn){btn.disabled=false;btn.textContent='从账密清单补齐';}}
 }
 
+function parseRunScriptsAccounts(text){
+  const accounts=[];
+  const errors=[];
+  String(text||'').split(/\r?\n/).forEach((raw,index)=>{
+    const line=raw.trim();
+    if(!line)return;
+    const separator=line.indexOf('----');
+    if(separator<=0){errors.push('第 '+(index+1)+' 行格式错误,应为:账号----密码');return;}
+    const email=line.slice(0,separator).trim();
+    const password=line.slice(separator+4);
+    if(!email||!password){errors.push('第 '+(index+1)+' 行账号或密码为空');return;}
+    accounts.push({email,password});
+  });
+  return {accounts,errors};
+}
+
+async function loadRunScriptsAccountFile(input){
+  const file=input&&input.files&&input.files[0];
+  if(!file)return;
+  setFieldErr('rsErr','');
+  if(!/\.txt$/i.test(file.name)){
+    setFieldErr('rsErr','请选择 .txt 格式的账号文件');
+    input.value='';
+    return;
+  }
+  try{
+    const text=await file.text();
+    $('rsAccountList').value=text;
+    const parsed=parseRunScriptsAccounts(text);
+    $('rsAccountFileHint').textContent='已读取 '+file.name+',识别 '+parsed.accounts.length+' 个账号'+(parsed.errors.length?',另有 '+parsed.errors.length+' 行格式错误':'');
+  }catch(e){
+    setFieldErr('rsErr','读取账号文件失败:'+(e.message||'未知错误'));
+  }
+}
+
 async function submitRunScripts(){
   const email=$('rsEmail').value.trim();
   const password=$('rsPassword').value;
+  const parsed=parseRunScriptsAccounts($('rsAccountList').value);
   setFieldErr('rsErr','');
-  if(!email){setFieldErr('rsErr','请输入 M365 账号');$('rsEmail').focus();return;}
+  if(parsed.errors.length){setFieldErr('rsErr',parsed.errors.slice(0,3).join('；'));$('rsAccountList').focus();return;}
+  if(parsed.accounts.length){await submitRunScriptsBatch(parsed.accounts);return;}
+  if(!email){setFieldErr('rsErr','请输入 M365 账号,或粘贴/选择账号列表');$('rsEmail').focus();return;}
   // 密码留空是合法用法：后端会取加密 vault 里已存的账密。若 vault 里也没有，
   // 后端会明确回「密码为空」，这里预先提示用户可以一键补齐。
   if(!password&&!_credCache.some(c=>c.email===email)){
@@ -3594,6 +3677,103 @@ async function submitRunScripts(){
 
 /* 半自动分支：复用既有 PKCE 弹窗流程 —— 先 logoutUrl 再 authorizationUrl，
    并把 state/attempt 写进回调输入框，让「确认添加」能校验 state。 */
+async function submitRunScriptsBatch(accounts){
+  const btn=$('rsSubmit');
+  const out=$('rsProgress');
+  btn.disabled=true;
+  btn.classList.add('is-busy');
+  out.textContent='';
+
+  const summary=document.createElement('p');
+  summary.className='form-hint';
+  summary.textContent='准备批量回调 '+accounts.length+' 个账号…';
+  out.appendChild(summary);
+
+  const results=document.createElement('div');
+  results.className='steps-list';
+  out.appendChild(results);
+
+  let completed=0;
+  let interactive=0;
+  let failed=0;
+
+  try{
+    for(const [index,account] of accounts.entries()){
+      summary.textContent='正在处理 '+(index+1)+' / '+accounts.length+':'+account.email;
+
+      const row=document.createElement('div');
+      row.className='steps-item';
+      const text=document.createElement('div');
+      const title=document.createElement('b');
+      title.textContent=account.email;
+      text.appendChild(title);
+      const status=document.createElement('span');
+      status.className='badge';
+      status.style.marginLeft='6px';
+      status.textContent='处理中';
+      text.appendChild(status);
+      row.appendChild(text);
+      results.appendChild(row);
+
+      try{
+        const response=await fetch('/api/accounts/web/run-scripts',{
+          method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({email:account.email,password:account.password,saveCredential:true})
+        });
+        const raw=await response.text();
+        let data;
+        try{data=raw?JSON.parse(raw):{};}catch(parseError){data={};}
+        if(!response.ok&&response.status!==202){
+          throw Error((data&&data.error&&data.error.message)||raw||('HTTP '+response.status));
+        }
+
+        if(data.complete===true||data.status==='completed'){
+          completed++;
+          row.classList.add('done');
+          status.className='badge ok';
+          status.textContent='完成';
+        }else{
+          interactive++;
+          status.className='badge';
+          status.textContent='需人工登录';
+          if(data.authorizationUrl){
+            const action=document.createElement('button');
+            action.type='button';
+            action.className='btn';
+            action.style.marginTop='var(--sp-2)';
+            action.textContent='打开该账号授权页面';
+            action.onclick=()=>runScriptsAuthorize(data);
+            text.appendChild(action);
+          }
+        }
+      }catch(error){
+        failed++;
+        status.className='badge err';
+        status.textContent='失败';
+        const detail=document.createElement('p');
+        detail.className='form-hint';
+        detail.textContent=error.message||'运行失败';
+        text.appendChild(detail);
+      }
+    }
+
+    summary.textContent='批量回调完成:成功 '+completed+' 个,需人工登录 '+interactive+' 个,失败 '+failed+' 个';
+    showNotice('批量回调处理完毕',failed?'info':'success');
+    if(completed){
+      $('rsAccountList').value='';
+      $('rsAccountFile').value='';
+      $('rsAccountFileHint').textContent='也可直接粘贴多行账号；空行会自动忽略';
+      loadAccounts();
+      loadCredentials();
+      loadStats();
+    }
+  }finally{
+    btn.disabled=false;
+    btn.classList.remove('is-busy');
+  }
+}
+
 function runScriptsAuthorize(d){
   const win=window.open('about:blank',PKCE_POPUP_NAME,'width=600,height=800');
   if(!win){showNotice('浏览器拦截了弹窗，请允许弹窗后重试','error');return;}
@@ -3655,9 +3835,34 @@ function renderCredentialState(){
 }
 
 async function deleteAccount(id){
-  if(!confirm('确定删除？'))return;
-  try{await api('/api/accounts/delete',{method:'POST',body:JSON.stringify({id})});showNotice('已删除','success');loadAccounts();showPage('dashboard');}
-  catch(e){showNotice(e.message,'error');}
+  if(!confirm('确定删除这个账号？'))return;
+  try{
+    await api('/api/accounts/delete',{method:'POST',body:JSON.stringify({id})});
+    _selectedAccountIds.delete(id);
+    updateAccountSelectionUI();
+    showNotice('已删除','success');
+    await loadAccounts();
+    showPage('dashboard');
+  }catch(e){showNotice(e.message,'error');}
+}
+async function deleteSelectedAccounts(){
+  const ids=[..._selectedAccountIds];
+  if(!ids.length){showNotice('请先勾选要删除的账号','info');return;}
+  if(!confirm('确定删除已勾选的 '+ids.length+' 个账号？此操作不可撤销。'))return;
+  const btn=$('acctDeleteSelected');
+  if(btn){btn.disabled=true;btn.classList.add('is-busy');}
+  let deleted=0,failed=0;
+  for(const id of ids){
+    try{
+      await api('/api/accounts/delete',{method:'POST',body:JSON.stringify({id})});
+      _selectedAccountIds.delete(id);
+      deleted++;
+    }catch(e){failed++;}
+  }
+  if(btn)btn.classList.remove('is-busy');
+  updateAccountSelectionUI();
+  await loadAccounts();
+  showNotice('已删除 '+deleted+' 个账号'+(failed?',失败 '+failed+' 个':''),failed?'warning':'success');
 }
 
 // 每次授权都创建独立的本地 attempt。旧的轮询、回调输入和由页面打开的

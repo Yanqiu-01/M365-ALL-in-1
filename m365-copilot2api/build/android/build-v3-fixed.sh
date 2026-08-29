@@ -24,11 +24,15 @@ if [ ! -f "$SRC" ]; then
   echo "原始 APK 不存在: $SRC" >&2
   exit 1
 fi
-NEW_PKG=com.m365.gateway3
-OLD_PKG=com.m365.gateway
-NEW_LABEL='M365 网关 v3 修复版'
-VERSION_CODE=84
-VERSION_NAME=2.24.25
+NEW_PKG=com.m365.gateway.pkcego
+OLD_PKG=com.m365.gateway3
+NEW_LABEL='修改版M365'
+VERSION_CODE=2
+VERSION_NAME=1.0.1
+APK_NAME=修改版M365-v1.0.1-arm64.apk
+BUILD_COMMIT=${BUILD_COMMIT:-$(git -C "$REPO" rev-parse --short=12 HEAD 2>/dev/null || printf unknown)}
+BUILD_TIME=${BUILD_TIME:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}
+LDFLAGS="-s -w -X m365-copilot2api/internal/web.Version=$VERSION_NAME -X m365-copilot2api/internal/web.Commit=$BUILD_COMMIT -X m365-copilot2api/internal/web.BuildTime=$BUILD_TIME"
 # 密钥库必须在所有版本间保持同一份：此前默认落在 $OUT/...，而每版用独立输出
 # 目录，keytool 每次都新生成一份密钥，导致每版签名都不一样，升级时必须先卸载。
 # 签名一致才能覆盖安装并保留数据。
@@ -50,7 +54,9 @@ fi
 # go.mod 声明 go 1.23，本机容器实际提供 golang:1.26。优先使用项目固化的
 # 工具链，避免系统 Go 触发联网 toolchain 自动下载；也允许调用方通过 GO_BIN 覆盖。
 if [ -z "${GO_BIN:-}" ]; then
-  if [ -x /workspace/toolchain/go1.26/bin/go ]; then
+  if [ -x /workspace/toolchain/go1.23/bin/go ]; then
+    GO_BIN=/workspace/toolchain/go1.23/bin/go
+  elif [ -x /workspace/toolchain/go1.26/bin/go ]; then
     GO_BIN=/workspace/toolchain/go1.26/bin/go
   else
     GO_BIN=go
@@ -70,7 +76,7 @@ printf '%s\n' '== 1/6 交叉编译 libm365.so =='
 (
   cd "$REPO"
   GOTOOLCHAIN=local GOPROXY=off CGO_ENABLED=0 GOOS=android GOARCH=arm64 GOARM64=v8.0 \
-    "$GO_BIN" build -trimpath -buildvcs=false -buildmode=pie -o "$OUT/libm365.so" ./cmd/server
+    "$GO_BIN" build -trimpath -buildvcs=false -buildmode=pie -ldflags "$LDFLAGS" -o "$OUT/libm365.so" ./cmd/server
 )
 readelf -h "$OUT/libm365.so" | grep -E 'Type|Machine|Entry point'
 readelf -p .interp "$OUT/libm365.so" | grep -oE '/[a-z/0-9._]+'
@@ -81,7 +87,7 @@ apktool d -f -o "$OUT/work" "$SRC"
 
 printf '%s\n' '== 3/6 替换 .so、同步 web 资源、改包名与组件 =='
 cp "$OUT/libm365.so" "$OUT/work/lib/arm64-v8a/libm365.so"
-for f in index.html login.html debug.html; do
+for f in index.html login.html debug.html panel.html workbench.html; do
   [ -f "$REPO/web/$f" ] && cp "$REPO/web/$f" "$OUT/work/assets/web/$f"
 done
 
@@ -93,9 +99,10 @@ version_code, version_name = sys.argv[5:7]
 
 manifest_path = root / 'AndroidManifest.xml'
 s = manifest_path.read_text(encoding='utf-8')
-if f'package="{old_pkg}"' not in s:
-    raise SystemExit(f'expected package not found: {old_pkg}')
-s = s.replace(f'package="{old_pkg}"', f'package="{new_pkg}"', 1)
+if f'package="{old_pkg}"' in s:
+    s = s.replace(f'package="{old_pkg}"', f'package="{new_pkg}"', 1)
+elif f'package="{new_pkg}"' not in s:
+    raise SystemExit(f'expected package not found: {old_pkg} or {new_pkg}')
 # Provider authority 是应用私有标识，必须与 provider 内部常量同步。
 s = s.replace(f'"{old_pkg}.wake"', f'"{new_pkg}.wake"')
 # dex 中的组件类仍是 com.m365.gateway.*。改成完整类名，不能让
@@ -141,7 +148,9 @@ components = ('MainActivity', 'AuthActivity', 'DiagActivity', 'TunnelActivity',
               'WakeProvider', 'GatewayService', 'KeepAliveReceiver', 'BootReceiver')
 manifest_after = manifest_path.read_text(encoding='utf-8')
 for component in components:
-    suffix = old_pkg.replace('.', '/') + '/' + component + '.smali'
+    # manifest 的应用包名原为 com.m365.gateway3,但组件类仍位于
+    # com.m365.gateway,因此组件存在性检查必须使用实际 dex 类路径。
+    suffix = 'com/m365/gateway/' + component + '.smali'
     if not any((smali_dir / suffix).exists() for smali_dir in smali_dirs):
         raise SystemExit(f'component class missing: {suffix}')
 if re.search(r'android:name="\.(?:' + '|'.join(components) + r')"', manifest_after):
@@ -153,10 +162,28 @@ for token in (f'{old_pkg}.wake', f'{old_pkg}.KEEPALIVE', f'{old_pkg}.START',
             raise SystemExit(f'old private identity remains: {token} in {path}')
 PY
 
+# Android WebView 默认使用普通 WebChromeClient,无法处理 HTML 文件选择器。
+# 注入系统文档选择器及回调,使背景图片和面板内文件导入可用。
+python3 "$REPO/build/android/patch-webview-file-chooser.py" "$OUT/work"
+
 # 诊断页 cookie 持久化补丁已停用：2.24.15 实测点击「网关诊断」直接闪退。
 # 注入位置在构造函数与登录回调内，寄存器/异常表处理不当会导致 Activity
 # 初始化即崩溃。保留脚本供后续验证，但不再参与构建。
 # python3 "$REPO/build/android/patch-diag-cookie.py" "$OUT/work/smali"
+
+# 3.0.0 稳定版保留原 APK 已存在的原生 OAuth 按钮与 AuthActivity，
+# 不再注入“网关就绪后自动拉起 OAuth”。2.24.25-first-run-oauth-safe
+# 已在真机出现启动闪退，而同 DEX 基线的 native-oauth 版没有这两个注入方法。
+# 用户可在主界面或 /panel 手动启动授权，成功后仍由现有 PKCE 回调保存令牌。
+if grep -Rqs 'maybeStartFirstRunAuthorization' "$OUT/work"/smali*; then
+  echo '错误：基线 APK 已包含不稳定的首次启动 OAuth 注入，请改用 native-oauth 基线' >&2
+  exit 1
+fi
+
+# 原始 APK 的管理密码资源中含有用户曾提供的密码。每次构建生成独立随机管理密码,
+# 恢复值只写入输出目录中的 0600 文件,不将用户的 Microsoft 账号密码打入 APK。
+python3 "$REPO/build/android/patch-random-admin-password.py" \
+  "$OUT/work" "$OUT/local-admin-password.txt"
 
 printf '%s\n' '== 4/6 打包（必须使用 aapt2）=='
 apktool b "$OUT/work" --use-aapt2 -o "$OUT/unsigned.apk"
@@ -199,12 +226,12 @@ keytool -list -keystore "$KS" -storepass "$KS_PASS" 2>/dev/null | grep -oE '\(SH
 apksigner sign --ks "$KS" --ks-key-alias "$KS_ALIAS" \
   --ks-pass "pass:$KS_PASS" --key-pass "pass:$KS_PASS" \
   --v1-signing-enabled true --v2-signing-enabled true --v3-signing-enabled true \
-  --out "$OUT/M365-Gateway-v3-fixed.apk" "$OUT/aligned.apk"
+  --out "$OUT/$APK_NAME" "$OUT/aligned.apk"
 
 printf '%s\n' '== 6/6 验证 =='
-apksigner verify "$OUT/M365-Gateway-v3-fixed.apk"
-aapt dump badging "$OUT/M365-Gateway-v3-fixed.apk" | grep -E '^package|application-label|launchable-activity|native-code'
-python3 - "$SRC" "$OUT/M365-Gateway-v3-fixed.apk" <<'PY'
+apksigner verify "$OUT/$APK_NAME"
+aapt dump badging "$OUT/$APK_NAME" | grep -E '^package|application-label|launchable-activity|native-code'
+python3 - "$SRC" "$OUT/$APK_NAME" <<'PY'
 import hashlib, sys, zipfile
 old, new = (zipfile.ZipFile(p) for p in sys.argv[1:3])
 h = lambda z, n: hashlib.sha256(z.read(n)).hexdigest()
@@ -219,6 +246,6 @@ print('条目数            :', len(old.namelist()), '->', len(new.namelist()))
 PY
 (
   cd "$OUT"
-  sha256sum M365-Gateway-v3-fixed.apk | tee M365-Gateway-v3-fixed.apk.sha256
+  sha256sum "$APK_NAME" | tee "$APK_NAME.sha256"
 )
-echo "完成：$OUT/M365-Gateway-v3-fixed.apk"
+echo "完成：$OUT/$APK_NAME"

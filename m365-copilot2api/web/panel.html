@@ -1,0 +1,346 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>M365 面板</title>
+<style>
+  :root{--bg:#0f1420;--panel:#171e2e;--panel2:#1d2740;--line:#2a3650;--fg:#e6ecf5;--mut:#9ba9c3;--acc:#4f8cff;--acc2:#76a7ff;--ok:#34d399;--warn:#fbbf24;--bad:#f87171;--shadow:0 12px 28px rgba(0,0,0,.2)}
+  *{box-sizing:border-box}
+  html{-webkit-text-size-adjust:100%;scroll-behavior:smooth}
+  body{margin:0;min-height:100vh;font:15px/1.65 system-ui,-apple-system,"Segoe UI Variable","Segoe UI","Noto Sans SC","Microsoft YaHei UI","Microsoft YaHei",sans-serif;background:radial-gradient(circle at 90% 0,rgba(79,140,255,.13),transparent 30rem),var(--bg);color:var(--fg);letter-spacing:.01em}
+  button,input,select{font:inherit}
+  header{position:sticky;top:0;z-index:20;padding:16px max(18px,env(safe-area-inset-right)) 15px max(18px,env(safe-area-inset-left));display:flex;align-items:center;gap:12px;border-bottom:1px solid rgba(42,54,80,.82);background:rgba(15,20,32,.88);backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px)}
+  header h1{font-size:19px;line-height:1.25;margin:0;font-weight:750;letter-spacing:.01em}
+  header .sub{color:var(--mut);font-size:12px;white-space:nowrap}
+  main{max-width:1120px;margin:0 auto;padding:22px 22px calc(72px + env(safe-area-inset-bottom))}
+  .cards{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}
+  .card,section{background:linear-gradient(145deg,rgba(29,39,64,.76),rgba(23,30,46,.98));border:1px solid var(--line);box-shadow:0 1px 0 rgba(255,255,255,.025),var(--shadow)}
+  .card{border-radius:16px;padding:17px 18px;min-width:0}
+  .card h3{margin:0 0 8px;font-size:13px;color:var(--mut);font-weight:650;letter-spacing:.02em}
+  .big{font-size:30px;line-height:1.15;font-weight:760;font-variant-numeric:tabular-nums}
+  .grid2{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:14px;margin-top:14px}
+  section{border-radius:16px;padding:18px;margin-top:14px;min-width:0}
+  section h2{font-size:16px;line-height:1.35;margin:0 0 14px;font-weight:720}
+  .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:12px}
+  label{color:var(--mut);font-size:13px;font-weight:550}
+  select,input[type=number],input[type=text]{min-height:42px;background:var(--panel2);border:1px solid var(--line);color:var(--fg);border-radius:10px;padding:9px 12px;font-size:14px;outline:0;transition:border-color .18s,box-shadow .18s}
+  select:focus,input:focus{border-color:var(--acc);box-shadow:0 0 0 3px rgba(79,140,255,.16)}
+  .btn{min-height:42px;background:linear-gradient(180deg,var(--acc2),var(--acc));border:1px solid rgba(255,255,255,.08);color:#fff;border-radius:10px;padding:9px 17px;font-size:14px;cursor:pointer;font-weight:680;box-shadow:0 5px 14px rgba(79,140,255,.2);transition:transform .15s,filter .15s,opacity .15s}
+  .btn:hover{filter:brightness(1.06)}
+  .btn:active{transform:translateY(1px)}
+  .btn:disabled{opacity:.5;cursor:not-allowed;box-shadow:none}
+  .btn.gray{background:#33415e;box-shadow:none}
+  .btn.bad{background:#b91c1c;box-shadow:none}
+  pre.log{background:#0b0f1a;border:1px solid var(--line);border-radius:12px;padding:13px;max-height:320px;overflow:auto;font:12px/1.65 "Cascadia Mono","Cascadia Code","SFMono-Regular",Consolas,monospace;white-space:pre-wrap;word-break:break-word;color:#c9d7f0}
+  .ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}
+  .mut{color:var(--mut)}
+  .progress{height:8px;background:var(--panel2);border-radius:999px;overflow:hidden;margin-top:9px}
+  .progress i{display:block;height:100%;background:linear-gradient(90deg,var(--acc),#72a4ff);width:0%;transition:width .4s}
+  .hint{font-size:12px;line-height:1.5;color:var(--mut);overflow-wrap:anywhere}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{text-align:left;padding:9px 8px;border-bottom:1px solid var(--line);vertical-align:top;overflow-wrap:anywhere}
+  th{color:var(--mut);font-weight:650;position:sticky;top:0;background:var(--panel)}
+  .pill{display:inline-flex;align-items:center;border-radius:999px;padding:3px 9px;font-size:12px;line-height:1.5;font-weight:650}
+  .pill.on{background:#0d2b22;color:var(--ok)}
+  .pill.fail{background:#3b1116;color:var(--bad)}
+  .pill.mut{background:#232b3d;color:var(--mut)}
+  .twocol{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:16px}
+  .metric-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-bottom:16px}
+  .metric{background:rgba(11,15,26,.58);border:1px solid var(--line);border-radius:12px;padding:13px;min-width:0}
+  .metric b{display:block;font-size:22px;line-height:1.2;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
+  .metric span{display:block;color:var(--mut);font-size:12px;margin-top:5px}
+  .table-wrap{overflow:auto;max-height:360px;border:1px solid var(--line);border-radius:12px;background:#0b0f1a}
+  .table-wrap table{min-width:620px}
+  .section-head{display:flex;align-items:baseline;justify-content:space-between;gap:12px;flex-wrap:wrap}
+  .section-head h2{margin-bottom:0}
+  footer{color:var(--mut);font-size:12px;padding:18px 24px calc(18px + env(safe-area-inset-bottom));text-align:center}
+  @media(max-width:900px){.cards{grid-template-columns:repeat(2,minmax(0,1fr))}.metric-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.twocol{grid-template-columns:1fr}}
+  @media(max-width:700px){header{align-items:flex-start;flex-direction:column;gap:3px}main{padding:16px 14px calc(62px + env(safe-area-inset-bottom))}.grid2{grid-template-columns:1fr}.card,section{border-radius:14px}.row{align-items:stretch}.row label{width:100%}.row select,.row input[type=number],.row input[type=text]{flex:1;min-width:0}.btn{flex:1;padding-inline:12px}pre.log{max-height:42vh}}
+  @media(max-width:430px){body{font-size:14px}.cards{grid-template-columns:1fr 1fr;gap:10px}.card{padding:14px}.card h3{font-size:12px}.big{font-size:25px}section{padding:15px;margin-top:11px}header h1{font-size:18px}}
+  @media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important;transition:none!important}}
+</style>
+</head>
+<body>
+<header><h1>M365 面板</h1><span class="sub">v3.0.1 · 注册 · 授权导入 · 调度 · 账本</span></header>
+<main>
+  <div class="cards">
+    <div class="card"><h3>账密文件账号</h3><div class="big" id="credTotal">-</div></div>
+    <div class="card"><h3>网关在线</h3><div class="big" id="gwOnline" data-err="0">-</div><div class="hint" id="gwHint"></div></div>
+    <div class="card"><h3>本地授权记录</h3><div class="big" id="oauthDone">-</div>
+      <div class="hint">失败 <span id="oauthFailCount">-</span> · 仅本机日志,账号是否可用以网关为准</div></div>
+    <div class="card"><h3>任务</h3><div class="big" id="jobState">空闲</div><div class="hint" id="jobKind"></div>
+      <div class="progress"><i id="jobProg"></i></div>
+      <p class="hint" id="jobStart"></p></div>
+  </div>
+
+  <section>
+    <div class="section-head">
+      <h2>账号池调度与贡献账本</h2>
+      <span class="hint" id="resourceUpdated">等待刷新</span>
+    </div>
+    <p class="hint">仅调度当前网关内自有或已授权账号；尊重上游限流与 Retry-After，异常资源进入冷却后自动切换。</p>
+    <div class="metric-grid">
+      <div class="metric"><b id="poolAvailable">-</b><span>可用账号 / 总账号</span></div>
+      <div class="metric"><b id="poolInflight">-</b><span>当前上游并发</span></div>
+      <div class="metric"><b id="ledgerRequests">-</b><span>近 30 天请求</span></div>
+      <div class="metric"><b id="ledgerTokens">-</b><span>近 30 天 Token</span></div>
+    </div>
+    <div class="twocol">
+      <div>
+        <h3>资源健康与调度</h3>
+        <div class="table-wrap"><table>
+          <thead><tr><th>资源 ID</th><th>状态</th><th>并发</th><th>调度次数</th><th>最近调度</th></tr></thead>
+          <tbody id="resourceRows"><tr><td colspan="5" class="mut">暂无数据</td></tr></tbody>
+        </table></div>
+      </div>
+      <div>
+        <h3>贡献账本（近 30 天）</h3>
+        <div class="table-wrap"><table>
+          <thead><tr><th>资源账号</th><th>请求</th><th>成功 / 失败</th><th>Token</th><th>累计耗时</th></tr></thead>
+          <tbody id="ledgerRows"><tr><td colspan="5" class="mut">暂无数据</td></tr></tbody>
+        </table></div>
+      </div>
+    </div>
+  </section>
+
+  <div class="twocol">
+    <section>
+      <h2>注册新账号</h2>
+      <div class="row">
+        <label>出口方式</label>
+        <select id="regMode">
+          <option value="phone">手机 LTE (v3)</option>
+          <option value="clash">Clash 机场 (v2)</option>
+          <option value="proxy">DE 代理池 (v1)</option>
+        </select>
+        <label>数量</label>
+        <input id="regCount" type="number" min="1" max="20" value="1">
+        <button class="btn" id="regBtn" onclick="startRegister()">开始注册</button>
+      </div>
+      <p class="hint">每 IP 24h 仅成功 1 次。成功后账号写入 <b>桌面\IP出口\M365账密.txt</b>。</p>
+    </section>
+
+    <section>
+      <h2>OAuth 授权导入</h2>
+      <p class="hint">手机端优先使用网关原生授权。系统会先尝试无需浏览器的授权；如账号要求交互登录,将打开 Microsoft 登录页并由应用接收回调。</p>
+      <div class="row">
+        <input id="oauthEmail" type="email" autocomplete="username" placeholder="Microsoft 账号邮箱" style="min-width:240px;flex:1">
+        <input id="oauthPassword" type="password" autocomplete="current-password" placeholder="账号密码" style="min-width:200px;flex:1">
+        <button class="btn" id="oauthBtn" onclick="startNativeOauth()">手机授权导入</button>
+      </div>
+      <label class="hint" style="display:flex;align-items:center;gap:8px;margin-top:8px">
+        <input id="oauthSaveCredential" type="checkbox"> 将密码加密保存在本机,供以后重新授权使用
+      </label>
+      <div id="nativeOauthState" class="hint" style="margin-top:8px"></div>
+      <details>
+        <summary class="hint mut" style="cursor:pointer;margin-top:10px">桌面 Python 自动化兼容模式</summary>
+        <p class="hint">该模式依赖 Python、Playwright 和桌面 Chromium,不适用于当前仅包含 Go 网关的 Android APK。</p>
+        <div class="row" style="margin-top:6px">
+          <button class="btn gray" onclick="startOauth()">运行单账号 Python OAuth</button>
+          <button class="btn gray" onclick="startOauthBatch()">对未授权账号批量 OAuth</button>
+        </div>
+      </details>
+    </section>
+  </div>
+
+  <section>
+    <h2>运行日志</h2>
+    <div class="row"><button class="btn gray" id="stopBtn" onclick="stopJob()">停止任务</button></div>
+    <pre class="log" id="jobLog"></pre>
+  </section>
+
+  <div class="twocol">
+    <section><h2>网关在线账号</h2><div id="gwList" class="mut">–</div></section>
+    <section><h2>OAuth 进度 / 失败</h2><div id="oauthList" class="mut">–</div></section>
+  </div>
+</main>
+<footer>M365 本地控制面板 · 所有凭据仅本机处理</footer>
+
+<script>
+let currentLogCount = 0;
+async function api(path, body){
+  const r = await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});
+  return r.json().catch(()=>({}));
+}
+function esc(s){return String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+function pill(s){
+  if(s==='online'||s==='success'||s==='ok'||s==='authenticated') return `<span class="pill on">${s}</span>`;
+  if(s.includes('fail')||s.includes('err')||s.includes('exc')||s==='timeout'||s.includes('captcha')||s.includes('locked')) return `<span class="pill fail">${s}</span>`;
+  return `<span class="pill mut">${s}</span>`;
+}
+async function startRegister(){
+  setBusy('regBtn',true);
+  const r = await api('/api/admin/panel/register',{mode:document.getElementById('regMode').value,count:document.getElementById('regCount').value});
+  if(!r.ok){alert(r.error||'启动失败');}
+  setBusy('regBtn',false); poll();
+}
+let nativeOauthTimer = 0;
+function setNativeOauthState(text, bad=false){
+  const el=document.getElementById('nativeOauthState');
+  if(!el)return;
+  el.textContent=text||'';
+  el.classList.toggle('bad',bad);
+}
+async function pollNativeOauth(state){
+  clearTimeout(nativeOauthTimer);
+  try{
+    const r=await fetch('/api/auth/status?state='+encodeURIComponent(state));
+    const j=await r.json();
+    if(j.status==='authenticated'){
+      setNativeOauthState('授权完成,账号已写入当前网关。');
+      setBusy('oauthBtn',false);
+      poll();
+      return;
+    }
+    if(j.terminal){
+      setNativeOauthState(j.error||('授权结束: '+(j.status||'未知状态')),j.status!=='authenticated');
+      setBusy('oauthBtn',false);
+      return;
+    }
+    setNativeOauthState('等待 Microsoft 登录回调…');
+  }catch(e){
+    setNativeOauthState('正在等待网关恢复连接…',true);
+  }
+  nativeOauthTimer=setTimeout(()=>pollNativeOauth(state),1800);
+}
+async function startNativeOauth(){
+  const email=document.getElementById('oauthEmail').value.trim();
+  const password=document.getElementById('oauthPassword').value;
+  const saveCredential=document.getElementById('oauthSaveCredential').checked;
+  if(!email||!password){alert('请输入邮箱和密码');return;}
+  setBusy('oauthBtn',true);
+  setNativeOauthState('正在尝试手机原生授权…');
+  try{
+    const response=await fetch('/api/accounts/web/run-scripts',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({email,password,saveCredential})
+    });
+    const result=await response.json().catch(()=>({}));
+    document.getElementById('oauthPassword').value='';
+    if(!response.ok){
+      setNativeOauthState(result?.error?.message||result.error||'授权启动失败',true);
+      setBusy('oauthBtn',false);
+      return;
+    }
+    if(result.complete){
+      setNativeOauthState('授权完成,账号已写入当前网关。');
+      setBusy('oauthBtn',false);
+      poll();
+      return;
+    }
+    if(result.authorizationUrl&&result.state){
+      setNativeOauthState('请在打开的 Microsoft 页面完成登录。');
+      window.open(result.authorizationUrl,'_blank','noopener,noreferrer');
+      pollNativeOauth(result.state);
+      return;
+    }
+    setNativeOauthState(result.nextStep||'需要完成交互式授权。',true);
+  }catch(e){
+    setNativeOauthState('授权请求失败: '+e.message,true);
+  }
+  setBusy('oauthBtn',false);
+}
+async function startOauth(){
+  const email=document.getElementById('oauthEmail').value.trim();
+  if(!email){alert('请输入邮箱');return;}
+  setBusy('oauthBtn',true);
+  const r = await api('/api/admin/panel/oauth',{email});
+  if(!r.ok){alert(r.error||'启动失败');}
+  setBusy('oauthBtn',false); poll();
+}
+async function startOauthBatch(){
+  const r = await fetch('/api/admin/panel/oauth/batch',{method:'POST'});
+  const j = await r.json();
+  if(!j.ok) alert(j.error||'启动失败');
+  poll();
+}
+async function stopJob(){ await api('/api/admin/panel/job/stop'); poll(); }
+function setBusy(id,on){const el=document.getElementById(id);if(el)el.disabled=on;}
+async function refreshResources(){
+  try{
+    const [statusResponse,ledgerResponse]=await Promise.all([
+      fetch('/api/resources/status'),
+      fetch('/api/contributions/ledger?days=30')
+    ]);
+    if(!statusResponse.ok||!ledgerResponse.ok) throw new Error('HTTP '+statusResponse.status+'/'+ledgerResponse.status);
+    const status=await statusResponse.json();
+    const ledger=await ledgerResponse.json();
+    const scheduler=status.scheduler||{};
+    const concurrency=scheduler.concurrency||{};
+    const inflight=concurrency.inflight||{};
+    const inflightTotal=Object.values(inflight).reduce((sum,value)=>sum+(Number(value)||0),0);
+    document.getElementById('poolAvailable').textContent=`${scheduler.available_accounts||0} / ${scheduler.total_accounts||0}`;
+    document.getElementById('poolInflight').textContent=String(inflightTotal);
+    document.getElementById('ledgerRequests').textContent=Number(ledger.summary?.requests||0).toLocaleString();
+    document.getElementById('ledgerTokens').textContent=Number(ledger.summary?.tokens||0).toLocaleString();
+    const resources=Array.isArray(scheduler.resources)?scheduler.resources:[];
+    const resourceRows=document.getElementById('resourceRows');
+    resourceRows.innerHTML=resources.length?resources.map(resource=>{
+      const health=resource.health||{};
+      const state=resource.available?'online':(health.authFailed?'auth failed':'cooldown');
+      const label=resource.email||resource.id||'unknown';
+      const last=resource.last_selected?new Date(resource.last_selected).toLocaleString():'–';
+      return `<tr><td>${esc(label)}</td><td>${pill(state)}</td><td>${Number(resource.inflight||0)}</td><td>${Number(resource.selected||0).toLocaleString()}</td><td>${esc(last)}</td></tr>`;
+    }).join(''):'<tr><td colspan="5" class="mut">暂无已授权资源</td></tr>';
+    const entries=Array.isArray(ledger.ledger)?ledger.ledger:[];
+    const ledgerRows=document.getElementById('ledgerRows');
+    ledgerRows.innerHTML=entries.length?entries.map(entry=>`<tr><td>${esc(entry.account_email)}</td><td>${Number(entry.requests||0).toLocaleString()}</td><td><span class="ok">${Number(entry.successes||0).toLocaleString()}</span> / <span class="bad">${Number(entry.failures||0).toLocaleString()}</span></td><td>${Number(entry.total_tokens||0).toLocaleString()}</td><td>${Math.round(Number(entry.duration_ms||0)/1000).toLocaleString()}s</td></tr>`).join(''):'<tr><td colspan="5" class="mut">近 30 天暂无调用记录</td></tr>';
+    document.getElementById('resourceUpdated').textContent='更新于 '+new Date().toLocaleTimeString();
+  }catch(error){
+    document.getElementById('resourceUpdated').textContent='调度/账本暂不可用: '+error.message;
+  }
+}
+async function poll(){
+  // 先排空子进程 stdout, 让日志实时
+  try { await fetch('/api/admin/panel/job/poll'); } catch(e){}
+  try{
+    const response=await fetch('/api/admin/panel/state');
+    if(!response.ok) throw new Error('HTTP '+response.status);
+    const s=await response.json();
+    const oauthDone=Array.isArray(s.oauth_done)?s.oauth_done:[];
+    const oauthFails=Array.isArray(s.oauth_fails)?s.oauth_fails:[];
+    const gwEmails=Array.isArray(s.gw_emails)?s.gw_emails:[];
+    const job=s.job||{running:false,kind:'',started:0,log:[]};
+    const jobLog=Array.isArray(job.log)?job.log:[];
+    document.getElementById('credTotal').textContent = Number(s.cred_total||0);
+    document.getElementById('gwOnline').textContent = Number(s.gw_online||0);
+    const gwh=document.getElementById('gwHint');
+    gwh.textContent = s.gw_error || s.native_panel_error || '';
+    gwh.classList.toggle('bad', !!(s.gw_error||s.native_panel_error));
+    document.getElementById('oauthDone').textContent = oauthDone.length;
+    document.getElementById('oauthFailCount').textContent = oauthFails.length;
+    const js = document.getElementById('jobState');
+    js.textContent = job.running ? '运行中' : '空闲';
+    js.className = 'big ' + (job.running?'ok':'mut');
+    document.getElementById('jobKind').textContent = job.kind || '';
+    document.getElementById('jobStart').textContent = job.started?('开始 '+new Date(job.started*1000).toLocaleTimeString()):'';
+    const gwl=document.getElementById('gwList');
+    if(gwEmails.length){
+      gwl.innerHTML = gwEmails.map(e=>`<div>${esc(e)}</div>`).join('');
+    } else gwl.textContent = s.gw_error || '–';
+    const mapa={};
+    oauthDone.forEach(r=>mapa[r.email]=['online',r]);
+    oauthFails.forEach(r=>{if(!mapa[r.email])mapa[r.email]=['fail',r];});
+    const olist=document.getElementById('oauthList');
+    const emails=Object.keys(mapa).sort();
+    olist.innerHTML = emails.length?emails.map(e=>`<div>${esc(e)} ${pill(mapa[e][0])}</div>`).join(''):'–';
+    const log=document.getElementById('jobLog');
+    if(jobLog.length!==currentLogCount){
+      log.textContent = jobLog.join('\n');
+      currentLogCount = jobLog.length;
+      log.scrollTop = log.scrollHeight;
+    }
+  }catch(error){
+    const gwh=document.getElementById('gwHint');
+    gwh.textContent='面板状态暂不可用: '+error.message;
+    gwh.classList.add('bad');
+  }
+  await refreshResources();
+}
+setInterval(poll, 5000);
+poll();
+</script>
+</body>
+</html>

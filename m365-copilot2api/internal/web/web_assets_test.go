@@ -28,8 +28,8 @@ func TestWebAssetsMatchAPKSet(t *testing.T) {
 	sort.Strings(got)
 
 	want := []string{"debug.html", "index.html", "login.html"}
-	extraHTML := []string{"workbench.html"}          // 有意新增，见函数注释
-	extraAssets := []string{"favicon.ico"}           // 有意新增：站点图标（壁纸编号05生成）
+	extraHTML := []string{"panel.html", "workbench.html"} // 有意新增，见函数注释
+	extraAssets := []string{"favicon.ico"}                // 有意新增：站点图标（壁纸编号05生成）
 	allowed := append(append([]string{}, want...), extraHTML...)
 	allowed = append(allowed, extraAssets...)
 	sort.Strings(allowed)

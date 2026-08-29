@@ -60,11 +60,15 @@ func (s *Server) rootPage(w http.ResponseWriter, r *http.Request) {
 		// 恢复时误将其带回，导致 /login 只返回 10611 字节的空壳页面。
 		name = "web/index.html"
 	case "/workbench":
-		// 本次按用户明确要求新增的「仅聊天」前端工作台，与 APK 原始行为无关：
-		// APK rodata 只有 "web/index.html"，不存在 workbench.html，原版 GET
-		// /workbench 应为 404。此分支属于有意的功能扩展，不是上文所述那类凭空
-		// 复原出的虚构路由，请勿按「APK 无此路径」为由直接删除。
+		// 本次按用户明确要求新增的「仅聊天」前端工作台,与 APK 原始行为无关:
+		// APK rodata 只有 "web/index.html",不存在 workbench.html,原版 GET
+		// /workbench 应为 404。此分支属于有意的功能扩展,不是上文所述那类凭空
+		// 复原出的虚构路由,请勿按「APK 无此路径」为由直接删除。
 		name = "web/workbench.html"
+	case "/panel":
+		// 一体化控制面板入口。账号注册、OAuth 授权导入、网关状态和任务日志
+		// 共用 4141 服务及 /api/admin/panel/* 原生接口,不再依赖独立的 8555 端口。
+		name = "web/panel.html"
 	default:
 		http.NotFound(w, r)
 		return

@@ -91,14 +91,17 @@ func (c *accountConcurrency) Snapshot() map[string]any {
 }
 
 func (s *Server) accountAvailable(accountID string) bool {
+	if s == nil || s.tokens == nil || strings.TrimSpace(accountID) == "" {
+		return false
+	}
+	account, ok := s.tokens.Get(accountID)
+	if !ok || account.Status != "online" || strings.TrimSpace(account.AccessToken) == "" {
+		return false
+	}
 	if !s.accountPool.Available(accountID) || !s.accountConcurrency.Available(accountID) {
 		return false
 	}
-	if s.upstreamCooldown == nil || s.tokens == nil {
-		return true
-	}
-	account, ok := s.tokens.Get(accountID)
-	return !ok || !s.upstreamCooldown.blocked(account.Email)
+	return s.upstreamCooldown == nil || !s.upstreamCooldown.blocked(account.Email)
 }
 
 // recordUpstreamCooldown applies the APK's email-keyed backoff only to an

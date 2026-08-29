@@ -195,7 +195,7 @@ go build -o m365-copilot2api ./cmd/server
 
 `manage.py` 已随旧支线一并归档，不再随仓库分发：它内置 `admin123` 回退口令并默认绑定
 `0.0.0.0`，两者都与本仓库「无口令即拒绝启动、默认只听回环」的方向冲突。需要 Windows
-后台常驻请用计划任务或 `docs/windows-service-template.md` 里的服务模板。
+后台常驻请使用当前运行平台提供的进程守护或服务管理功能。
 
 PC 端产物直接运行即可，默认只监听内网 `http://127.0.0.1:4141`：
 
@@ -460,6 +460,8 @@ curl http://127.0.0.1:4141/v1/messages \
 | `/api/conversations` · `/api/m365/conversations` | 本地 / 云端对话列表、删除、清理、白名单 |
 | `/api/stats` · `/stats/reset` | 缓存命中统计 |
 | `/api/usage` · `/usage/logs` | 用量统计仪表盘与明细 |
+| `/api/resources/status` | 账号资源调度状态,包括可用账号数、健康状态、并发占用及调度次数 |
+| `/api/contributions/ledger` | 贡献账本,按资源账号汇总请求量、成功/失败次数、Token 消耗和累计耗时 |
 | `/api/chat` · `/chat/stream` | 控制台内即时对话 |
 | `/api/health` · `/api/version` | 健康检查 / 版本 |
 
@@ -506,7 +508,7 @@ m365-copilot2api/
 │   ├── chathub_probe.py   # ChatHub 协议探针
 │   ├── genprobe.py        # 图像生成协议探针（原始帧 dump）
 │   ├── multimodal_probe.py # 多模态图片输入探针（上传 + 注解流程）
-│   ├── test-recorder.ps1  # Windows 测试录制
+│   ├── e2e_test.py        # 跨平台端到端测试
 │   └── m365-upload-forensic-trace.user.js  # 上传取证脚本
 ├── tools/                 # apktool 等自研二进制分析工具
 ├── docker-compose.yml · Dockerfile   # PC/Linux 容器目标

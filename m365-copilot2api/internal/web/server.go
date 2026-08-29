@@ -196,6 +196,7 @@ type Server struct {
 	accountPool        *accountHealth
 	upstreamCooldown   *accountCooldown
 	accountConcurrency *accountConcurrency
+	resourceScheduler  *resourceScheduler
 	pkce               map[string]pendingPKCE
 	pkceAttempt        uint64
 	// exchangePKCECode is nil in production and falls back to auth.ExchangeCode.
@@ -251,6 +252,7 @@ func New() (*Server, error) {
 		accountPool:        newAccountHealth(),
 		upstreamCooldown:   newAccountCooldown(),
 		accountConcurrency: newAccountConcurrency(),
+		resourceScheduler:  newResourceScheduler(),
 		pkce:               map[string]pendingPKCE{},
 		// One Client for the process lifetime is fine: it holds no snapshot of the
 		// outbound configuration, so proxy-pool and client-profile edits are picked
@@ -359,6 +361,8 @@ func (s *Server) Routes() http.Handler {
 	m.HandleFunc("/api/stats/reset", s.handleCacheStatsReset)
 	m.HandleFunc("/api/usage", s.adminUsage)
 	m.HandleFunc("/api/usage/logs", s.adminUsageLogs)
+	m.HandleFunc("/api/resources/status", s.resourceStatus)
+	m.HandleFunc("/api/contributions/ledger", s.contributionLedger)
 	m.HandleFunc("/v1/mcp", mcp.HandleStreamable)
 	m.HandleFunc("/v1/mcp/sse", mcp.HandleSSE)
 	m.HandleFunc("/v1/mcp/message", mcp.HandleMessage)
@@ -1094,19 +1098,20 @@ func (s *Server) resolveAccount(accountID string) (auth.AccountToken, error) {
 		return auth.AccountToken{}, fmt.Errorf("no accounts; login first")
 	}
 	if accountID == "" {
-		probeLimit := len(s.tokens.List())
-		acc, ok := s.tokens.Next()
-		if !ok {
+		accounts := s.tokens.List()
+		if len(accounts) == 0 {
 			return auth.AccountToken{}, fmt.Errorf("no accounts; login first")
 		}
-		accountID = acc.ID
-		for i := 1; !s.accountAvailable(accountID) && i < probeLimit; i++ {
-			acc, ok = s.tokens.Next()
-			if !ok {
-				break
-			}
-			accountID = acc.ID
+		concurrency := s.accountConcurrency.Snapshot()
+		inflight, _ := concurrency["inflight"].(map[string]int)
+		if s.resourceScheduler == nil {
+			s.resourceScheduler = newResourceScheduler()
 		}
+		acc, ok := s.resourceScheduler.Select(accounts, s.accountAvailable, inflight)
+		if !ok {
+			return auth.AccountToken{}, fmt.Errorf("no online authorized account available; complete OAuth callback first")
+		}
+		accountID = acc.ID
 		if !s.accountAvailable(accountID) {
 			if !s.accountPool.Available(accountID) {
 				until := s.accountPool.EarliestRecovery()
@@ -1429,10 +1434,11 @@ type oaiMsg struct {
 }
 
 type oaiReq struct {
-	Model          string          `json:"model"`
-	ResponseFormat *responseFormat `json:"response_format,omitempty"`
-	Messages       []oaiMsg        `json:"messages"`
-	Stream         bool            `json:"stream"`
+	Model             string          `json:"model"`
+	ResponseFormat    *responseFormat `json:"response_format,omitempty"`
+	Messages          []oaiMsg        `json:"messages"`
+	Stream            bool            `json:"stream"`
+	ParallelToolCalls *bool           `json:"parallel_tool_calls,omitempty"`
 	// optional account routing
 	User           string `json:"user"`
 	AccountID      string `json:"accountId"`
@@ -1739,7 +1745,11 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			s.dropTransientConversation(routeRes.ConversationID)
 		}
 		if routeErr != nil {
-			http.Error(w, "tool router: "+routeErr.Error(), http.StatusBadGateway)
+			msg := upstreamStageError("router", routeErr)
+			if IsRateLimited(routeErr) {
+				msg = "upstream is rate limiting; try again shortly"
+			}
+			writeOpenAIError(w, http.StatusBadGateway, "router_error", msg)
 			return
 		}
 		calls, parsed = parseModelToolDecision(routeRes.Text, toolMaps, body.ToolChoice)

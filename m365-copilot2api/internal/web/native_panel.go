@@ -22,11 +22,13 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"m365-copilot2api/internal/auth"
+	"m365-copilot2api/internal/outbound"
 )
 
 const (
 	nativePanelRootEnv       = "M365_NATIVE_PANEL_ROOT"
-	nativePanelPythonEnv     = "M365_NATIVE_PANEL_PYTHON"
 	nativePanelLogCap        = 800
 	nativePanelPollLogCap    = 200
 	nativePanelMaxRequest    = 32 << 10
@@ -41,11 +43,12 @@ var (
 	errNativePanelUnavailable = errors.New("本地 Python 工作者未配置或不可用")
 )
 
-// nativePanelConfig is process-local. Requests cannot choose a Python binary,
-// script, config path, or working directory.
+// nativePanelConfig is process-local. Requests cannot choose an executable,
+// script, config path, or working directory. OAuth execution is implemented
+// directly by the Go gateway and no Python runtime is configured here.
 type nativePanelConfig struct {
 	Root       string
-	Python     string
+	Python     string // transitional: removed after the remaining registration workers are rewritten
 	LogCap     int
 	PollLogCap int
 }
@@ -53,23 +56,19 @@ type nativePanelConfig struct {
 func defaultNativePanelConfig() nativePanelConfig {
 	root := strings.TrimSpace(os.Getenv(nativePanelRootEnv))
 	if root == "" {
-		// Release layout: place the existing worker tree beside the gateway exe.
+		// Release layout: keep panel data beside the gateway executable.
 		if exe, err := os.Executable(); err == nil {
 			root = filepath.Join(filepath.Dir(exe), "M365-自用")
 		} else {
 			root = "M365-自用"
 		}
 	}
-	python := strings.TrimSpace(os.Getenv(nativePanelPythonEnv))
-	if python == "" {
-		python = "python"
-	}
-	return nativePanelConfig{Root: root, Python: python, LogCap: nativePanelLogCap, PollLogCap: nativePanelPollLogCap}
+	return nativePanelConfig{Root: root, Python: "python", LogCap: nativePanelLogCap, PollLogCap: nativePanelPollLogCap}
 }
 
-// persistedNativePanelConfig resolves the worker location from saved settings so
-// a plain restart keeps registration and OAuth working. The environment variables
-// still take precedence, which matches how every other setting behaves here.
+// persistedNativePanelConfig resolves the panel data location from saved
+// settings so a plain restart keeps credentials and configuration available.
+// The environment variable still takes precedence.
 func persistedNativePanelConfig(server *Server) nativePanelConfig {
 	config := defaultNativePanelConfig()
 	if server == nil || server.settings == nil {
@@ -81,11 +80,6 @@ func persistedNativePanelConfig(server *Server) nativePanelConfig {
 			config.Root = root
 		}
 	}
-	if strings.TrimSpace(os.Getenv(nativePanelPythonEnv)) == "" {
-		if python := strings.TrimSpace(saved.NativePanelPython); python != "" {
-			config.Python = python
-		}
-	}
 	return config
 }
 
@@ -95,9 +89,6 @@ func (c nativePanelConfig) normalized() nativePanelConfig {
 	}
 	if c.PollLogCap <= 0 || c.PollLogCap > c.LogCap {
 		c.PollLogCap = min(c.LogCap, nativePanelPollLogCap)
-	}
-	if strings.TrimSpace(c.Python) == "" {
-		c.Python = "python"
 	}
 	return c
 }
@@ -470,6 +461,13 @@ func (m *nativePanelManager) start(kind, script string, args []string, prepare f
 
 	env := append([]string(nil), os.Environ()...)
 	env = append(env, "PYTHONUTF8=1", "PYTHONIOENCODING=utf-8", "M365_CONFIG="+paths.configPath)
+	// OAuth 工作者直接继承网关当前代理池。原始地址仅通过子进程环境传递,
+	// 不写入日志或浏览器可见的 API 响应。Python 工作者按账号轮换使用。
+	if strings.Contains(kind, "oauth") {
+		if proxies := outbound.ProxyPoolRawURLs(); len(proxies) > 0 {
+			env = append(env, "M365_OAUTH_PROXY_POOL="+strings.Join(proxies, "\n"))
+		}
+	}
 	process, out, err := m.runner.Start(ctx, nativePanelCommand{Program: m.config.Python, Args: append([]string{worker}, args...), Dir: paths.root, Env: env})
 	if err != nil {
 		cancel()
@@ -658,47 +656,6 @@ func nativePanelValidEmail(email string) bool {
 	return at > 0 && at < len(email)-1 && strings.Count(email, "@") == 1
 }
 
-func (m *nativePanelManager) startOAuth(request nativePanelOAuthRequest) (nativePanelJobSnapshot, error) {
-	email := strings.TrimSpace(request.Email)
-	if !nativePanelValidEmail(email) {
-		return nativePanelJobSnapshot{}, errors.New("email 格式无效")
-	}
-	paths, cfg, err := m.workerConfig()
-	if err != nil {
-		return nativePanelJobSnapshot{}, err
-	}
-	credentialPath, err := paths.credentialPath(cfg)
-	if err != nil {
-		return nativePanelJobSnapshot{}, err
-	}
-	credentials, err := nativePanelReadCredentials(credentialPath)
-	if err != nil {
-		return nativePanelJobSnapshot{}, err
-	}
-	password := credentials[email]
-	if strings.TrimSpace(password) == "" {
-		return nativePanelJobSnapshot{}, errors.New("账密文件中找不到该邮箱")
-	}
-	probe := filepath.Join(paths.root, "oauth", "_pw_probe.txt")
-	prepare := func() (func(), error) {
-		f, err := os.OpenFile(probe, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
-		if err != nil {
-			return nil, err
-		}
-		_, writeErr := f.WriteString(password)
-		closeErr := f.Close()
-		if writeErr != nil || closeErr != nil {
-			_ = os.Remove(probe)
-			if writeErr != nil {
-				return nil, writeErr
-			}
-			return nil, closeErr
-		}
-		return func() { _ = os.Remove(probe) }, nil
-	}
-	return m.start("oauth:"+email, "oauth/oauth_auto.py", []string{email}, prepare)
-}
-
 type nativePanelOAuthBatchRequest struct {
 	Concurrent  *bool `json:"concurrent"`
 	Serial      *bool `json:"serial"`
@@ -724,74 +681,15 @@ func (r nativePanelOAuthBatchRequest) serial() bool {
 // maxPanelConcurrency 是注册 / OAuth 批量任务的并发上限。
 //
 // 之前是 16。放开到 64 的前提是两个真实缺陷已经修掉：
-//   1. 批量脚本原来所有账号共用一个 browser context（共用 cookie），并发登录
-//      不同账号会互相顶掉会话，表现为 login_timeout；现在每账号一个独立
-//      context。
-//   2. 网关每次 /api/auth/start 都整表覆盖 PKCE state，前 N-1 个账号回调必然
-//      拿到 invalid state（http400）；现在并发模式下多个 state 并存。
+//  1. 批量脚本原来所有账号共用一个 browser context（共用 cookie），并发登录
+//     不同账号会互相顶掉会话，表现为 login_timeout；现在每账号一个独立
+//     context。
+//  2. 网关每次 /api/auth/start 都整表覆盖 PKCE state，前 N-1 个账号回调必然
+//     拿到 invalid state（http400）；现在并发模式下多个 state 并存。
 //
 // 实测：修复前 3 并发 1 成功 2 失败（204s）；修复后 5 并发 5 成功（12.6s）。
 // 真正的天花板是本机内存与微软风控，不是这个常量，所以上限给到 64 而不是更高。
 const maxPanelConcurrency = 64
-
-func (m *nativePanelManager) startOAuthBatch(request nativePanelOAuthBatchRequest) (nativePanelJobSnapshot, error) {
-	paths, cfg, err := m.workerConfig()
-	if err != nil {
-		return nativePanelJobSnapshot{}, err
-	}
-	start := nativePanelPositive(request.Start, 1)
-	if start < 1 || start > 1_000_000 || request.Limit < 0 || request.Limit > 1000 {
-		return nativePanelJobSnapshot{}, errors.New("批量 OAuth 参数无效")
-	}
-	// 邮箱编号区间优先。oauth_batch*.py 的 --start 是排序后账密清单的 1-based
-	// 下标，所以必须先把编号区间解析成「下标 + 数量」，否则 482 会被当成下标
-	// 而启动 24s055526 —— 这正是用户报告的现象。
-	if r, provided, rangeErr := resolveEmailRange(request.StartNum, request.EndNum, request.Limit); provided {
-		if rangeErr != nil {
-			return nativePanelJobSnapshot{}, rangeErr
-		}
-		credentialPath, pathErr := paths.credentialPath(cfg)
-		if pathErr != nil {
-			return nativePanelJobSnapshot{}, pathErr
-		}
-		credentials, readErr := nativePanelReadCredentials(credentialPath)
-		if readErr != nil {
-			return nativePanelJobSnapshot{}, readErr
-		}
-		matched, position, selErr := selectEmailsInRange(credentials, strings.TrimSpace(cfg.Register.EmailPrefix), r)
-		if selErr != nil {
-			return nativePanelJobSnapshot{}, selErr
-		}
-		start = position
-		request.Limit = len(matched)
-	}
-	if request.serial() {
-		args := []string{}
-		if start > 1 {
-			args = append(args, "--start", strconv.Itoa(start))
-		}
-		if request.Limit > 0 {
-			args = append(args, "--limit", strconv.Itoa(request.Limit))
-		}
-		return m.start("oauth:batch", "oauth/oauth_batch.py", args, nil)
-	}
-	concurrency := nativePanelClamp(nativePanelPositive(request.Concurrency, 3), 1, maxPanelConcurrency)
-	timeout := nativePanelClamp(nativePanelPositive(request.Timeout, 300), 60, 900)
-	args := []string{"--concurrency", strconv.Itoa(concurrency), "--timeout", strconv.Itoa(timeout)}
-	if request.Resume {
-		args = append(args, "--resume")
-	}
-	if request.Reset {
-		args = append(args, "--reset")
-	}
-	if start > 1 {
-		args = append(args, "--start", strconv.Itoa(start))
-	}
-	if request.Limit > 0 {
-		args = append(args, "--limit", strconv.Itoa(request.Limit))
-	}
-	return m.start(fmt.Sprintf("oauth:batch×%d", concurrency), "oauth/oauth_batch_concurrent.py", args, nil)
-}
 
 func (m *nativePanelManager) state(server *Server) map[string]any {
 	state := map[string]any{"native_panel": true, "native_panel_ready": false, "cred_total": 0, "register_ready": false, "job": m.snapshot()}
@@ -929,10 +827,36 @@ func (c *nativePanelController) ServeHTTP(w http.ResponseWriter, r *http.Request
 			return
 		}
 		var body nativePanelOAuthRequest
-		if nativePanelDecodeJSON(w, r, &body, false) {
-			snapshot, err := c.manager.startOAuth(body)
-			c.writeStart(w, snapshot, err)
+		if !nativePanelDecodeJSON(w, r, &body, false) {
+			return
 		}
+		email := strings.TrimSpace(body.Email)
+		if !nativePanelValidEmail(email) {
+			writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "email 格式无效")
+			return
+		}
+		if c.server == nil {
+			writeOpenAIError(w, http.StatusServiceUnavailable, "panel_unavailable", "OAuth 服务不可用")
+			return
+		}
+		state, authorizationURL, attempt, redirectURI, err := c.server.beginPKCEAuthorization("login")
+		if err != nil {
+			writeOpenAIError(w, http.StatusInternalServerError, "pkce_error", err.Error())
+			return
+		}
+		jsonOut(w, map[string]any{
+			"ok":               true,
+			"status":           "manual_step_required",
+			"mode":             "pkce",
+			"complete":         false,
+			"email":            email,
+			"state":            state,
+			"attempt":          attempt,
+			"authorizationUrl": authorizationURL,
+			"redirectUri":      redirectURI,
+			"logoutUrl":        auth.LogoutURL(),
+			"nextStep":         "请在打开的 Microsoft 页面完成登录,回调完成后账号会自动加入网关。",
+		})
 	case "/api/admin/panel/oauth/batch":
 		if r.Method != http.MethodPost {
 			w.Header().Set("Allow", http.MethodPost)
@@ -940,10 +864,10 @@ func (c *nativePanelController) ServeHTTP(w http.ResponseWriter, r *http.Request
 			return
 		}
 		var body nativePanelOAuthBatchRequest
-		if nativePanelDecodeJSON(w, r, &body, true) {
-			snapshot, err := c.manager.startOAuthBatch(body)
-			c.writeStart(w, snapshot, err)
+		if !nativePanelDecodeJSON(w, r, &body, true) {
+			return
 		}
+		writeOpenAIError(w, http.StatusNotImplemented, "batch_oauth_requires_interaction", "批量 OAuth 已停止调用 Python Worker。请使用单账号 PKCE 授权,完成一个账号后再启动下一个账号。")
 	default:
 		writeOpenAIError(w, http.StatusNotFound, "not_found", "unknown native panel route")
 	}
