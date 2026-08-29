@@ -62,7 +62,7 @@
 </style>
 </head>
 <body>
-<header><h1>M365 面板</h1><span class="sub">授权导入 · 调度 · 账本</span></header>
+<header><h1>M365 面板</h1><span class="sub">注册 · 授权导入 · 调度 · 账本</span></header>
 <main>
   <div class="cards">
     <div class="card"><h3>账密文件账号</h3><div class="big" id="credTotal">-</div>
@@ -112,7 +112,31 @@
       <input id="oauthSaveCredential" type="checkbox"> 将密码加密保存在本机,供以后重新授权使用
     </label>
     <div id="nativeOauthState" class="hint" style="margin-top:8px"></div>
-    <p class="hint" style="margin-top:10px">账号注册与批量授权已不在网关内提供：原实现依赖 Python、Playwright 与桌面 Chromium，Android 环境无法运行。请在其他环境完成注册，再在此处逐个授权导入。</p>
+    <p class="hint" style="margin-top:10px">批量授权走账密清单：先 ROPC，被拒再发设备码，仍不行才打开 PKCE 登录页。</p>
+    <div class="row">
+      <input id="oauthStartNum" type="number" min="1" placeholder="起始编号">
+      <input id="oauthEndNum" type="number" min="1" placeholder="结束编号">
+      <label class="hint" style="display:flex;align-items:center;gap:8px"><input id="oauthResume" type="checkbox" checked> 跳过已在线</label>
+      <button class="btn gray" id="oauthBatchBtn" onclick="startOauthBatch()">批量授权</button>
+    </div>
+    <div id="oauthBatchState" class="hint" style="margin-top:8px"></div>
+  </section>
+
+  <section>
+    <h2>注册新账号</h2>
+    <p class="hint">Go 内置注册会先换出口 IP，再 POST 站点 /api/register。Turnstile token 仍须从浏览器复制，网关不再内嵌 Chromium。</p>
+    <div class="row">
+      <select id="regMode">
+        <option value="phone">手机换IP</option>
+        <option value="clash">Clash 节点</option>
+        <option value="proxy">当前代理</option>
+      </select>
+      <input id="regStartNum" type="number" min="1" placeholder="起始编号">
+      <input id="regCount" type="number" min="1" max="20" value="1">
+      <input id="regTurnstile" type="text" placeholder="Turnstile token" style="flex:1;min-width:220px">
+      <button class="btn" id="regBtn" onclick="startRegister()">开始注册</button>
+    </div>
+    <div id="regState" class="hint"></div>
   </section>
 
   <section><h2>网关在线账号</h2><div id="gwList" class="mut">–</div></section>
@@ -193,6 +217,59 @@ async function startNativeOauth(){
     setNativeOauthState('授权请求失败: '+e.message,true);
   }
   setBusy('oauthBtn',false);
+}
+async function startOauthBatch(){
+  const startNum=parseInt(document.getElementById('oauthStartNum').value||'0',10);
+  const endNum=parseInt(document.getElementById('oauthEndNum').value||'0',10);
+  const resume=document.getElementById('oauthResume').checked;
+  const el=document.getElementById('oauthBatchState');
+  setBusy('oauthBatchBtn',true);
+  el.textContent='正在批量授权…';
+  try{
+    const response=await fetch('/api/admin/panel/oauth/batch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({startNum,endNum,resume})});
+    const result=await response.json().catch(()=>({}));
+    if(!response.ok){
+      el.textContent=result?.error?.message||result.error||'批量授权失败';
+      el.classList.add('bad');
+      return;
+    }
+    el.classList.remove('bad');
+    el.textContent=`导入 ${result.imported||0} · 待确认 ${result.pending||0} · 跳过 ${result.skipped||0} · 失败 ${result.failed||0}`;
+    const pending=(result.accounts||[]).find(a=>a.authorizationUrl);
+    if(pending&&pending.authorizationUrl) window.open(pending.authorizationUrl,'_blank','noopener,noreferrer');
+    poll();
+  }catch(e){
+    el.textContent='批量授权失败: '+e.message;
+    el.classList.add('bad');
+  }finally{
+    setBusy('oauthBatchBtn',false);
+  }
+}
+async function startRegister(){
+  const mode=document.getElementById('regMode').value;
+  const startNum=parseInt(document.getElementById('regStartNum').value||'0',10);
+  const count=parseInt(document.getElementById('regCount').value||'1',10);
+  const turnstileToken=document.getElementById('regTurnstile').value.trim();
+  const el=document.getElementById('regState');
+  setBusy('regBtn',true);
+  el.textContent='正在注册…';
+  try{
+    const response=await fetch('/api/admin/panel/register',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode,startNum,count,turnstileToken})});
+    const result=await response.json().catch(()=>({}));
+    if(!response.ok){
+      el.textContent=result?.error?.message||result.error||'注册失败';
+      el.classList.add('bad');
+      return;
+    }
+    el.classList.remove('bad');
+    el.textContent=`成功 ${result.success||0} · 失败 ${result.failed||0}`;
+    poll();
+  }catch(e){
+    el.textContent='注册失败: '+e.message;
+    el.classList.add('bad');
+  }finally{
+    setBusy('regBtn',false);
+  }
 }
 async function refreshResources(){
   try{

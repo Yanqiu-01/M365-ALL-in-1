@@ -33,29 +33,20 @@ func panelRequest(t *testing.T, server *Server, cookie *http.Cookie, method, pat
 	return recorder
 }
 
-// 注册、批量 OAuth 与任务日志随 Python 工作者一并移除。路由必须仍然存在并给出
-// 501 + 明确原因：静默 404 或「找不到 Python 工作者」都会让用户无从判断。
+// job/poll 与 job/stop 随 Python 子进程一并移除，必须仍给出 501。
+// 注册与批量 OAuth 已经改成 Go 实现，不再走这条路径。
 func TestNativePanelRemovedRoutesAnswer501WithReason(t *testing.T) {
 	server, cookie := panelTestServer(t)
-	cases := map[string]string{
-		"/api/admin/panel/register":    `{"mode":"phone","count":1}`,
-		"/api/admin/panel/oauth/batch": `{"concurrency":3}`,
-		"/api/admin/panel/job/stop":    `{}`,
+	stop := panelRequest(t, server, cookie, http.MethodPost, "/api/admin/panel/job/stop", `{}`)
+	if stop.Code != http.StatusNotImplemented {
+		t.Errorf("job/stop status = %d, want 501", stop.Code)
 	}
-	for path, body := range cases {
-		recorder := panelRequest(t, server, cookie, http.MethodPost, path, body)
-		if recorder.Code != http.StatusNotImplemented {
-			t.Errorf("%s status = %d, want 501", path, recorder.Code)
-		}
-		if !strings.Contains(recorder.Body.String(), "feature_removed") {
-			t.Errorf("%s body missing feature_removed: %s", path, recorder.Body.String())
-		}
-		if strings.Contains(recorder.Body.String(), "Python 工作者未配置") {
-			t.Errorf("%s 仍在提示依赖 Python 工作者: %s", path, recorder.Body.String())
-		}
+	if !strings.Contains(stop.Body.String(), "feature_removed") {
+		t.Errorf("job/stop body missing feature_removed: %s", stop.Body.String())
 	}
-
-	// job/poll 用 GET，同样必须是明确的 501 而不是空任务快照。
+	if strings.Contains(stop.Body.String(), "Python 工作者未配置") {
+		t.Errorf("job/stop 仍在提示依赖 Python 工作者: %s", stop.Body.String())
+	}
 	recorder := panelRequest(t, server, cookie, http.MethodGet, "/api/admin/panel/job/poll", "")
 	if recorder.Code != http.StatusNotImplemented {
 		t.Errorf("job/poll status = %d, want 501", recorder.Code)
@@ -85,14 +76,14 @@ func TestRegisterNativePanelRoutesCoversRemovedPaths(t *testing.T) {
 	}
 }
 
-// 数据目录缺失时状态要如实报告，并且明确声明注册与批量 OAuth 不受支持，
-// 前端据此不再渲染入口。
+// 数据目录缺失时状态要如实报告。注册与批量 OAuth 的 Go 实现仍然可用，
+// 但 native_panel_ready 必须为 false，避免界面假装已经读到账密清单。
 func TestNativePanelStateReportsUnsupportedFeatures(t *testing.T) {
 	manager := newNativePanelManager(nativePanelConfig{Root: filepath.Join(t.TempDir(), "missing")})
 	state := manager.state(nil)
 	for _, key := range []string{"register_supported", "batch_oauth_supported"} {
-		if value, ok := state[key].(bool); !ok || value {
-			t.Errorf("state[%q] = %v, want false", key, state[key])
+		if value, ok := state[key].(bool); !ok || !value {
+			t.Errorf("state[%q] = %v, want true", key, state[key])
 		}
 	}
 	if ready, _ := state["native_panel_ready"].(bool); ready {
@@ -100,9 +91,6 @@ func TestNativePanelStateReportsUnsupportedFeatures(t *testing.T) {
 	}
 	if _, exists := state["job"]; exists {
 		t.Error("任务机制已移除，state 不应再返回 job 字段")
-	}
-	if _, exists := state["register_ready"]; exists {
-		t.Error("register_ready 已被 register_supported 取代")
 	}
 }
 

@@ -59,7 +59,7 @@
 > build/android/  安卓端 APK 重打包、冒烟测试、smali 补丁
 > docs/           部署文档、安全审计、界面截图
 > scripts/        运维与协议探针脚本
-> tools/          apktool 等自研分析工具
+> tools/          apktool、exit-rotate（Rust 换 IP CLI）等自研工具
 > ```
 >
 > **源码来历需要说明**：安卓分支的原始改动源码已丢失，仅剩一个可正常工作的 APK。
@@ -141,6 +141,8 @@ M365 Copilot2API 是一个用 Go 编写的自托管网关，把微软 365 Copilo
 | 会话显式绑定 | `X-M365-Session-Id` 请求头精确指定要继续的会话 |
 | 自动清理 | 按闲置时间（默认 2h）或保留数量回收云端对话 |
 | 多账号管理 | PKCE 授权 + 账号轮询 + 故障自动转移 |
+| 批量 OAuth | Go 内置：ROPC → 设备码 → PKCE，不再调用 Python / Playwright |
+| 换 IP 注册 | Go 编排 + Rust `exit-rotate`：手机飞行模式 / Clash 节点 / 当前代理；Turnstile token 仍须由浏览器提供 |
 | API Key 管理 | 控制台创建 / 撤销 / 回读 |
 | 代理池 | HTTP / HTTPS / SOCKS5 代理轮换、健康检查、失败冷却 |
 | 用量统计 | 按 key / 账号 / 模型 / 端点聚合（`usage.jsonl`） |
@@ -455,6 +457,7 @@ curl http://127.0.0.1:4141/v1/messages \
 | `/api/admin/proxy-pool` | 代理池管理 |
 | `/api/accounts` · `/refresh` · `/delete` | 账号管理 |
 | `/api/auth/start` · `status` · `callback` | PKCE 授权流程 |
+| `/api/admin/panel/state` · `/register` · `/oauth` · `/oauth/batch` | 本地面板：账密清单、Go 注册、单账号/批量 OAuth |
 | `/api/conversations` · `/api/m365/conversations` | 本地 / 云端对话列表、删除、清理、白名单 |
 | `/api/stats` · `/stats/reset` | 缓存命中统计 |
 | `/api/usage` · `/usage/logs` | 用量统计仪表盘与明细 |
@@ -485,7 +488,8 @@ m365-copilot2api/
 │   │   ├── usage.go               # usage.jsonl 用量统计
 │   │   └── ...                    # 工具调用、协议转换、代理池、密钥管理等
 │   ├── chathub/           # M365 Copilot ChatHub WebSocket 客户端
-│   ├── auth/              # OAuth / PKCE
+│   ├── auth/              # OAuth / PKCE / ROPC / 设备码
+│   ├── exitrotate/        # 换出口 IP（Rust CLI 优先，Go 回退）
 │   ├── mcp/               # MCP 工具网关（SSE / JSON-RPC）
 │   └── outbound/          # HTTP 代理池
 ├── web/                   # 管理控制台（纯 HTML / JS 单页）
@@ -507,7 +511,7 @@ m365-copilot2api/
 │   ├── multimodal_probe.py # 多模态图片输入探针（上传 + 注解流程）
 │   ├── e2e_test.py        # 跨平台端到端测试
 │   └── m365-upload-forensic-trace.user.js  # 上传取证脚本
-├── tools/                 # apktool 等自研二进制分析工具
+├── tools/                 # apktool、exit-rotate（Rust 换 IP CLI）等自研工具
 ├── docker-compose.yml · Dockerfile   # PC/Linux 容器目标
 └── data/                  # 运行数据（由 M365_DATA_DIR 指定）
 ```

@@ -1,0 +1,10 @@
+[package]
+name = "exit-rotate"
+version = "0.1.0"
+edition = "2021"
+description = "Rotate the registration exit IP: phone airplane-mode, Clash node switch, or proxy probe."
+publish = false
+
+[[bin]]
+name = "exit-rotate"
+path = "src/main.rs"

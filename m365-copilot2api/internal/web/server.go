@@ -1566,6 +1566,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	body.SessionID = firstNonEmpty(body.SessionID, body.SessionIDC)
 	log.Printf("[req-trace] id=%s stage=body_parsed messages=%d tools=%d choice=%s raw_bytes=%d", requestID, len(body.Messages), len(body.Tools), normalizedToolChoiceMode(body.ToolChoice), len(raw))
 	stage(requestID, "body_parsed", map[string]any{"messages": len(body.Messages), "tools": len(body.Tools), "raw_bytes": len(raw)})
+	body.Messages = ensureRuntimeWorkspaceInstruction(body.Messages)
 	if cleaned, notes := sanitizeToolConversation(body.Messages); len(notes) > 0 {
 		body.Messages = cleaned
 		log.Printf("[req-trace] id=%s stage=tool_history_sanitized drops=%d detail=%v", requestID, len(notes), notes)

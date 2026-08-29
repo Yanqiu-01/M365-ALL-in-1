@@ -1,17 +1,17 @@
 package web
 
-// 原生面板：账号数据目录 + Go 内置 OAuth。
+// 原生面板：账号数据目录 + Go 内置注册 / OAuth。
 //
 // 历史：注册与批量 OAuth 曾由 4141 网关拉起 M365-自用/ 下的 Python 工作者
-// （Register/*.py、oauth/*.py）完成，Go 只负责进程生命周期。那些脚本依赖
-// Playwright、桌面 Chromium 与 Cloudflare Turnstile，在 Android APK 里没有
-// 运行条件，已随工程一并删除。因此本文件不再有任何子进程编排：
+// （Register/*.py、oauth/*.py）完成。那些脚本依赖 Playwright、桌面 Chromium
+// 与 Cloudflare Turnstile，已随工程删除。当前分工：
 //
-//   - 数据目录（config.json、账密清单）仍然读取，供面板状态与账密补齐使用；
+//   - 数据目录（config.json、账密清单）仍然读取，供面板状态与账密补齐使用。
 //     目录位置由 M365_NATIVE_PANEL_ROOT 或已保存设置决定，属用户数据而非仓库代码。
-//   - 单账号授权完全由 Go 的 PKCE 流程实现，不需要 Python 运行时。
-//   - 注册、批量 OAuth 和任务日志三类路由仍然注册，但一律返回 501 并说明原因，
-//     这样旧前端或外部脚本得到的是明确答复，而不是 404 或「找不到 Python 工作者」。
+//   - 批量 OAuth 走 Go：ROPC → Device Code → PKCE，不再驱动浏览器填账密。
+//   - 注册走 Go：换 IP（Rust CLI 优先，Go 回退）+ POST /api/register。Turnstile
+//     token 仍须由调用方从浏览器拿到，网关不再内嵌 Chromium。
+//   - job/poll 与 job/stop 仍返回 501：已经没有可轮询的子进程。
 
 import (
 	"bufio"
@@ -110,17 +110,32 @@ func (c nativePanelConfig) paths() (nativePanelPaths, error) {
 }
 
 // nativePanelFileConfig 只保留 Go 侧真正会读的字段：网关地址用于状态展示，
-// register 段用于账密清单定位与邮箱编号解析（账号仍由用户在别处注册）。
+// register 段用于账密清单、邮箱编号、换 IP 与 /api/register 提交。
 type nativePanelFileConfig struct {
 	Gateway struct {
 		Host string `json:"host"`
 		Port int    `json:"port"`
 	} `json:"gateway"`
 	Register struct {
+		SiteURL        string `json:"site_url"`
+		TurnstileSite  string `json:"turnstile_sitekey"`
 		EmailDomain    string `json:"email_domain"`
 		EmailPrefix    string `json:"email_prefix"`
+		Password       string `json:"password"`
+		PlanID         string `json:"plan_id"`
+		DomainID       string `json:"domain_id"`
 		EmailStartNum  int    `json:"email_start_num"`
+		DisplayBase    int    `json:"display_base"`
 		CredentialFile string `json:"cred_file"`
+		PhoneSOCKS     string `json:"phone_socks"`
+		ClashAPI       string `json:"clash_api"`
+		ClashSecret    string `json:"clash_secret"`
+		ClashGroup     string `json:"clash_group"`
+		ClashProxy     string `json:"clash_proxy"`
+		ClashNodes     []struct {
+			Name     string `json:"name"`
+			ExpectIP string `json:"expect_ip"`
+		} `json:"clash_nodes"`
 	} `json:"register"`
 }
 
@@ -233,14 +248,16 @@ func nativePanelValidEmail(email string) bool {
 }
 
 func (m *nativePanelManager) state(server *Server) map[string]any {
-	// register_supported / batch_oauth_supported 是给前端的明确判据：这两项
-	// 已随 Python 工作者一起移除，界面不应再给出入口。
+	// register_supported / batch_oauth_supported 告诉前端：Go 内置实现可用。
+	// 注册仍需要调用方提供 Turnstile token；批量 OAuth 走 ROPC / 设备码 / PKCE。
 	state := map[string]any{
-		"native_panel":          true,
-		"native_panel_ready":    false,
-		"cred_total":            0,
-		"register_supported":    false,
-		"batch_oauth_supported": false,
+		"native_panel":             true,
+		"native_panel_ready":       false,
+		"cred_total":               0,
+		"register_supported":       true,
+		"batch_oauth_supported":    true,
+		"register_needs_turnstile": true,
+		"oauth_modes":              []string{"ropc", "device_code", "pkce"},
 	}
 	if server != nil && server.tokens != nil {
 		accounts := server.tokens.List()
@@ -259,6 +276,7 @@ func (m *nativePanelManager) state(server *Server) map[string]any {
 		return state
 	}
 	state["native_panel_ready"] = true
+	state["register_ready"] = cfg.registerReady()
 	credentialPath, err := paths.credentialPath(cfg)
 	if err == nil {
 		state["cred_file"] = credentialPath
@@ -312,10 +330,8 @@ func nativePanelDecodeJSON(w http.ResponseWriter, r *http.Request, target any, a
 // nativePanelRemovedRoutes 保留旧路由但明确答复 501。逐条给出原因和可行替代，
 // 避免用户在界面上按下按钮后只看到一句无法定位的失败。
 var nativePanelRemovedRoutes = map[string]string{
-	"/api/admin/panel/register":    "账号注册工作者已移除：原实现依赖 Python、Playwright 与桌面 Chromium，Android 网关无法运行。请在其他环境完成注册后，用单账号 PKCE 授权导入。",
-	"/api/admin/panel/oauth/batch": "批量 OAuth 已移除：原实现依赖 Python 浏览器自动化。请使用单账号 PKCE 授权，完成一个账号后再授权下一个。",
-	"/api/admin/panel/job/poll":    "任务日志已移除：网关不再拉起本地工作者进程，没有可轮询的任务。",
-	"/api/admin/panel/job/stop":    "任务停止已移除：网关不再拉起本地工作者进程，没有可停止的任务。",
+	"/api/admin/panel/job/poll": "任务日志已移除：网关不再拉起本地 Python 工作者进程。注册与批量 OAuth 改为同步返回结果。",
+	"/api/admin/panel/job/stop": "任务停止已移除：网关不再拉起本地 Python 工作者进程。",
 }
 
 type nativePanelController struct {
@@ -356,6 +372,38 @@ func (c *nativePanelController) ServeHTTP(w http.ResponseWriter, r *http.Request
 			return
 		}
 		jsonOut(w, c.manager.state(c.server))
+	case "/api/admin/panel/register":
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", http.MethodPost)
+			writeOpenAIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "POST required")
+			return
+		}
+		var body panelRegisterRequest
+		if !nativePanelDecodeJSON(w, r, &body, false) {
+			return
+		}
+		report, err := c.server.runRegister(r.Context(), c.manager, body)
+		if err != nil {
+			writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+			return
+		}
+		jsonOut(w, report)
+	case "/api/admin/panel/oauth/batch":
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", http.MethodPost)
+			writeOpenAIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "POST required")
+			return
+		}
+		var body panelOAuthBatchRequest
+		if !nativePanelDecodeJSON(w, r, &body, true) {
+			return
+		}
+		report, err := c.server.runOAuthBatch(r.Context(), c.manager, body)
+		if err != nil {
+			writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+			return
+		}
+		jsonOut(w, report)
 	case "/api/admin/panel/oauth":
 		if r.Method != http.MethodPost {
 			w.Header().Set("Allow", http.MethodPost)
@@ -411,10 +459,14 @@ func (s *Server) NativePanelHandler(w http.ResponseWriter, r *http.Request) {
 	newNativePanelController(s, nativePanelManagerFor(s)).ServeHTTP(w, r)
 }
 
-// RegisterNativePanelRoutes is the single server.go integration point. 已移除的
-// 四条路由仍然登记，由 ServeHTTP 统一答复 501。
+// RegisterNativePanelRoutes is the single server.go integration point.
 func (s *Server) RegisterNativePanelRoutes(mux *http.ServeMux) {
-	paths := []string{"/api/admin/panel/state", "/api/admin/panel/oauth"}
+	paths := []string{
+		"/api/admin/panel/state",
+		"/api/admin/panel/oauth",
+		"/api/admin/panel/oauth/batch",
+		"/api/admin/panel/register",
+	}
 	for path := range nativePanelRemovedRoutes {
 		paths = append(paths, path)
 	}

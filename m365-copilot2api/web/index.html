@@ -2111,6 +2111,39 @@ if (response.output_text) {
         </div>
         
 <div class="card">
+  <div class="card-head"><h3 class="card-title">注册新账号</h3><span class="card-note" id="panelRegState"></span></div>
+  <div class="card-body">
+    <p class="form-hint" style="margin-bottom:var(--sp-2)">Go 内置注册：先换出口 IP（手机飞行模式 / Clash 节点 / 当前代理），再 POST 站点 /api/register。Cloudflare Turnstile token 仍须从浏览器拿到，网关不再内嵌 Chromium。</p>
+    <div style="display:flex;gap:var(--sp-3);flex-wrap:wrap;align-items:flex-end">
+      <div class="form-group" style="margin:0;min-width:130px"><label class="form-label" for="regMode">注册模式</label>
+        <select class="form-input" id="regMode"><option value="phone">手机换IP</option><option value="clash">Clash 节点</option><option value="proxy">当前代理</option></select></div>
+      <div class="form-group" style="margin:0;width:110px"><label class="form-label" for="regStartNum">起始编号</label>
+        <input class="form-input" id="regStartNum" type="number" min="1" placeholder="5026"></div>
+      <div class="form-group" style="margin:0;width:80px"><label class="form-label" for="regCount">数量</label>
+        <input class="form-input" id="regCount" type="number" min="1" max="20" value="1"></div>
+      <div class="form-group" style="margin:0;flex:1;min-width:220px"><label class="form-label" for="regTurnstile">Turnstile token</label>
+        <input class="form-input" id="regTurnstile" placeholder="从注册页 input[name=cf-turnstile-response] 复制"></div>
+      <button type="button" class="btn primary" onclick="panelStartRegister()">开始注册</button>
+    </div>
+    <p class="form-hint" id="regResult" aria-live="polite" style="margin-top:var(--sp-2)"></p>
+  </div>
+</div>
+<div class="card">
+  <div class="card-head"><h3 class="card-title">批量 OAuth 授权导入</h3></div>
+  <div class="card-body">
+    <p class="form-hint" style="margin-bottom:var(--sp-2)">对账密清单里的账号走 Go 内置授权：先 ROPC，被拒再发设备码，仍不行才打开 PKCE 登录页。不再调用 Python / Playwright。</p>
+    <div style="display:flex;gap:var(--sp-3);flex-wrap:wrap;align-items:flex-end">
+      <div class="form-group" style="margin:0;width:110px"><label class="form-label" for="oauthStartNum">起始编号</label>
+        <input class="form-input" id="oauthStartNum" type="number" min="1" placeholder="5026"></div>
+      <div class="form-group" style="margin:0;width:110px"><label class="form-label" for="oauthEndNum">结束编号</label>
+        <input class="form-input" id="oauthEndNum" type="number" min="1" placeholder="5100"></div>
+      <label style="display:flex;align-items:center;gap:4px;font-size:13px"><input type="checkbox" id="oauthBatchResume" checked>跳过已在线账号</label>
+      <button type="button" class="btn primary" onclick="panelStartOauthBatch()">开始批量授权</button>
+    </div>
+    <p class="form-hint" id="oauthBatchResult" aria-live="polite" style="margin-top:var(--sp-2)"></p>
+  </div>
+</div>
+<div class="card">
           <div class="card-head">
             <h3 class="card-title">已授权账号</h3>
             <div class="card-head-actions">
@@ -2996,7 +3029,7 @@ function showPage(p){
   // 对话详情在窄屏是 fixed 覆盖层，切页时必须收起，否则会盖住新页面
   if(p!=='conversations')$('convDetail')?.classList.remove('is-open');
   if(p==='dashboard'){loadStats();loadUsage();loadOnboarding();}
-  if(p==='accounts'){loadAccounts();loadCredentials();}
+  if(p==='accounts'){loadAccounts();loadCredentials();loadPanelState();}
   if(p==='apikeys'){loadKeys();loadUsage();}
   // 请求明细页：拉一次明细并启动实时指标轮询；离开该页时停轮询。
   if(p==='requests'){loadUsageLogs();startLiveMetrics();}else{stopLiveMetrics();}
@@ -5988,6 +6021,46 @@ function showLogin(){
   $('loginPassword')?.focus();
 }
 
+
+async function loadPanelState(){
+  try{
+    const d=await api('/api/admin/panel/state');
+    const note=$('panelRegState');
+    if(note){
+      const bits=[];
+      bits.push(d.register_ready?'注册配置已就绪':'注册配置不完整');
+      if(d.cred_total)bits.push('账密 '+d.cred_total+' 条');
+      if(d.cred_num_min&&d.cred_num_max)bits.push('编号 '+d.cred_num_min+'-'+d.cred_num_max);
+      note.textContent=bits.join(' · ');
+    }
+    const rs=$('regStartNum'),os=$('oauthStartNum');
+    if(rs&&!rs.value&&d.cred_num_max)rs.value=d.cred_num_max+1;
+    if(os&&!os.value&&d.cred_num_min)os.value=d.cred_num_min;
+  }catch(e){}
+}
+async function panelStartRegister(){
+  const body={mode:$('regMode')?.value||'phone',count:parseInt($('regCount')?.value)||1,startNum:parseInt($('regStartNum')?.value)||0,turnstileToken:($('regTurnstile')?.value||'').trim()};
+  const out=$('regResult');
+  if(out)out.textContent='提交注册…';
+  try{
+    const d=await api('/api/admin/panel/register',{method:'POST',body:JSON.stringify(body)});
+    const ok=d.success||0, fail=d.failed||0;
+    if(out)out.textContent='成功 '+ok+' · 失败 '+fail+(d.accounts&&d.accounts[0]&&d.accounts[0].detail?(' · '+d.accounts[0].detail):'');
+    loadAccounts();loadPanelState();
+  }catch(e){if(out)out.textContent=e.message||String(e);showNotice(e.message,'error');}
+}
+async function panelStartOauthBatch(){
+  const body={startNum:parseInt($('oauthStartNum')?.value)||0,endNum:parseInt($('oauthEndNum')?.value)||0,resume:!!$('oauthBatchResume')?.checked};
+  const out=$('oauthBatchResult');
+  if(out)out.textContent='提交批量授权…';
+  try{
+    const d=await api('/api/admin/panel/oauth/batch',{method:'POST',body:JSON.stringify(body)});
+    if(out)out.textContent='导入 '+ (d.imported||0) +' · 待确认 '+(d.pending||0)+' · 跳过 '+(d.skipped||0)+' · 失败 '+(d.failed||0);
+    const pending=(d.accounts||[]).find(a=>a.authorizationUrl);
+    if(pending&&pending.authorizationUrl) window.open(pending.authorizationUrl,'_blank','noopener,noreferrer');
+    loadAccounts();
+  }catch(e){if(out)out.textContent=e.message||String(e);showNotice(e.message,'error');}
+}
 </script>
 </body>
 </html>
