@@ -8,6 +8,11 @@ the operator never sees the Cloudflare widget. This patch:
   * injects a watcher that reads input[name=cf-turnstile-response]
   * returns to http://127.0.0.1:4141/#turnstile=...
   * exposes M365Native.openUrl / captureTurnstile to the dashboard
+
+Dalvik: if-eqz = jump when zero/null/false; if-nez = jump when nonzero/true.
+The login.live.com check clobbers p2 with a boolean, so the office/cloudflare
+check must re-read the host from the Uri. Using p2 as a String after that
+move-result is a VerifyError and crashes the activity on launch.
 """
 from __future__ import annotations
 
@@ -29,8 +34,6 @@ WATCH_JS = (
     "if(window.M365Native&&M365Native.captureTurnstile){M365Native.captureTurnstile(v);}"
     "else{location.href='http://127.0.0.1:4141/#turnstile='+encodeURIComponent(v);}"
     "return true;}return false;}"
-    "var form=document.getElementById('registerForm');"
-    "if(form)form.addEventListener('submit',function(e){e.preventDefault();e.stopImmediatePropagation();grab();},true);"
     "if(grab())return;var n=0;var t=setInterval(function(){n++;if(grab()||n>240)clearInterval(t);},500);})();"
 )
 
@@ -58,9 +61,15 @@ def main() -> None:
     new-instance v0, Landroid/content/Intent;
 """
     new_try = """    :cond_2
+    invoke-virtual {p1}, Landroid/net/Uri;->getHost()Ljava/lang/String;
+
+    move-result-object v2
+
+    if-eqz v2, :do_external
+
     const-string v0, "office.965007.xyz"
 
-    invoke-virtual {p2, v0}, Ljava/lang/String;->endsWith(Ljava/lang/String;)Z
+    invoke-virtual {v2, v0}, Ljava/lang/String;->endsWith(Ljava/lang/String;)Z
 
     move-result v0
 
@@ -68,12 +77,13 @@ def main() -> None:
 
     const-string v0, "cloudflare.com"
 
-    invoke-virtual {p2, v0}, Ljava/lang/String;->endsWith(Ljava/lang/String;)Z
+    invoke-virtual {v2, v0}, Ljava/lang/String;->endsWith(Ljava/lang/String;)Z
 
     move-result v0
 
     if-nez v0, :allow_in_webview
 
+    :do_external
     :try_start_0
     iget-object p2, p0, Lcom/m365/gateway/MainActivity$2;->this$0:Lcom/m365/gateway/MainActivity;
 
@@ -152,7 +162,7 @@ def main() -> None:
 
     const-string v0, "https://office.965007.xyz"
 
-    if-nez p1, :use_default
+    if-eqz p1, :use_default
 
     invoke-virtual {p1}, Ljava/lang/String;->trim()Ljava/lang/String;
 
@@ -190,7 +200,7 @@ def main() -> None:
 
     move-result-object v0
 
-    if-nez v0, :done
+    if-eqz v0, :done
 
     new-instance v1, Lcom/m365/gateway/MainActivity$NativeBridge$1;
 
@@ -207,7 +217,7 @@ def main() -> None:
     .annotation runtime Landroid/webkit/JavascriptInterface;
     .end annotation
 
-    if-nez p1, :done
+    if-eqz p1, :done
 
     invoke-virtual {p1}, Ljava/lang/String;->trim()Ljava/lang/String;
 
@@ -227,7 +237,7 @@ def main() -> None:
 
     move-result-object v0
 
-    if-nez v0, :done
+    if-eqz v0, :done
 
     new-instance v1, Ljava/lang/StringBuilder;
 
@@ -303,6 +313,8 @@ def main() -> None:
         raise SystemExit("register host was not allowed in WebView")
     if "onPageFinished" not in verify_client:
         raise SystemExit("onPageFinished was not installed")
+    if "invoke-virtual {p1}, Landroid/net/Uri;->getHost()Ljava/lang/String;" not in verify_client:
+        raise SystemExit("host must be re-read from Uri after login.live.com clobbers p2")
     if "openUrl" not in verify_bridge or "captureTurnstile" not in verify_bridge:
         raise SystemExit("native bridge methods missing")
     print(f"patched turnstile capture: {client}")
