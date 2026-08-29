@@ -64,6 +64,37 @@ func TestRunRegisterDefaultsToProxyMode(t *testing.T) {
 	}
 }
 
+func TestRunRegisterAcceptsInPageSubmit(t *testing.T) {
+	stubRotate(t)
+	posted := 0
+	site := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		posted++
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "upn": "ok"})
+	}))
+	defer site.Close()
+	root := t.TempDir()
+	writePanelConfig(t, root, site.URL)
+	report, err := (&Server{}).runRegister(context.Background(), newNativePanelManager(nativePanelConfig{Root: root}), panelRegisterRequest{
+		Mode: "proxy", Count: 1, StartNum: 5026, TurnstileToken: "SUBMITTED:24s055026@office.example.test",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if posted != 0 {
+		t.Fatalf("in-page submit still posted /api/register %d times", posted)
+	}
+	if !report.OK || report.Success != 1 {
+		t.Fatalf("report = %#v", report)
+	}
+	stored, err := nativePanelReadCredentials(filepath.Join(root, "data", "credentials.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored["24s055026@office.example.test"] != "Passw0rd!" {
+		t.Fatalf("credentials = %#v", stored)
+	}
+}
+
 func TestRunRegisterPostsAndWritesCredentials(t *testing.T) {
 	stubRotate(t)
 	var got map[string]any

@@ -106,6 +106,9 @@ func TestSmaliPatchesOnOriginalAPK(t *testing.T) {
 			t.Fatalf("NativeBridge missing %s", needle)
 		}
 	}
+	if strings.Contains(bridge, "127.0.0.1:4141/#turnstile=") {
+		t.Fatal("captureTurnstile must not navigate the dashboard WebView away from the register page")
+	}
 	if !strings.Contains(manifest, `package="com.m365.gateway.pkcego"`) {
 		t.Fatal(manifest[:200])
 	}
@@ -161,7 +164,7 @@ func TestSmaliPatchesOnOriginalAPK(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, needle := range []string{"displayName", "turnstileBox", "__m365Filled", "__m365Clicked"} {
+	for _, needle := range []string{"displayName", "turnstileBox", "__m365Filled", "__m365Clicked", "submitBtn", "SUBMITTED:"} {
 		if !strings.Contains(clientJS, needle) {
 			t.Fatalf("solver script missing %s", needle)
 		}

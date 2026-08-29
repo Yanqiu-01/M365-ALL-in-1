@@ -6,7 +6,7 @@ import (
 	"strings"
 )
 
-const watchJS = `(function(){if(window.__m365TsWatch)return;window.__m365TsWatch=1;function grab(){var el=document.querySelector('input[name=cf-turnstile-response]');var v=el&&el.value;if(v&&v.length>20){if(window.M365Native&&M365Native.captureTurnstile){M365Native.captureTurnstile(v);}else{location.href='http://127.0.0.1:4141/#turnstile='+encodeURIComponent(v);}return true;}return false;}if(grab())return;var n=0;var t=setInterval(function(){n++;if(grab()||n>240)clearInterval(t);},500);})();`
+const watchJS = `(function(){if(window.__m365TsWatch)return;window.__m365TsWatch=1;})();`
 
 func javaString(value string) string {
 	value = strings.ReplaceAll(value, `\`, `\\`)
@@ -212,57 +212,10 @@ const nativeBridgeURLSmali = `
 .end method
 
 .method public captureTurnstile(Ljava/lang/String;)V
-    .locals 3
+    .locals 0
     .annotation runtime Landroid/webkit/JavascriptInterface;
     .end annotation
 
-    if-eqz p1, :done
-
-    invoke-virtual {p1}, Ljava/lang/String;->trim()Ljava/lang/String;
-
-    move-result-object p1
-
-    invoke-virtual {p1}, Ljava/lang/String;->length()I
-
-    move-result v0
-
-    const/16 v1, 0x14
-
-    if-le v0, v1, :done
-
-    iget-object v0, p0, Lcom/m365/gateway/MainActivity$NativeBridge;->this$0:Lcom/m365/gateway/MainActivity;
-
-    invoke-static {v0}, Lcom/m365/gateway/MainActivity;->access$web(Lcom/m365/gateway/MainActivity;)Landroid/webkit/WebView;
-
-    move-result-object v0
-
-    if-eqz v0, :done
-
-    new-instance v1, Ljava/lang/StringBuilder;
-
-    invoke-direct {v1}, Ljava/lang/StringBuilder;-><init>()V
-
-    const-string v2, "http://127.0.0.1:4141/#turnstile="
-
-    invoke-virtual {v1, v2}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
-
-    invoke-static {p1}, Landroid/net/Uri;->encode(Ljava/lang/String;)Ljava/lang/String;
-
-    move-result-object p1
-
-    invoke-virtual {v1, p1}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
-
-    invoke-virtual {v1}, Ljava/lang/StringBuilder;->toString()Ljava/lang/String;
-
-    move-result-object p1
-
-    new-instance v1, Lcom/m365/gateway/MainActivity$NativeBridge$1;
-
-    invoke-direct {v1, v0, p1}, Lcom/m365/gateway/MainActivity$NativeBridge$1;-><init>(Landroid/webkit/WebView;Ljava/lang/String;)V
-
-    invoke-virtual {v0, v1}, Landroid/webkit/WebView;->post(Ljava/lang/Runnable;)Z
-
-    :done
     return-void
 .end method
 `

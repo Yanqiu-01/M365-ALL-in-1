@@ -163,11 +163,19 @@ func (s *Server) runRegister(ctx context.Context, manager *nativePanelManager, r
 			report.Accounts = append(report.Accounts, item)
 			continue
 		}
-		if err := postRegister(ctx, cfg, username, display, token, proxyURL); err != nil {
-			item.Status, item.Detail = "failed", err.Error()
+		if strings.HasPrefix(token, "ERROR:") {
+			item.Status, item.Detail = "failed", strings.TrimPrefix(token, "ERROR:")
 			report.Failed++
 			report.Accounts = append(report.Accounts, item)
 			continue
+		}
+		if !strings.HasPrefix(token, "SUBMITTED:") {
+			if err := postRegister(ctx, cfg, username, display, token, proxyURL); err != nil {
+				item.Status, item.Detail = "failed", err.Error()
+				report.Failed++
+				report.Accounts = append(report.Accounts, item)
+				continue
+			}
 		}
 		if err := nativePanelAppendCredential(credentialPath, email, cfg.Register.Password); err != nil {
 			item.Status, item.Detail = "failed", "注册成功但写入账密失败: "+err.Error()

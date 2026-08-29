@@ -2119,7 +2119,7 @@ if (response.output_text) {
 <div class="card">
   <div class="card-head"><h3 class="card-title">注册新账号</h3><span class="card-note" id="panelRegState"></span></div>
   <div class="card-body">
-    <p class="form-hint" style="margin-bottom:var(--sp-2)">默认走本地代理池，不断网、不切飞行模式。后台 WebView 过 Cloudflare 后提交 /api/register，成功再写入本地账密。返回键只取消当前验证，不会退出 App。</p>
+    <p class="form-hint" style="margin-bottom:var(--sp-2)">点开始注册后，后台在同一页填账密、过 Cloudflare、再点提交。不会打开注册页，也不用粘贴 token。返回键只取消当前验证。</p>
     <div class="form-row">
       <div class="form-group"><label class="form-label" for="regSiteUrl">注册站点</label>
         <input class="form-input" id="regSiteUrl" type="url" placeholder="https://office.965007.xyz"></div>
@@ -2146,9 +2146,6 @@ if (response.output_text) {
         <input class="form-input" id="regStartNum" type="number" min="1" placeholder="5026"></div>
       <div class="form-group" style="margin:0;width:80px"><label class="form-label" for="regCount">数量</label>
         <input class="form-input" id="regCount" type="number" min="1" max="20" value="1"></div>
-      <div class="form-group" style="margin:0;flex:1;min-width:220px"><label class="form-label" for="regTurnstile">手动 token（可选）</label>
-        <input class="form-input" id="regTurnstile" placeholder="留空则由 FlareSolverr 自动获取"></div>
-      <button type="button" class="btn" onclick="openRegisterPage()">打开注册页</button>
       <button type="button" class="btn primary" onclick="panelStartRegister()">开始注册</button>
     </div>
     <p class="form-hint" id="regResult" aria-live="polite" style="margin-top:var(--sp-2)"></p>
@@ -6185,12 +6182,10 @@ function enterApp(){
   $('login').hidden=true;
   $('app').style.display='flex';
   $('app').hidden=false;
-  const captured=consumeTurnstileFromHash();
-  showPage(captured?'accounts':'dashboard');
+  showPage('dashboard');
   loadStats();
   loadOnboarding();
 }
-window.addEventListener('hashchange',()=>{ if(consumeTurnstileFromHash()) showPage('accounts'); });
 function showLogin(){
   $('login').style.display='grid';
   $('login').hidden=false;
@@ -6238,43 +6233,10 @@ async function saveRegisterConfig(){
     loadPanelState();
   }catch(e){showNotice(e.message||String(e),'error');}
 }
-function registerSiteUrl(){
-  return ($('regSiteUrl')?.value||'').trim().replace(/\/$/,'') || 'https://office.965007.xyz';
-}
-function consumeTurnstileFromHash(){
-  let token='';
-  try{
-    const hash=String(location.hash||'');
-    const m=hash.match(/turnstile=([^&]+)/);
-    if(m) token=decodeURIComponent(m[1]);
-  }catch(e){}
-  if(!token){
-    try{ token=sessionStorage.getItem('m365_turnstile_token')||''; }catch(e){}
-  }
-  if(!token) return false;
-  const el=$('regTurnstile');
-  if(el) el.value=token;
-  try{ sessionStorage.setItem('m365_turnstile_token', token); }catch(e){}
-  try{ history.replaceState(null,'',location.pathname+location.search); }catch(e){}
-  showNotice('已提取人机验证，可以开始注册','success');
-  return true;
-}
-function openRegisterPage(){
-  const url=registerSiteUrl();
-  if(window.M365Native && typeof window.M365Native.openUrl==='function'){
-    window.M365Native.openUrl(url);
-    showNotice('已打开注册页，完成人机验证后会自动返回','info');
-    return;
-  }
-  window.open(url,'_blank','noopener,noreferrer');
-  showNotice('请在打开的注册页完成验证。Android 客户端会自动提取 token。','info');
-}
 async function panelStartRegister(){
-  consumeTurnstileFromHash();
-  const token=($('regTurnstile')?.value||'').trim();
-  const body={mode:$('regMode')?.value||'proxy',count:parseInt($('regCount')?.value)||1,startNum:parseInt($('regStartNum')?.value)||0,turnstileToken:token};
+  const body={mode:$('regMode')?.value||'proxy',count:parseInt($('regCount')?.value)||1,startNum:parseInt($('regStartNum')?.value)||0};
   const out=$('regResult');
-  if(out)out.textContent='正在走代理池过验证并提交，请保持 App 在前台…';
+  if(out)out.textContent='正在同一页填账密、过验证并提交，请保持 App 在前台…';
   try{
     const d=await api('/api/admin/panel/register',{method:'POST',body:JSON.stringify(body),timeoutMs:120000});
     const ok=d.success||0, fail=d.failed||0;
