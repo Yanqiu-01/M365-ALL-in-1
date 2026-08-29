@@ -92,7 +92,10 @@ for f in index.html login.html debug.html panel.html workbench.html; do
 done
 
 PATCHER="$OUT/apkpatcher"
-GOTOOLCHAIN=local GOPROXY=off "$GO_BIN" build -trimpath -buildvcs=false -o "$PATCHER" "$REPO/build/android/apkpatcher"
+(
+  cd "$REPO"
+  GOTOOLCHAIN=local GOPROXY=off "$GO_BIN" build -trimpath -buildvcs=false -o "$PATCHER" ./build/android/apkpatcher
+)
 "$PATCHER" identity "$OUT/work" "$OLD_PKG" "$NEW_PKG" "$NEW_LABEL" "$VERSION_CODE" "$VERSION_NAME"
 "$PATCHER" smali "$OUT/work"
 
