@@ -49,7 +49,7 @@ func HandleV1(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), timeout)
 	defer cancel()
-	solved, err := solveLocal(ctx, page)
+	solved, err := solveLocal(ctx, page, strField(payload, "displayName"), strField(payload, "username"), strField(payload, "password"))
 	if err != nil {
 		writeFlare(w, flareReply{Status: "error", Message: err.Error()})
 		return
@@ -68,6 +68,18 @@ func HandleV1(w http.ResponseWriter, r *http.Request) {
 			UserAgent: solved.UserAgent,
 		},
 	})
+}
+
+func strField(payload map[string]any, key string) string {
+	v, ok := payload[key]
+	if !ok || v == nil {
+		return ""
+	}
+	s := strings.TrimSpace(fmt.Sprint(v))
+	if s == "<nil>" {
+		return ""
+	}
+	return s
 }
 
 func writeFlare(w http.ResponseWriter, reply flareReply) {
@@ -116,12 +128,12 @@ type localSolution struct {
 	UserAgent string
 }
 
-func solveLocal(ctx context.Context, page string) (localSolution, error) {
+func solveLocal(ctx context.Context, page, display, username, password string) (localSolution, error) {
 	dir := flareDir()
 	if dir == "" {
 		return localSolution{}, errors.New("内置 FlareSolverr 需要 App 数据目录。请打开修改版M365 后再注册")
 	}
-	return solveViaWebView(ctx, dir, page)
+	return solveViaWebView(ctx, dir, page, display, username, password)
 }
 
 func flareDir() string {
@@ -134,7 +146,13 @@ func flareDir() string {
 
 var webviewMu sync.Mutex
 
-func solveViaWebView(ctx context.Context, dir, page string) (localSolution, error) {
+func oneLine(v string) string {
+	v = strings.ReplaceAll(v, "\r", " ")
+	v = strings.ReplaceAll(v, "\n", " ")
+	return strings.TrimSpace(v)
+}
+
+func solveViaWebView(ctx context.Context, dir, page, display, username, password string) (localSolution, error) {
 	webviewMu.Lock()
 	defer webviewMu.Unlock()
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -151,7 +169,8 @@ func solveViaWebView(ctx context.Context, dir, page string) (localSolution, erro
 	status := filepath.Join(dir, "status")
 	_ = os.Remove(result)
 	_ = os.Remove(status)
-	if err := os.WriteFile(tmp, []byte(id+"\n"+page+"\n"), 0o600); err != nil {
+	body := strings.Join([]string{id, oneLine(page), oneLine(display), oneLine(username), oneLine(password)}, "\n") + "\n"
+	if err := os.WriteFile(tmp, []byte(body), 0o600); err != nil {
 		return localSolution{}, err
 	}
 	if err := os.Rename(tmp, job); err != nil {
@@ -170,21 +189,24 @@ func solveViaWebView(ctx context.Context, dir, page string) (localSolution, erro
 			if _, err := os.Stat(job); err != nil {
 				jobTaken = true
 			}
-			if body, err := os.ReadFile(status); err == nil && strings.Contains(string(body), "loaded") {
+			if raw, err := os.ReadFile(status); err == nil && strings.Contains(string(raw), "loaded") {
 				pageLoaded = true
 			}
-			body, err := os.ReadFile(result)
+			raw, err := os.ReadFile(result)
 			if err != nil {
 				continue
 			}
-			lines := strings.Split(strings.ReplaceAll(string(body), "\r\n", "\n"), "\n")
+			lines := strings.Split(strings.ReplaceAll(string(raw), "\r\n", "\n"), "\n")
 			if len(lines) < 2 || strings.TrimSpace(lines[0]) != id {
 				continue
 			}
 			_ = os.Remove(result)
 			token := strings.TrimSpace(lines[1])
+			if token == "CANCEL" {
+				return localSolution{}, errors.New("已取消验证")
+			}
 			if token == "" {
-				return localSolution{}, errors.New("验证页已打开，但没有拿到 Turnstile token")
+				return localSolution{}, errors.New("后台验证没有拿到 Turnstile token")
 			}
 			return localSolution{Token: token, UserAgent: "M365-WebView"}, nil
 		}
@@ -194,10 +216,10 @@ func solveViaWebView(ctx context.Context, dir, page string) (localSolution, erro
 func timeoutError(jobTaken, pageLoaded bool) error {
 	switch {
 	case !jobTaken:
-		return errors.New("验证页没有接到任务。请保持修改版M365 在前台，不要锁屏")
+		return errors.New("后台验证没有接到任务。请保持修改版M365 在前台，不要锁屏")
 	case !pageLoaded:
-		return errors.New("验证页没有打开注册站。请检查网络后重试")
+		return errors.New("后台验证没有打开注册站。请检查网络后重试")
 	default:
-		return errors.New("验证页已打开，但 Turnstile 没有给出 token。请在弹出的验证层里完成勾选")
+		return errors.New("后台验证已打开注册页，但 Turnstile 没有给出 token")
 	}
 }

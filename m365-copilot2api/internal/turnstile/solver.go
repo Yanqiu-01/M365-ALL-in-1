@@ -1,9 +1,9 @@
 // Package turnstile talks to a local FlareSolverr instance so registration can
 // obtain a Cloudflare Turnstile token without a human tapping the widget.
 //
-// FlareSolverr exposes a single JSON endpoint (default http://127.0.0.1:8191/v1).
-// We ask it to fetch the register page through the same egress proxy the
-// registration uses, then read the token out of the solved DOM. Tokens are
+// The APK embeds a FlareSolverr-compatible endpoint on 127.0.0.1:8191. The
+// browser backend is an off-screen WebView: it fills the register form, scrolls
+// the Turnstile widget into its own viewport, and reads the token. Tokens are
 // single-use and short lived, so callers solve once per account and never
 // persist the value.
 package turnstile
@@ -23,7 +23,7 @@ import (
 	"m365-copilot2api/internal/outbound"
 )
 
-// DefaultEndpoint is where FlareSolverr listens when running on the same host.
+// DefaultEndpoint is where the built-in solver listens on the same host.
 const DefaultEndpoint = "http://127.0.0.1:8191/v1"
 
 // DefaultTimeout bounds a single solve attempt.
@@ -31,10 +31,13 @@ const DefaultTimeout = 90 * time.Second
 
 // Request describes one solve attempt.
 type Request struct {
-	Endpoint string        // FlareSolverr /v1 endpoint
-	PageURL  string        // page that renders the Turnstile widget
-	Proxy    string        // egress proxy FlareSolverr should use, optional
-	Timeout  time.Duration // overall budget
+	Endpoint    string        // FlareSolverr /v1 endpoint
+	PageURL     string        // page that renders the Turnstile widget
+	Proxy       string        // egress proxy FlareSolverr should use, optional
+	Timeout     time.Duration // overall budget
+	DisplayName string        // filled into #displayName
+	Username    string        // filled into #username
+	Password    string        // filled into #password
 }
 
 // Solution carries what the solver produced.
@@ -63,9 +66,6 @@ type flareReply struct {
 	Solution flareSolution `json:"solution"`
 }
 
-// tokenPattern reads the hidden input Turnstile writes once the challenge
-// passes. Attribute order and quoting vary between renders, so match either
-// order rather than assuming one layout.
 var tokenPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?is)<input[^>]*name=["']cf-turnstile-response["'][^>]*value=["']([^"']{20,})["']`),
 	regexp.MustCompile(`(?is)<input[^>]*value=["']([^"']{20,})["'][^>]*name=["']cf-turnstile-response["']`),
@@ -95,9 +95,12 @@ func Solve(ctx context.Context, request Request) (Solution, error) {
 	}
 
 	payload := map[string]any{
-		"cmd":        "request.get",
-		"url":        page,
-		"maxTimeout": budget.Milliseconds(),
+		"cmd":         "request.get",
+		"url":         page,
+		"maxTimeout":  budget.Milliseconds(),
+		"displayName": strings.TrimSpace(request.DisplayName),
+		"username":    strings.TrimSpace(request.Username),
+		"password":    strings.TrimSpace(request.Password),
 	}
 	if proxy := strings.TrimSpace(request.Proxy); proxy != "" {
 		payload["proxy"] = map[string]any{"url": proxy}
@@ -107,8 +110,6 @@ func Solve(ctx context.Context, request Request) (Solution, error) {
 		return Solution{}, err
 	}
 
-	// FlareSolverr runs locally, so the request itself must not go through the
-	// egress proxy; only the page fetch does.
 	callCtx, cancel := context.WithTimeout(ctx, budget+15*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(callCtx, http.MethodPost, endpoint, bytes.NewReader(body))
@@ -147,8 +148,7 @@ func Solve(ctx context.Context, request Request) (Solution, error) {
 	}
 	solution.Token = extractToken(reply.Solution.Response)
 	if solution.Token == "" {
-		return solution, errors.New("FlareSolverr 已打开注册页，但页面里没有 Turnstile token。" +
-			"该站点使用显式渲染的 widget，需在 App 内「打开注册页」手动完成一次验证")
+		return solution, errors.New("FlareSolverr 已打开注册页，但页面里没有 Turnstile token")
 	}
 	return solution, nil
 }

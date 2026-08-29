@@ -148,8 +148,23 @@ func TestSmaliPatchesOnOriginalAPK(t *testing.T) {
 	if !strings.Contains(flare, "gw/data/flare/ready") {
 		t.Fatal("ready marker missing")
 	}
-	if !strings.Contains(flare, "Landroid/widget/FrameLayout;") {
-		t.Fatal("visible overlay missing")
+	if !strings.Contains(flare, "setTranslationX") {
+		t.Fatal("solver WebView should stay off-screen")
+	}
+	if strings.Contains(flare, "setAlpha") {
+		t.Fatal("alpha=0 can stop WebView from painting Turnstile")
+	}
+	if !strings.Contains(main, "FlareSolver;->onBack()Z") {
+		t.Fatal("back press must cancel solve instead of leaving the app")
+	}
+	clientJS, err := readFile(filepath.Join(work, "smali", "com", "m365", "gateway", "FlareSolver$Client.smali"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, needle := range []string{"displayName", "turnstileBox", "scrollIntoView"} {
+		if !strings.Contains(clientJS, needle) {
+			t.Fatalf("solver script missing %s", needle)
+		}
 	}
 }
 

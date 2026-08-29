@@ -39,6 +39,9 @@ func TestSolveReadsTokenFromFlareSolverr(t *testing.T) {
 		if payload["url"] != "https://office.example.test/" {
 			t.Errorf("url = %#v", payload["url"])
 		}
+		if payload["username"] != "24s055026" || payload["displayName"] != "User1" {
+			t.Errorf("credentials = %#v", payload)
+		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"status": "ok",
 			"solution": map[string]any{
@@ -51,9 +54,12 @@ func TestSolveReadsTokenFromFlareSolverr(t *testing.T) {
 	defer server.Close()
 
 	got, err := Solve(context.Background(), Request{
-		Endpoint: server.URL + "/v1",
-		PageURL:  "https://office.example.test/",
-		Timeout:  2 * time.Second,
+		Endpoint:    server.URL + "/v1",
+		PageURL:     "https://office.example.test/",
+		Timeout:     2 * time.Second,
+		DisplayName: "User1",
+		Username:    "24s055026",
+		Password:    "Passw0rd!",
 	})
 	if err != nil {
 		t.Fatal(err)

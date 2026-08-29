@@ -32,6 +32,32 @@ func patchFlareSolver(work string) error {
 			return err
 		}
 	}
+	if !strings.Contains(source, "FlareSolver;->onBack()Z") {
+		oldBack := ".method public onBackPressed()V\n    .locals 1\n\n    .line 375\n    iget-object v0, p0, Lcom/m365/gateway/MainActivity;->web:Landroid/webkit/WebView;\n"
+		newBack := `.method public onBackPressed()V
+    .locals 1
+
+    iget-object v0, p0, Lcom/m365/gateway/MainActivity;->flare:Lcom/m365/gateway/FlareSolver;
+
+    if-eqz v0, :flare_skip
+
+    invoke-virtual {v0}, Lcom/m365/gateway/FlareSolver;->onBack()Z
+
+    move-result v0
+
+    if-eqz v0, :flare_skip
+
+    return-void
+
+    :flare_skip
+    .line 375
+    iget-object v0, p0, Lcom/m365/gateway/MainActivity;->web:Landroid/webkit/WebView;
+`
+		source, err = replaceOnce(source, oldBack, newBack, "intercept back during background solve")
+		if err != nil {
+			return err
+		}
+	}
 	if err := writeFile(mainPath, source); err != nil {
 		return err
 	}
@@ -42,7 +68,6 @@ func patchFlareSolver(work string) error {
 		"FlareSolver$Client.smali": flareClientSmali(),
 		"FlareSolver$Loop.smali":   flareLoopSmali,
 		"FlareSolver$Load.smali":   flareLoadSmali,
-		"FlareSolver$Hide.smali":   flareHideSmali,
 	}
 	for name, body := range files {
 		if err := writeFile(filepath.Join(packageDir, name), body); err != nil {
@@ -74,6 +99,9 @@ func patchFlareSolver(work string) error {
 	if err := mustContain(verify, "Lcom/m365/gateway/FlareSolver;-><init>", "flare start"); err != nil {
 		return err
 	}
+	if err := mustContain(verify, "FlareSolver;->onBack()Z", "back intercept"); err != nil {
+		return err
+	}
 	manifestPath := filepath.Join(work, "AndroidManifest.xml")
 	manifest, err := readFile(manifestPath)
 	if err != nil {
@@ -91,7 +119,7 @@ func patchFlareSolver(work string) error {
 	return nil
 }
 
-const flareWatchJS = `(function(){if(window.__m365Flare)return;window.__m365Flare=1;function grab(){var el=document.querySelector('input[name=cf-turnstile-response]');var v=el&&el.value;if(v&&v.length>20){M365Flare.done(v);return true;}return false;}if(grab())return;var n=0;setInterval(function(){n++;grab();},400);})();`
+const flareWatchJS = `(function(){if(window.__m365Flare)return;window.__m365Flare=1;function val(fn){try{return String(fn()||'')}catch(e){return ''}}function set(id,v){var el=document.getElementById(id);if(!el||!v)return;el.focus();el.value=v;el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));}function layout(){var info=document.querySelector('.info-column');if(info)info.style.display='none';var shell=document.querySelector('.page-shell');if(shell){shell.style.display='block';shell.style.gridTemplateColumns='1fr';shell.style.width='100%';shell.style.minHeight='auto';}var col=document.querySelector('.register-column,.form-card');if(col)col.scrollIntoView({block:'start'});}function fill(){set('displayName',val(M365Flare.displayName));set('username',val(M365Flare.username));set('password',val(M365Flare.password));layout();}function grab(){var el=document.querySelector('input[name=cf-turnstile-response]');var v=el&&el.value;if(v&&v.length>20){M365Flare.done(v);return true;}return false;}function poke(){fill();var box=document.getElementById('turnstileBox');if(box){box.classList.remove('hidden');box.style.display='block';box.scrollIntoView({block:'center'});try{box.click();}catch(e){}}var nodes=document.querySelectorAll('.cf-turnstile,iframe[src*="challenges.cloudflare.com"]');for(var i=0;i<nodes.length;i++){try{nodes[i].scrollIntoView({block:'center'});nodes[i].click();}catch(e){}}}fill();if(grab())return;setInterval(function(){poke();grab();},400);})();`
 
 const flareSolverSmali = `.class public Lcom/m365/gateway/FlareSolver;
 .super Ljava/lang/Object;
@@ -102,6 +130,9 @@ const flareSolverSmali = `.class public Lcom/m365/gateway/FlareSolver;
 .field web:Landroid/webkit/WebView;
 .field volatile running:Z
 .field currentId:Ljava/lang/String;
+.field currentDisplay:Ljava/lang/String;
+.field currentUser:Ljava/lang/String;
+.field currentPass:Ljava/lang/String;
 
 .method public constructor <init>(Landroid/app/Activity;)V
     .locals 0
@@ -114,7 +145,7 @@ const flareSolverSmali = `.class public Lcom/m365/gateway/FlareSolver;
 .end method
 
 .method public start()V
-    .locals 6
+    .locals 7
 
     const/4 v0, 0x1
 
@@ -128,17 +159,9 @@ const flareSolverSmali = `.class public Lcom/m365/gateway/FlareSolver;
 
     iput-object v0, p0, Lcom/m365/gateway/FlareSolver;->overlay:Landroid/widget/FrameLayout;
 
-    const-string v2, "#F0111827"
+    const v2, 0x461c4000    # 10000.0f
 
-    invoke-static {v2}, Landroid/graphics/Color;->parseColor(Ljava/lang/String;)I
-
-    move-result v2
-
-    invoke-virtual {v0, v2}, Landroid/widget/FrameLayout;->setBackgroundColor(I)V
-
-    const/16 v2, 0x8
-
-    invoke-virtual {v0, v2}, Landroid/widget/FrameLayout;->setVisibility(I)V
+    invoke-virtual {v0, v2}, Landroid/widget/FrameLayout;->setTranslationX(F)V
 
     new-instance v2, Landroid/webkit/WebView;
 
@@ -194,15 +217,17 @@ const flareSolverSmali = `.class public Lcom/m365/gateway/FlareSolver;
 
     new-instance v3, Landroid/widget/FrameLayout$LayoutParams;
 
-    const/4 v4, -0x1
+    const/16 v4, 0x2d0
 
-    invoke-direct {v3, v4, v4}, Landroid/widget/FrameLayout$LayoutParams;-><init>(II)V
+    const/16 v5, 0x640
+
+    invoke-direct {v3, v4, v5}, Landroid/widget/FrameLayout$LayoutParams;-><init>(II)V
 
     invoke-virtual {v0, v2, v3}, Landroid/widget/FrameLayout;->addView(Landroid/view/View;Landroid/view/ViewGroup$LayoutParams;)V
 
     new-instance v2, Landroid/widget/FrameLayout$LayoutParams;
 
-    invoke-direct {v2, v4, v4}, Landroid/widget/FrameLayout$LayoutParams;-><init>(II)V
+    invoke-direct {v2, v4, v5}, Landroid/widget/FrameLayout$LayoutParams;-><init>(II)V
 
     invoke-virtual {v1, v0, v2}, Landroid/app/Activity;->addContentView(Landroid/view/View;Landroid/view/ViewGroup$LayoutParams;)V
 
@@ -229,6 +254,51 @@ const flareSolverSmali = `.class public Lcom/m365/gateway/FlareSolver;
     invoke-virtual {v0}, Ljava/lang/Thread;->start()V
 
     return-void
+.end method
+
+.method public onBack()Z
+    .locals 3
+
+    iget-object v0, p0, Lcom/m365/gateway/FlareSolver;->currentId:Ljava/lang/String;
+
+    if-eqz v0, :no
+
+    new-instance v1, Ljava/lang/StringBuilder;
+
+    invoke-direct {v1}, Ljava/lang/StringBuilder;-><init>()V
+
+    invoke-virtual {v1, v0}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
+
+    const-string v0, "\nCANCEL\n"
+
+    invoke-virtual {v1, v0}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
+
+    invoke-virtual {v1}, Ljava/lang/StringBuilder;->toString()Ljava/lang/String;
+
+    move-result-object v0
+
+    const/4 v1, 0x0
+
+    iput-object v1, p0, Lcom/m365/gateway/FlareSolver;->currentId:Ljava/lang/String;
+
+    :try_start_0
+    invoke-virtual {p0}, Lcom/m365/gateway/FlareSolver;->resultFile()Ljava/io/File;
+
+    move-result-object v1
+
+    invoke-static {v1, v0}, Lcom/m365/gateway/FlareSolver;->writeFile(Ljava/io/File;Ljava/lang/String;)V
+    :try_end_0
+    .catch Ljava/lang/Exception; {:try_start_0 .. :try_end_0} :catch_0
+
+    :catch_0
+    const/4 v0, 0x1
+
+    return v0
+
+    :no
+    const/4 v0, 0x0
+
+    return v0
 .end method
 
 .method jobFile()Ljava/io/File;
@@ -399,6 +469,63 @@ const flareBridgeSmali = `.class Lcom/m365/gateway/FlareSolver$Bridge;
     return-void
 .end method
 
+.method public displayName()Ljava/lang/String;
+    .locals 1
+    .annotation runtime Landroid/webkit/JavascriptInterface;
+    .end annotation
+
+    iget-object v0, p0, Lcom/m365/gateway/FlareSolver$Bridge;->this$0:Lcom/m365/gateway/FlareSolver;
+
+    iget-object v0, v0, Lcom/m365/gateway/FlareSolver;->currentDisplay:Ljava/lang/String;
+
+    if-eqz v0, :empty
+
+    return-object v0
+
+    :empty
+    const-string v0, ""
+
+    return-object v0
+.end method
+
+.method public username()Ljava/lang/String;
+    .locals 1
+    .annotation runtime Landroid/webkit/JavascriptInterface;
+    .end annotation
+
+    iget-object v0, p0, Lcom/m365/gateway/FlareSolver$Bridge;->this$0:Lcom/m365/gateway/FlareSolver;
+
+    iget-object v0, v0, Lcom/m365/gateway/FlareSolver;->currentUser:Ljava/lang/String;
+
+    if-eqz v0, :empty
+
+    return-object v0
+
+    :empty
+    const-string v0, ""
+
+    return-object v0
+.end method
+
+.method public password()Ljava/lang/String;
+    .locals 1
+    .annotation runtime Landroid/webkit/JavascriptInterface;
+    .end annotation
+
+    iget-object v0, p0, Lcom/m365/gateway/FlareSolver$Bridge;->this$0:Lcom/m365/gateway/FlareSolver;
+
+    iget-object v0, v0, Lcom/m365/gateway/FlareSolver;->currentPass:Ljava/lang/String;
+
+    if-eqz v0, :empty
+
+    return-object v0
+
+    :empty
+    const-string v0, ""
+
+    return-object v0
+.end method
+
 .method public done(Ljava/lang/String;)V
     .locals 3
     .annotation runtime Landroid/webkit/JavascriptInterface;
@@ -442,9 +569,13 @@ const flareBridgeSmali = `.class Lcom/m365/gateway/FlareSolver$Bridge;
 
     move-result-object p1
 
-    :try_start_0
     iget-object v0, p0, Lcom/m365/gateway/FlareSolver$Bridge;->this$0:Lcom/m365/gateway/FlareSolver;
 
+    const/4 v1, 0x0
+
+    iput-object v1, v0, Lcom/m365/gateway/FlareSolver;->currentId:Ljava/lang/String;
+
+    :try_start_0
     invoke-virtual {v0}, Lcom/m365/gateway/FlareSolver;->resultFile()Ljava/io/File;
 
     move-result-object v0
@@ -454,18 +585,6 @@ const flareBridgeSmali = `.class Lcom/m365/gateway/FlareSolver$Bridge;
     .catch Ljava/lang/Exception; {:try_start_0 .. :try_end_0} :catch_0
 
     :catch_0
-    iget-object p1, p0, Lcom/m365/gateway/FlareSolver$Bridge;->this$0:Lcom/m365/gateway/FlareSolver;
-
-    iget-object v0, p1, Lcom/m365/gateway/FlareSolver;->overlay:Landroid/widget/FrameLayout;
-
-    if-eqz v0, :done
-
-    new-instance v1, Lcom/m365/gateway/FlareSolver$Hide;
-
-    invoke-direct {v1, v0}, Lcom/m365/gateway/FlareSolver$Hide;-><init>(Landroid/view/View;)V
-
-    invoke-virtual {v0, v1}, Landroid/widget/FrameLayout;->post(Ljava/lang/Runnable;)Z
-
     :done
     return-void
 .end method
@@ -579,7 +698,7 @@ const flareLoopSmali = `.class Lcom/m365/gateway/FlareSolver$Loop;
 
     array-length v1, v0
 
-    const/4 v2, 0x2
+    const/4 v2, 0x5
 
     if-lt v1, v2, :sleep
 
@@ -593,27 +712,55 @@ const flareLoopSmali = `.class Lcom/m365/gateway/FlareSolver$Loop;
 
     const/4 v2, 0x1
 
-    aget-object v0, v0, v2
+    aget-object v2, v0, v2
+
+    invoke-virtual {v2}, Ljava/lang/String;->trim()Ljava/lang/String;
+
+    move-result-object v2
+
+    const/4 v3, 0x2
+
+    aget-object v3, v0, v3
+
+    invoke-virtual {v3}, Ljava/lang/String;->trim()Ljava/lang/String;
+
+    move-result-object v3
+
+    const/4 v4, 0x3
+
+    aget-object v4, v0, v4
+
+    invoke-virtual {v4}, Ljava/lang/String;->trim()Ljava/lang/String;
+
+    move-result-object v4
+
+    const/4 v5, 0x4
+
+    aget-object v0, v0, v5
 
     invoke-virtual {v0}, Ljava/lang/String;->trim()Ljava/lang/String;
 
     move-result-object v0
 
-    iget-object v2, p0, Lcom/m365/gateway/FlareSolver$Loop;->this$0:Lcom/m365/gateway/FlareSolver;
+    iget-object v5, p0, Lcom/m365/gateway/FlareSolver$Loop;->this$0:Lcom/m365/gateway/FlareSolver;
 
-    iput-object v1, v2, Lcom/m365/gateway/FlareSolver;->currentId:Ljava/lang/String;
+    iput-object v1, v5, Lcom/m365/gateway/FlareSolver;->currentId:Ljava/lang/String;
 
-    iget-object v1, v2, Lcom/m365/gateway/FlareSolver;->web:Landroid/webkit/WebView;
+    iput-object v3, v5, Lcom/m365/gateway/FlareSolver;->currentDisplay:Ljava/lang/String;
+
+    iput-object v4, v5, Lcom/m365/gateway/FlareSolver;->currentUser:Ljava/lang/String;
+
+    iput-object v0, v5, Lcom/m365/gateway/FlareSolver;->currentPass:Ljava/lang/String;
+
+    iget-object v1, v5, Lcom/m365/gateway/FlareSolver;->web:Landroid/webkit/WebView;
 
     if-eqz v1, :sleep
 
-    new-instance v2, Lcom/m365/gateway/FlareSolver$Load;
+    new-instance v0, Lcom/m365/gateway/FlareSolver$Load;
 
-    iget-object v3, p0, Lcom/m365/gateway/FlareSolver$Loop;->this$0:Lcom/m365/gateway/FlareSolver;
+    invoke-direct {v0, v5, v2}, Lcom/m365/gateway/FlareSolver$Load;-><init>(Lcom/m365/gateway/FlareSolver;Ljava/lang/String;)V
 
-    invoke-direct {v2, v3, v0}, Lcom/m365/gateway/FlareSolver$Load;-><init>(Lcom/m365/gateway/FlareSolver;Ljava/lang/String;)V
-
-    invoke-virtual {v1, v2}, Landroid/webkit/WebView;->post(Ljava/lang/Runnable;)Z
+    invoke-virtual {v1, v0}, Landroid/webkit/WebView;->post(Ljava/lang/Runnable;)Z
     :try_end_0
     .catch Ljava/lang/Exception; {:try_start_0 .. :try_end_0} :catch_0
 
@@ -662,19 +809,6 @@ const flareLoadSmali = `.class Lcom/m365/gateway/FlareSolver$Load;
 
     iget-object v0, p0, Lcom/m365/gateway/FlareSolver$Load;->this$0:Lcom/m365/gateway/FlareSolver;
 
-    iget-object v0, v0, Lcom/m365/gateway/FlareSolver;->overlay:Landroid/widget/FrameLayout;
-
-    if-eqz v0, :load
-
-    const/4 v1, 0x0
-
-    invoke-virtual {v0, v1}, Landroid/widget/FrameLayout;->setVisibility(I)V
-
-    invoke-virtual {v0}, Landroid/widget/FrameLayout;->bringToFront()V
-
-    :load
-    iget-object v0, p0, Lcom/m365/gateway/FlareSolver$Load;->this$0:Lcom/m365/gateway/FlareSolver;
-
     iget-object v0, v0, Lcom/m365/gateway/FlareSolver;->web:Landroid/webkit/WebView;
 
     if-eqz v0, :done
@@ -684,37 +818,6 @@ const flareLoadSmali = `.class Lcom/m365/gateway/FlareSolver$Load;
     invoke-virtual {v0, v1}, Landroid/webkit/WebView;->loadUrl(Ljava/lang/String;)V
 
     :done
-    return-void
-.end method
-`
-
-const flareHideSmali = `.class Lcom/m365/gateway/FlareSolver$Hide;
-.super Ljava/lang/Object;
-.source "FlareSolver.java"
-
-.implements Ljava/lang/Runnable;
-
-.field final view:Landroid/view/View;
-
-.method constructor <init>(Landroid/view/View;)V
-    .locals 0
-
-    iput-object p1, p0, Lcom/m365/gateway/FlareSolver$Hide;->view:Landroid/view/View;
-
-    invoke-direct {p0}, Ljava/lang/Object;-><init>()V
-
-    return-void
-.end method
-
-.method public run()V
-    .locals 2
-
-    iget-object v0, p0, Lcom/m365/gateway/FlareSolver$Hide;->view:Landroid/view/View;
-
-    const/16 v1, 0x8
-
-    invoke-virtual {v0, v1}, Landroid/view/View;->setVisibility(I)V
-
     return-void
 .end method
 `

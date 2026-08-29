@@ -153,7 +153,7 @@ func (s *Server) runRegister(ctx context.Context, manager *nativePanelManager, r
 			item.IP = ip
 			lastIP = ip
 		}
-		token, tokenErr := resolveTurnstileToken(ctx, cfg, request.TurnstileToken, proxyURL)
+		token, tokenErr := resolveTurnstileToken(ctx, cfg, request.TurnstileToken, proxyURL, display, username)
 		if tokenErr != nil {
 			item.Status, item.Detail = "failed", tokenErr.Error()
 			report.Failed++
@@ -216,7 +216,7 @@ func probeRegisterIP(ctx context.Context, proxyURL string) (string, error) {
 	return result.IP, nil
 }
 
-func resolveTurnstileToken(ctx context.Context, cfg nativePanelFileConfig, supplied, proxyURL string) (string, error) {
+func resolveTurnstileToken(ctx context.Context, cfg nativePanelFileConfig, supplied, proxyURL, display, username string) (string, error) {
 	if token := strings.TrimSpace(supplied); token != "" {
 		return token, nil
 	}
@@ -229,9 +229,12 @@ func resolveTurnstileToken(ctx context.Context, cfg nativePanelFileConfig, suppl
 		return "", errors.New("缺少注册页地址，无法请求 FlareSolverr")
 	}
 	solved, err := turnstile.Solve(ctx, turnstile.Request{
-		Endpoint: endpoint,
-		PageURL:  page,
-		Proxy:    proxyURL,
+		Endpoint:    endpoint,
+		PageURL:     page,
+		Proxy:       proxyURL,
+		DisplayName: display,
+		Username:    username,
+		Password:    cfg.Register.Password,
 	})
 	if err != nil {
 		return "", err

@@ -2119,7 +2119,7 @@ if (response.output_text) {
 <div class="card">
   <div class="card-head"><h3 class="card-title">注册新账号</h3><span class="card-note" id="panelRegState"></span></div>
   <div class="card-body">
-    <p class="form-hint" style="margin-bottom:var(--sp-2)">每个号都先联网过 Cloudflare。开始注册后会弹出验证层，勾选通过后自动提交并写入本地账密；确认成功后再切飞行模式换 IP，给下一个号用。不调用电脑 adb。</p>
+    <p class="form-hint" style="margin-bottom:var(--sp-2)">每个号都先联网，由后台 WebView 自动填账密并过 Cloudflare，不弹出注册页。成功写入本地后再切飞行模式，给下一个号用。返回键只取消当前验证，不会退出 App。</p>
     <div class="form-row">
       <div class="form-group"><label class="form-label" for="regSiteUrl">注册站点</label>
         <input class="form-input" id="regSiteUrl" type="url" placeholder="https://office.965007.xyz"></div>
