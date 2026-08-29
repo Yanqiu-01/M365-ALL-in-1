@@ -161,13 +161,10 @@ func TestSmaliPatchesOnOriginalAPK(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, needle := range []string{"displayName", "turnstileBox", "getResponse"} {
+	for _, needle := range []string{"displayName", "turnstileBox", "__m365Filled", "__m365Clicked"} {
 		if !strings.Contains(clientJS, needle) {
 			t.Fatalf("solver script missing %s", needle)
 		}
-	}
-	if strings.Contains(clientJS, "box.click()") {
-		t.Fatal("solver must not click Turnstile; that aborts verifying")
 	}
 }
 
