@@ -27,9 +27,9 @@ fi
 NEW_PKG=com.m365.gateway.pkcego
 OLD_PKG=com.m365.gateway3
 NEW_LABEL='修改版M365'
-VERSION_CODE=2
-VERSION_NAME=1.0.1
-APK_NAME=修改版M365-v1.0.1-arm64.apk
+VERSION_CODE=3
+VERSION_NAME=1.0.2
+APK_NAME=修改版M365-v1.0.2-arm64.apk
 BUILD_COMMIT=${BUILD_COMMIT:-$(git -C "$REPO" rev-parse --short=12 HEAD 2>/dev/null || printf unknown)}
 BUILD_TIME=${BUILD_TIME:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}
 LDFLAGS="-s -w -X m365-copilot2api/internal/web.Version=$VERSION_NAME -X m365-copilot2api/internal/web.Commit=$BUILD_COMMIT -X m365-copilot2api/internal/web.BuildTime=$BUILD_TIME"
