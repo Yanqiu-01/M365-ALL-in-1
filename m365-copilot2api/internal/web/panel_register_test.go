@@ -45,6 +45,25 @@ func writePanelConfig(t *testing.T, root, siteURL string) {
 	}
 }
 
+func TestRunRegisterDefaultsToProxyMode(t *testing.T) {
+	stubRotate(t)
+	site := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "upn": "ok"})
+	}))
+	defer site.Close()
+	root := t.TempDir()
+	writePanelConfig(t, root, site.URL)
+	report, err := (&Server{}).runRegister(context.Background(), newNativePanelManager(nativePanelConfig{Root: root}), panelRegisterRequest{
+		Count: 1, StartNum: 5026, TurnstileToken: "token-from-browser",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Mode != "proxy" {
+		t.Fatalf("mode = %q", report.Mode)
+	}
+}
+
 func TestRunRegisterPostsAndWritesCredentials(t *testing.T) {
 	stubRotate(t)
 	var got map[string]any

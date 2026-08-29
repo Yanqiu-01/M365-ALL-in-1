@@ -295,13 +295,15 @@ func rotateClash(ctx context.Context, req Request) (Result, error) {
 }
 
 func probeIP(ctx context.Context, proxyURL string) (string, error) {
-	client := http.DefaultClient
+	client := outbound.HTTPClient()
 	if strings.TrimSpace(proxyURL) != "" {
 		clients, err := outbound.New(proxyURL)
 		if err != nil {
 			return "", err
 		}
-		client = clients.HTTP
+		if clients != nil && clients.HTTP != nil {
+			client = clients.HTTP
+		}
 	}
 	var last error
 	for _, endpoint := range ipEndpoints {

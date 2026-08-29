@@ -350,6 +350,19 @@ func HTTPClient() *http.Client {
 	}
 	return c
 }
+
+// PickRawURL returns one live pool exit. Empty means dial directly.
+func PickRawURL() string {
+	p := CurrentPool()
+	if p == nil {
+		return ""
+	}
+	entry := p.pick()
+	if entry == nil {
+		return ""
+	}
+	return entry.raw
+}
 func WebSocketDialer() *websocket.Dialer {
 	clientsMu.RLock()
 	p, c := proxyPool, clients.WebSocket

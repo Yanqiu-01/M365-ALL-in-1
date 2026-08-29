@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"m365-copilot2api/internal/exitrotate"
 	"m365-copilot2api/internal/outbound"
@@ -66,7 +67,7 @@ func (s *Server) runRegister(ctx context.Context, manager *nativePanelManager, r
 	}
 	mode := strings.ToLower(strings.TrimSpace(request.Mode))
 	if mode == "" {
-		mode = "phone"
+		mode = "proxy"
 	}
 	if mode != "phone" && mode != "clash" && mode != "proxy" {
 		return panelRegisterReport{}, errors.New("未知注册模式，支持 phone / clash / proxy")
@@ -112,7 +113,7 @@ func (s *Server) runRegister(ctx context.Context, manager *nativePanelManager, r
 		return report, err
 	}
 
-	proxyURL := firstNonEmpty(request.Proxy, cfg.Register.PhoneSOCKS, cfg.Register.ClashProxy)
+	proxyURL := firstNonEmpty(request.Proxy, cfg.Register.PhoneSOCKS, cfg.Register.ClashProxy, outbound.PickRawURL())
 	rotateReq := exitrotate.Request{
 		Mode:        mode,
 		PhoneSOCKS:  cfg.Register.PhoneSOCKS,
@@ -149,10 +150,12 @@ func (s *Server) runRegister(ctx context.Context, manager *nativePanelManager, r
 			emailStart = start
 		}
 		display := fmt.Sprintf("User%d", num-(emailStart-displayBase))
-		if ip, err := probeRegisterIP(ctx, proxyURL); err == nil {
+		probeCtx, probeCancel := context.WithTimeout(ctx, 8*time.Second)
+		if ip, err := probeRegisterIP(probeCtx, proxyURL); err == nil {
 			item.IP = ip
 			lastIP = ip
 		}
+		probeCancel()
 		token, tokenErr := resolveTurnstileToken(ctx, cfg, request.TurnstileToken, proxyURL, display, username)
 		if tokenErr != nil {
 			item.Status, item.Detail = "failed", tokenErr.Error()
@@ -275,7 +278,7 @@ func postRegister(ctx context.Context, cfg nativePanelFileConfig, username, disp
 		"emailCode":         "",
 		"turnstileToken":    turnstile,
 	})
-	client := http.DefaultClient
+	client := outbound.HTTPClient()
 	if strings.TrimSpace(proxyURL) != "" {
 		if clients, err := outbound.New(proxyURL); err == nil && clients != nil && clients.HTTP != nil {
 			client = clients.HTTP

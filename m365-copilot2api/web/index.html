@@ -2119,7 +2119,7 @@ if (response.output_text) {
 <div class="card">
   <div class="card-head"><h3 class="card-title">注册新账号</h3><span class="card-note" id="panelRegState"></span></div>
   <div class="card-body">
-    <p class="form-hint" style="margin-bottom:var(--sp-2)">每个号都先联网，由后台 WebView 自动填账密并过 Cloudflare，不弹出注册页。成功写入本地后再切飞行模式，给下一个号用。返回键只取消当前验证，不会退出 App。</p>
+    <p class="form-hint" style="margin-bottom:var(--sp-2)">默认走本地代理池，不断网、不切飞行模式。后台 WebView 过 Cloudflare 后提交 /api/register，成功再写入本地账密。返回键只取消当前验证，不会退出 App。</p>
     <div class="form-row">
       <div class="form-group"><label class="form-label" for="regSiteUrl">注册站点</label>
         <input class="form-input" id="regSiteUrl" type="url" placeholder="https://office.965007.xyz"></div>
@@ -2141,7 +2141,7 @@ if (response.output_text) {
     </div>
     <div style="display:flex;gap:var(--sp-3);flex-wrap:wrap;align-items:flex-end">
       <div class="form-group" style="margin:0;min-width:130px"><label class="form-label" for="regMode">注册模式</label>
-        <select class="form-input" id="regMode"><option value="phone">手机换IP</option><option value="clash">Clash 节点</option><option value="proxy">当前代理</option></select></div>
+        <select class="form-input" id="regMode"><option value="proxy" selected>代理池</option><option value="phone">手机换IP</option><option value="clash">Clash 节点</option></select></div>
       <div class="form-group" style="margin:0;width:110px"><label class="form-label" for="regStartNum">起始编号</label>
         <input class="form-input" id="regStartNum" type="number" min="1" placeholder="5026"></div>
       <div class="form-group" style="margin:0;width:80px"><label class="form-label" for="regCount">数量</label>
@@ -3201,6 +3201,10 @@ async function loadOnboarding(){
 
 async function api(path,opts={}){
   opts.headers={'Content-Type':'application/json',...(opts.headers||{})};
+  if(opts.timeoutMs&&!opts.signal){
+    opts.signal=AbortSignal.timeout(opts.timeoutMs);
+    delete opts.timeoutMs;
+  }
   const r=await fetch(path,opts);
   const t=await r.text();
   let d;try{d=t?JSON.parse(t):{}}catch{d={error:{message:t}}};
@@ -6268,11 +6272,11 @@ function openRegisterPage(){
 async function panelStartRegister(){
   consumeTurnstileFromHash();
   const token=($('regTurnstile')?.value||'').trim();
-  const body={mode:$('regMode')?.value||'phone',count:parseInt($('regCount')?.value)||1,startNum:parseInt($('regStartNum')?.value)||0,turnstileToken:token};
+  const body={mode:$('regMode')?.value||'proxy',count:parseInt($('regCount')?.value)||1,startNum:parseInt($('regStartNum')?.value)||0,turnstileToken:token};
   const out=$('regResult');
-  if(out)out.textContent='提交注册…';
+  if(out)out.textContent='正在走代理池过验证并提交，请保持 App 在前台…';
   try{
-    const d=await api('/api/admin/panel/register',{method:'POST',body:JSON.stringify(body)});
+    const d=await api('/api/admin/panel/register',{method:'POST',body:JSON.stringify(body),timeoutMs:120000});
     const ok=d.success||0, fail=d.failed||0;
     if(out)out.textContent='成功 '+ok+' · 失败 '+fail+(d.accounts&&d.accounts[0]&&d.accounts[0].detail?(' · '+d.accounts[0].detail):'');
     loadAccounts();loadPanelState();
