@@ -65,6 +65,9 @@ func (s *Server) rootPage(w http.ResponseWriter, r *http.Request) {
 		// /workbench 应为 404。此分支属于有意的功能扩展，不是上文所述那类凭空
 		// 复原出的虚构路由，请勿按「APK 无此路径」为由直接删除。
 		name = "web/workbench.html"
+	case "/panel":
+		// 一体化控制面板入口。该页面仍由管理员中间件保护,不加入鉴权豁免。
+		name = "web/panel.html"
 	default:
 		http.NotFound(w, r)
 		return

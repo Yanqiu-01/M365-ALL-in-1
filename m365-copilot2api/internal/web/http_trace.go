@@ -15,7 +15,7 @@ const EnvHTTPTraceVerbose = "M365_HTTP_TRACE_VERBOSE"
 
 // tracePollNoise are the endpoints the admin dashboard polls on a timer. In one
 // recent window they accounted for 176 hits on /api/admin/proxy-pool, 143 on
-// /api/admin/panel/job/poll, 127 on /api/admin/login and 126 on /api/accounts,
+// the panel job poll, 127 on /api/admin/login and 126 on /api/accounts,
 // two log lines each, in a gateway log that had reached 31 MB. A routine success
 // on one of these says nothing a human will ever read back, so it is dropped.
 //
@@ -26,11 +26,14 @@ const EnvHTTPTraceVerbose = "M365_HTTP_TRACE_VERBOSE"
 // The match is on path alone, so a *successful* mutation on one of these routes
 // (a POST or DELETE to /api/admin/proxy-pool, say) is filtered too; set
 // M365_HTTP_TRACE_VERBOSE to see it. Extend the set by adding a line.
+//
+// The panel job poll used to be listed here. It now answers 501 (the local
+// worker orchestration was removed), and errors are never filtered, so keeping
+// it would have no effect.
 var tracePollNoise = map[string]bool{
-	"/api/admin/proxy-pool":     true,
-	"/api/admin/panel/job/poll": true,
-	"/api/admin/login":          true,
-	"/api/accounts":             true,
+	"/api/admin/proxy-pool": true,
+	"/api/admin/login":      true,
+	"/api/accounts":         true,
 }
 
 type traceWriter struct {

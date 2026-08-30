@@ -5,11 +5,13 @@ import (
 	"errors"
 	"log"
 	"m365-copilot2api/internal/outbound"
+	"m365-copilot2api/internal/turnstile"
 	"m365-copilot2api/internal/web"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -51,6 +53,24 @@ func main() {
 	// waitForProxyGuard blocks until the patrol has actually returned, so nothing
 	// outlives main.
 	waitForProxyGuard := outbound.StartProxyGuard(ctx)
+	// 内建 FlareSolverr 自带一个 http.Server，不经过网关的任何中间件，也没有任何
+	// 鉴权。因此监听地址只允许回环：把它绑到 0.0.0.0 会把一个无鉴权的求解接口
+	// 直接摆到局域网上。非回环地址不静默接受，记一行日志后退回回环。
+	turnstileDone := make(chan struct{})
+	go func() {
+		defer close(turnstileDone)
+		addr := "127.0.0.1:8191"
+		if v := strings.TrimSpace(os.Getenv("M365_FLARESOLVERR_LISTEN")); v != "" {
+			if loopbackListenAddr(v) {
+				addr = v
+			} else {
+				log.Printf("built-in FlareSolverr: refusing non-loopback listen %q (unauthenticated endpoint); using %s", v, addr)
+			}
+		}
+		if err := turnstile.Listen(ctx, addr); err != nil {
+			log.Printf("built-in FlareSolverr: %v", err)
+		}
+	}()
 	go func() {
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -66,6 +86,10 @@ func main() {
 	// patrol goroutine to finish before the process exits.
 	stop()
 	waitForProxyGuard()
+	// 这个文件对其余后台工作者都保证「不会有东西比 main 活得更久」，内建
+	// FlareSolverr 也要照此join，否则进程退出时它的监听器可能还没关，紧接着的
+	// 重启会撞上「address already in use」。
+	<-turnstileDone
 	web.StopPersistLoop()
 	log.Println("shutdown complete")
 }

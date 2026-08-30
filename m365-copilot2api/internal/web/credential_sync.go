@@ -5,12 +5,15 @@ package web
 // 现象：网关有 481 个账号，但加密 vault 里只有 33 条账密，于是「账密一键回调」
 // 在密码留空时报「密码为空」——因为 vault 里确实没有。
 //
-// 原因：账号是由 Python 注册/OAuth 脚本导入的，那些脚本把账密写进配置里的
-// 文本清单（cred_file，格式 email----password，共 751 行），而 vault 是 Go 侧
+// 原因：账号是由早期的 Python 注册/OAuth 脚本导入的，那些脚本把账密写进配置里
+// 的文本清单（cred_file，格式 email----password，共 751 行），而 vault 是 Go 侧
 // 独立的加密存储，两边从未同步。
 //
 // 做法：把文本清单里的账密按邮箱匹配到账号池，缺失的补进 vault。这样用户
 // 「已经导入的账号」就自动带上账密，不需要再手动逐个录入。
+//
+// 那些脚本本身已经删除，但清单是留在用户机器上的既有数据，仍然是补齐账密的
+// 唯一来源，因此读取逻辑保留（见 native_panel.go 的数据目录部分）。
 
 import (
 	"errors"
@@ -49,7 +52,7 @@ func (s *Server) syncCredentialsFromPanel() (credentialSyncReport, error) {
 	if manager == nil {
 		return report, errors.New("本地面板不可用，无法定位账密清单")
 	}
-	paths, cfg, err := manager.workerConfig()
+	paths, cfg, err := manager.panelData()
 	if err != nil {
 		return report, err
 	}
