@@ -1,0 +1,15 @@
+# Go 构建产物。`go build ./...` 会把 main 包的可执行文件写到当前目录，
+# 一个 server.exe 有 25MB 级别，绝不能进仓库。
+*.exe
+*.test
+*.out
+
+# Go 覆盖率与性能剖析输出
+coverage.txt
+*.prof
+
+# 网关运行时产物（与源码同目录，见 cmd/server/gatewayLogPath）
+m365-gateway.log
+
+# 面板数据目录：内含账密清单与令牌，永远不提交
+M365-自用/
