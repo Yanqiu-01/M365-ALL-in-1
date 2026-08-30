@@ -988,6 +988,11 @@ textarea.form-input{min-height:80px;line-height:var(--lh-normal);resize:vertical
   cursor:pointer;font-family:inherit;padding:var(--sp-1) var(--sp-2);border-radius:6px;
   transition:color var(--dur-fast) ease,background var(--dur-fast) ease}
 .term-clear:hover{color:#fff;background:rgba(255,255,255,0.08)}
+.reg-frame{height:min(70vh,640px);min-height:420px;margin-top:var(--sp-3);
+  border:1px solid var(--line);border-radius:var(--radius-sm);background:#fff;
+  overflow:hidden;position:relative}
+.reg-frame-hint{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+  color:var(--muted);font-size:var(--fs-sm);padding:var(--sp-4);text-align:center;pointer-events:none}
 .term-body{height:260px;overflow-y:auto;padding:var(--sp-3);
   font-size:var(--fs-sm);line-height:var(--lh-relaxed);color:var(--term-text)}
 .term-body div{white-space:pre-wrap;word-break:break-all}
@@ -2119,7 +2124,7 @@ if (response.output_text) {
 <div class="card">
   <div class="card-head"><h3 class="card-title">注册新账号</h3><span class="card-note" id="panelRegState"></span></div>
   <div class="card-body">
-    <p class="form-hint" style="margin-bottom:var(--sp-2)">点开始注册后，右下角会开一个小窗自己填账密、过验证、提交。面板还在。成功后写入本地账密并去微软拿 OAuth。返回键只取消当前这次。</p>
+    <p class="form-hint" style="margin-bottom:var(--sp-2)">点开始注册后，下面这块会嵌进注册站：自动填账密、过验证、提交。成功后写入本地账密并去微软拿 OAuth。返回键只取消当前这次。</p>
     <div class="form-row">
       <div class="form-group"><label class="form-label" for="regSiteUrl">注册站点</label>
         <input class="form-input" id="regSiteUrl" type="url" placeholder="https://office.965007.xyz"></div>
@@ -2149,6 +2154,7 @@ if (response.output_text) {
       <button type="button" class="btn primary" onclick="panelStartRegister()">开始注册</button>
     </div>
     <p class="form-hint" id="regResult" aria-live="polite" style="margin-top:var(--sp-2)"></p>
+    <div class="reg-frame" id="regFrame"><div class="reg-frame-hint">开始注册后，注册站会出现在这里</div></div>
   </div>
 </div>
 <div class="card">
@@ -6233,10 +6239,19 @@ async function saveRegisterConfig(){
     loadPanelState();
   }catch(e){showNotice(e.message||String(e),'error');}
 }
+function placeRegisterFrame(){
+  const el=$('regFrame');
+  if(!el||!window.M365Native||typeof M365Native.placeRegister!=='function') return;
+  const r=el.getBoundingClientRect();
+  if(r.width<80||r.height<80) return;
+  M365Native.placeRegister(r.left,r.top,r.width,r.height);
+}
 async function panelStartRegister(){
   const body={mode:$('regMode')?.value||'proxy',count:parseInt($('regCount')?.value)||1,startNum:parseInt($('regStartNum')?.value)||0};
   const out=$('regResult');
-  if(out)out.textContent='正在右下角小窗填账密并提交，请保持 App 在前台…';
+  if(out)out.textContent='正在内嵌注册页填账密并提交，请保持 App 在前台…';
+  placeRegisterFrame();
+  const timer=setInterval(placeRegisterFrame,400);
   try{
     const d=await api('/api/admin/panel/register',{method:'POST',body:JSON.stringify(body),timeoutMs:180000});
     const acc=d.accounts&&d.accounts[0];
@@ -6246,6 +6261,7 @@ async function panelStartRegister(){
     if(out)out.textContent='成功 '+ok+' · 失败 '+fail+extra;
     loadAccounts();loadPanelState();
   }catch(e){if(out)out.textContent=e.message||String(e);showNotice(e.message,'error');}
+  finally{clearInterval(timer);}
 }
 async function panelStartOauthBatch(){
   const body={startNum:parseInt($('oauthStartNum')?.value)||0,endNum:parseInt($('oauthEndNum')?.value)||0,resume:!!$('oauthBatchResume')?.checked};

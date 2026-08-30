@@ -101,7 +101,7 @@ func TestSmaliPatchesOnOriginalAPK(t *testing.T) {
 	if strings.Contains(cond2, "invoke-virtual {p2, v0}, Ljava/lang/String;->endsWith") {
 		t.Fatal("p2 reused as String after login.live.com clobbers the host register")
 	}
-	for _, needle := range []string{"openUrl", "captureTurnstile", "keepAlive"} {
+	for _, needle := range []string{"openUrl", "captureTurnstile", "keepAlive", "placeRegister"} {
 		if !strings.Contains(bridge, needle) {
 			t.Fatalf("NativeBridge missing %s", needle)
 		}
@@ -166,6 +166,9 @@ func TestSmaliPatchesOnOriginalAPK(t *testing.T) {
 	if !strings.Contains(flare, "tapAt") {
 		t.Fatal("solver must dispatch a real tap to Turnstile")
 	}
+	if !strings.Contains(flare, "place(FFFF)") {
+		t.Fatal("solver must accept an in-panel slot")
+	}
 	if strings.Contains(flare, "setAlpha") {
 		t.Fatal("alpha=0 can stop WebView from painting Turnstile")
 	}
@@ -176,10 +179,13 @@ func TestSmaliPatchesOnOriginalAPK(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, needle := range []string{"displayName", "turnstileBox", "__m365Filled", "__m365Clicked", "submitBtn", "SUBMITTED:", "M365Flare.tap"} {
+	for _, needle := range []string{"displayName()", "username()", "password()", "turnstileBox", "__m365Filled", "__m365Clicked", "submitBtn", "SUBMITTED:", "M365Flare.tap"} {
 		if !strings.Contains(clientJS, needle) {
 			t.Fatalf("solver script missing %s", needle)
 		}
+	}
+	if _, err := os.Stat(filepath.Join(work, "smali", "com", "m365", "gateway", "FlareSolver$Place.smali")); err != nil {
+		t.Fatal(err)
 	}
 }
 

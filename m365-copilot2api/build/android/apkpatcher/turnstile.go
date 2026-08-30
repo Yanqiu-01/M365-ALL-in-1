@@ -117,9 +117,12 @@ func patchTurnstileCapture(work string) error {
 	}
 	if !strings.Contains(bridgeSource, "openUrl") {
 		bridgeSource += nativeBridgeURLSmali
-		if err := writeFile(bridgePath, bridgeSource); err != nil {
-			return err
-		}
+	}
+	if !strings.Contains(bridgeSource, "placeRegister") {
+		bridgeSource += nativeBridgePlaceSmali
+	}
+	if err := writeFile(bridgePath, bridgeSource); err != nil {
+		return err
 	}
 	if err := writeFile(filepath.Join(packageDir, "MainActivity$NativeBridge$1.smali"), nativeBridgeRunnerSmali); err != nil {
 		return err
@@ -146,6 +149,9 @@ func patchTurnstileCapture(work string) error {
 		return err
 	}
 	if err := mustContain(verifyBridge, "captureTurnstile", "native bridge"); err != nil {
+		return err
+	}
+	if err := mustContain(verifyBridge, "placeRegister", "native bridge"); err != nil {
 		return err
 	}
 	fmt.Printf("patched turnstile capture: %s\n", clientPath)
@@ -206,6 +212,25 @@ const nativeBridgeURLSmali = `
     invoke-direct {v1, v0, p1}, Lcom/m365/gateway/MainActivity$NativeBridge$1;-><init>(Landroid/webkit/WebView;Ljava/lang/String;)V
 
     invoke-virtual {v0, v1}, Landroid/webkit/WebView;->post(Ljava/lang/Runnable;)Z
+
+    :done
+    return-void
+.end method
+`
+
+const nativeBridgePlaceSmali = `
+.method public placeRegister(FFFF)V
+    .locals 2
+    .annotation runtime Landroid/webkit/JavascriptInterface;
+    .end annotation
+
+    iget-object v0, p0, Lcom/m365/gateway/MainActivity$NativeBridge;->this$0:Lcom/m365/gateway/MainActivity;
+
+    iget-object v0, v0, Lcom/m365/gateway/MainActivity;->flare:Lcom/m365/gateway/FlareSolver;
+
+    if-eqz v0, :done
+
+    invoke-virtual {v0, p1, p2, p3, p4}, Lcom/m365/gateway/FlareSolver;->place(FFFF)V
 
     :done
     return-void
