@@ -49,7 +49,7 @@ func HandleV1(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), timeout)
 	defer cancel()
-	solved, err := solveLocal(ctx, page, strField(payload, "displayName"), strField(payload, "username"), strField(payload, "password"))
+	solved, err := solveLocal(ctx, page, strField(payload, "displayName"), strField(payload, "username"), strField(payload, "password"), strField(payload, "proxy"))
 	if err != nil {
 		writeFlare(w, flareReply{Status: "error", Message: err.Error()})
 		return
@@ -128,12 +128,23 @@ type localSolution struct {
 	UserAgent string
 }
 
-func solveLocal(ctx context.Context, page, display, username, password string) (localSolution, error) {
+func solveLocal(ctx context.Context, page, display, username, password, proxy string) (localSolution, error) {
 	dir := flareDir()
 	if dir == "" {
 		return localSolution{}, errors.New("内置 FlareSolverr 需要 App 数据目录。请打开修改版M365 后再注册")
 	}
-	return solveViaWebView(ctx, dir, page, display, username, password)
+	return solveViaWebView(ctx, dir, page, display, username, password, proxy)
+}
+
+// Cancel asks the in-app register WebView to stop the current job.
+func Cancel() {
+	dir := flareDir()
+	if dir == "" {
+		return
+	}
+	_ = os.MkdirAll(dir, 0o755)
+	_ = os.WriteFile(filepath.Join(dir, "cancel"), []byte("1\n"), 0o600)
+	_ = os.WriteFile(filepath.Join(dir, "result"), []byte("0\nCANCEL\n"), 0o600)
 }
 
 func flareDir() string {
@@ -152,7 +163,7 @@ func oneLine(v string) string {
 	return strings.TrimSpace(v)
 }
 
-func solveViaWebView(ctx context.Context, dir, page, display, username, password string) (localSolution, error) {
+func solveViaWebView(ctx context.Context, dir, page, display, username, password, proxy string) (localSolution, error) {
 	webviewMu.Lock()
 	defer webviewMu.Unlock()
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -167,8 +178,10 @@ func solveViaWebView(ctx context.Context, dir, page, display, username, password
 	tmp := filepath.Join(dir, "job.tmp")
 	result := filepath.Join(dir, "result")
 	status := filepath.Join(dir, "status")
+	cancel := filepath.Join(dir, "cancel")
 	_ = os.Remove(result)
 	_ = os.Remove(status)
+	_ = os.Remove(cancel)
 	body := strings.Join([]string{id, oneLine(page), oneLine(display), oneLine(username), oneLine(password)}, "\n") + "\n"
 	if err := os.WriteFile(tmp, []byte(body), 0o600); err != nil {
 		return localSolution{}, err
@@ -186,6 +199,10 @@ func solveViaWebView(ctx context.Context, dir, page, display, username, password
 		case <-ctx.Done():
 			return localSolution{}, timeoutError(jobTaken, pageLoaded)
 		case <-ticker.C:
+			if _, err := os.Stat(cancel); err == nil {
+				_ = os.Remove(cancel)
+				return localSolution{}, errors.New("已取消验证")
+			}
 			if _, err := os.Stat(job); err != nil {
 				jobTaken = true
 			}
@@ -197,14 +214,18 @@ func solveViaWebView(ctx context.Context, dir, page, display, username, password
 				continue
 			}
 			lines := strings.Split(strings.ReplaceAll(string(raw), "\r\n", "\n"), "\n")
-			if len(lines) < 2 || strings.TrimSpace(lines[0]) != id {
+			if len(lines) < 2 {
+				continue
+			}
+			token := strings.TrimSpace(lines[1])
+			if token == "CANCEL" {
+				_ = os.Remove(result)
+				return localSolution{}, errors.New("已取消验证")
+			}
+			if strings.TrimSpace(lines[0]) != id {
 				continue
 			}
 			_ = os.Remove(result)
-			token := strings.TrimSpace(lines[1])
-			if token == "CANCEL" {
-				return localSolution{}, errors.New("已取消验证")
-			}
 			if token == "" {
 				return localSolution{}, errors.New("后台验证没有拿到 Turnstile token")
 			}

@@ -38,14 +38,11 @@ func panelRequest(t *testing.T, server *Server, cookie *http.Cookie, method, pat
 func TestNativePanelRemovedRoutesAnswer501WithReason(t *testing.T) {
 	server, cookie := panelTestServer(t)
 	stop := panelRequest(t, server, cookie, http.MethodPost, "/api/admin/panel/job/stop", `{}`)
-	if stop.Code != http.StatusNotImplemented {
-		t.Errorf("job/stop status = %d, want 501", stop.Code)
+	if stop.Code != http.StatusOK {
+		t.Errorf("job/stop status = %d, want 200 body=%s", stop.Code, stop.Body.String())
 	}
-	if !strings.Contains(stop.Body.String(), "feature_removed") {
-		t.Errorf("job/stop body missing feature_removed: %s", stop.Body.String())
-	}
-	if strings.Contains(stop.Body.String(), "Python 工作者未配置") {
-		t.Errorf("job/stop 仍在提示依赖 Python 工作者: %s", stop.Body.String())
+	if !strings.Contains(stop.Body.String(), `"stopped":true`) && !strings.Contains(stop.Body.String(), `"stopped": true`) {
+		t.Errorf("job/stop body missing stopped: %s", stop.Body.String())
 	}
 	recorder := panelRequest(t, server, cookie, http.MethodGet, "/api/admin/panel/job/poll", "")
 	if recorder.Code != http.StatusNotImplemented {

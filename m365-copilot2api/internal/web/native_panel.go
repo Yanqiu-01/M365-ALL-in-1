@@ -11,7 +11,7 @@ package web
 //   - 批量 OAuth 走 Go：ROPC → Device Code → PKCE，不再驱动浏览器填账密。
 //   - 注册走 Go：换 IP（Rust CLI 优先，Go 回退）+ FlareSolverr 取 Turnstile
 //     token + POST /api/register。调用方仍可手动提供 token 作为回退。
-//   - job/poll 与 job/stop 仍返回 501：已经没有可轮询的子进程。
+//   - job/poll 仍返回 501。job/stop 会取消当前内嵌注册。
 
 import (
 	"bufio"
@@ -471,7 +471,6 @@ func nativePanelDecodeJSON(w http.ResponseWriter, r *http.Request, target any, a
 // 避免用户在界面上按下按钮后只看到一句无法定位的失败。
 var nativePanelRemovedRoutes = map[string]string{
 	"/api/admin/panel/job/poll": "任务日志已移除：网关不再拉起本地 Python 工作者进程。注册与批量 OAuth 改为同步返回结果。",
-	"/api/admin/panel/job/stop": "任务停止已移除：网关不再拉起本地 Python 工作者进程。",
 }
 
 type nativePanelController struct {
@@ -535,6 +534,14 @@ func (c *nativePanelController) ServeHTTP(w http.ResponseWriter, r *http.Request
 			"emailPrefix":    cfg.Register.EmailPrefix,
 			"emailStartNum":  cfg.Register.EmailStartNum,
 		})
+	case "/api/admin/panel/job/stop":
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", http.MethodPost)
+			writeOpenAIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "POST required")
+			return
+		}
+		turnstile.Cancel()
+		jsonOut(w, map[string]any{"ok": true, "stopped": true})
 	case "/api/admin/panel/register":
 		if r.Method != http.MethodPost {
 			w.Header().Set("Allow", http.MethodPost)
@@ -630,6 +637,7 @@ func (s *Server) RegisterNativePanelRoutes(mux *http.ServeMux) {
 		"/api/admin/panel/oauth/batch",
 		"/api/admin/panel/register",
 		"/api/admin/panel/config",
+		"/api/admin/panel/job/stop",
 	}
 	for path := range nativePanelRemovedRoutes {
 		paths = append(paths, path)

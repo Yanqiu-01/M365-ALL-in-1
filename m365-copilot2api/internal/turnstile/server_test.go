@@ -42,8 +42,8 @@ func TestHandleV1ReadsWebViewResult(t *testing.T) {
 				continue
 			}
 			lines := strings.Split(string(body), "\n")
-			if len(lines) < 5 {
-				t.Errorf("job lines = %d, want at least 5", len(lines))
+			if len(lines) < 6 {
+				t.Errorf("job lines = %d, want at least 6", len(lines))
 			}
 			id := lines[0]
 			_ = os.WriteFile(filepath.Join(dir, "result"), []byte(id+"\nwebview-token-abcdefghijklmnopqrstuvwxyz\n"), 0o600)

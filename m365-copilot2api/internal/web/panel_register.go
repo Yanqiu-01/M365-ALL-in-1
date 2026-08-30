@@ -116,7 +116,10 @@ func (s *Server) runRegister(ctx context.Context, manager *nativePanelManager, r
 		return report, err
 	}
 
-	proxyURL := firstNonEmpty(request.Proxy, cfg.Register.PhoneSOCKS, cfg.Register.ClashProxy, outbound.PickRawURL())
+	proxyURL := firstNonEmpty(request.Proxy, cfg.Register.PhoneSOCKS, cfg.Register.ClashProxy)
+	if mode == "proxy" || strings.TrimSpace(proxyURL) == "" {
+		proxyURL = firstNonEmpty(proxyURL, outbound.PickRawURL())
+	}
 	rotateReq := exitrotate.Request{
 		Mode:        mode,
 		PhoneSOCKS:  cfg.Register.PhoneSOCKS,
@@ -195,7 +198,14 @@ func (s *Server) runRegister(ctx context.Context, manager *nativePanelManager, r
 
 		// 先联网过 CF、提交注册并写入本地账密，确认成功后再换出口，
 		// 给下一个号用。开着飞行模式是过不了 Turnstile 的。
-		if i < count-1 && mode != "proxy" {
+		if i < count-1 {
+			if mode == "proxy" {
+				next := outbound.PickRawURL()
+				if next != "" && next != proxyURL {
+					proxyURL = next
+				}
+				continue
+			}
 			rotateReq.PrevIP = lastIP
 			rotated, rotateErr := rotateExit(ctx, rotateReq)
 			report.Rotate = &rotated
