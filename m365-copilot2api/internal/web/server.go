@@ -196,6 +196,7 @@ type Server struct {
 	accountPool        *accountHealth
 	upstreamCooldown   *accountCooldown
 	accountConcurrency *accountConcurrency
+	resourceScheduler  *resourceScheduler
 	pkce               map[string]pendingPKCE
 	pkceAttempt        uint64
 	// exchangePKCECode is nil in production and falls back to auth.ExchangeCode.
@@ -251,6 +252,7 @@ func New() (*Server, error) {
 		accountPool:        newAccountHealth(),
 		upstreamCooldown:   newAccountCooldown(),
 		accountConcurrency: newAccountConcurrency(),
+		resourceScheduler:  newResourceScheduler(),
 		pkce:               map[string]pendingPKCE{},
 		// One Client for the process lifetime is fine: it holds no snapshot of the
 		// outbound configuration, so proxy-pool and client-profile edits are picked
@@ -359,6 +361,8 @@ func (s *Server) Routes() http.Handler {
 	m.HandleFunc("/api/stats/reset", s.handleCacheStatsReset)
 	m.HandleFunc("/api/usage", s.adminUsage)
 	m.HandleFunc("/api/usage/logs", s.adminUsageLogs)
+	m.HandleFunc("/api/resources/status", s.resourceStatus)
+	m.HandleFunc("/api/contributions/ledger", s.contributionLedger)
 	m.HandleFunc("/v1/mcp", mcp.HandleStreamable)
 	m.HandleFunc("/v1/mcp/sse", mcp.HandleSSE)
 	m.HandleFunc("/v1/mcp/message", mcp.HandleMessage)
@@ -1094,41 +1098,56 @@ func (s *Server) resolveAccount(accountID string) (auth.AccountToken, error) {
 		return auth.AccountToken{}, fmt.Errorf("no accounts; login first")
 	}
 	if accountID == "" {
-		probeLimit := len(s.tokens.List())
-		acc, ok := s.tokens.Next()
-		if !ok {
+		accounts := s.tokens.List()
+		if len(accounts) == 0 {
 			return auth.AccountToken{}, fmt.Errorf("no accounts; login first")
 		}
-		accountID = acc.ID
-		for i := 1; !s.accountAvailable(accountID) && i < probeLimit; i++ {
-			acc, ok = s.tokens.Next()
-			if !ok {
-				break
-			}
-			accountID = acc.ID
-		}
-		if !s.accountAvailable(accountID) {
-			if !s.accountPool.Available(accountID) {
-				until := s.accountPool.EarliestRecovery()
-				retry := int(time.Until(until).Seconds())
-				if retry < 5 {
-					retry = 5
+		concurrency := s.accountConcurrency.Snapshot()
+		inflight, _ := concurrency["inflight"].(map[string]int)
+		// 调度器由 New() 构造（server.go:255）。这里原有一段惰性初始化，既到不了
+		// （字段永不为 nil），又是在每个请求都会进入的路径上无锁写共享字段 ——
+		// 两个并发请求可能各建一个调度器，其中一个的在途计数随即丢失。
+		acc, ok := s.resourceScheduler.Select(accounts, s.accountAvailable, inflight)
+		if !ok {
+			// Select 内部已经用 accountAvailable 过滤，因此走到这里就是「没有一个
+			// 可用」。原先这里直接返回普通 error，映射成 502；紧随其后那段 429 +
+			// Retry-After 反而永远到不了 —— Select 成功时账号必然可用。
+			//
+			// 502 与 429 对客户端是两回事：Codex 会把 502 当上游故障立刻重试，把
+			// 冷却期打穿；429 带 Retry-After 才会让它等。所以这里要自己判断冷却
+			// 并给出重试时间。
+			if s.accountPool != nil {
+				for _, account := range accounts {
+					if account.ID == "" || s.accountPool.Available(account.ID) {
+						continue
+					}
+					retry := int(time.Until(s.accountPool.EarliestRecovery()).Seconds())
+					if retry < 5 {
+						retry = 5
+					}
+					return auth.AccountToken{}, &UpstreamHTTPError{Status: 429, RetryAfter: retry, Body: "all accounts are cooling down; try again later"}
 				}
-				return auth.AccountToken{}, &UpstreamHTTPError{Status: 429, RetryAfter: retry, Body: "all accounts are cooling down; try again later"}
 			}
-			retry := 1
+			// 账号健康但被上游按邮箱限流：取最晚的解禁时间，早于它重试仍会被拒。
 			if s.upstreamCooldown != nil {
-				if candidate, exists := s.tokens.Get(accountID); exists {
-					if until, blocked := s.upstreamCooldown.snapshot()[candidate.Email]; blocked {
-						retry = int(time.Until(until).Seconds())
-						if retry < 1 {
-							retry = 1
-						}
+				snapshot := s.upstreamCooldown.snapshot()
+				retry := 0
+				for _, account := range accounts {
+					until, blocked := snapshot[account.Email]
+					if !blocked {
+						continue
+					}
+					if seconds := int(time.Until(until).Seconds()); seconds > retry {
+						retry = seconds
 					}
 				}
+				if retry > 0 {
+					return auth.AccountToken{}, &UpstreamHTTPError{Status: 429, RetryAfter: retry, Body: "all accounts are temporarily unavailable; try again shortly"}
+				}
 			}
-			return auth.AccountToken{}, &UpstreamHTTPError{Status: 429, RetryAfter: retry, Body: "all accounts are temporarily unavailable; try again shortly"}
+			return auth.AccountToken{}, fmt.Errorf("no online authorized account available; complete OAuth callback first")
 		}
+		accountID = acc.ID
 	}
 	return s.tokens.EnsureValid(accountID)
 }
@@ -1429,10 +1448,11 @@ type oaiMsg struct {
 }
 
 type oaiReq struct {
-	Model          string          `json:"model"`
-	ResponseFormat *responseFormat `json:"response_format,omitempty"`
-	Messages       []oaiMsg        `json:"messages"`
-	Stream         bool            `json:"stream"`
+	Model             string          `json:"model"`
+	ResponseFormat    *responseFormat `json:"response_format,omitempty"`
+	Messages          []oaiMsg        `json:"messages"`
+	Stream            bool            `json:"stream"`
+	ParallelToolCalls *bool           `json:"parallel_tool_calls,omitempty"`
 	// optional account routing
 	User           string `json:"user"`
 	AccountID      string `json:"accountId"`
@@ -1560,6 +1580,15 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	body.SessionID = firstNonEmpty(body.SessionID, body.SessionIDC)
 	log.Printf("[req-trace] id=%s stage=body_parsed messages=%d tools=%d choice=%s raw_bytes=%d", requestID, len(body.Messages), len(body.Tools), normalizedToolChoiceMode(body.ToolChoice), len(raw))
 	stage(requestID, "body_parsed", map[string]any{"messages": len(body.Messages), "tools": len(body.Tools), "raw_bytes": len(raw)})
+	// 空请求必须在注入之前判定。下面注入的环境说明是网关自己添的内容，一旦先
+	// 注入，扁平化后的 prompt 就永远非空，messages:[] 这类请求会绕过后面那道
+	// 400 直接打到上游。这里用同一个扁平化函数和同一句错误文案，判定标准与注入
+	// 前保持一致。
+	if callerPrompt, _ := flattenPromptMessages(body.Messages, nil); strings.TrimSpace(callerPrompt) == "" {
+		http.Error(w, "messages required", http.StatusBadRequest)
+		return
+	}
+	body.Messages = ensureRuntimeWorkspaceInstruction(body.Messages)
 	if cleaned, notes := sanitizeToolConversation(body.Messages); len(notes) > 0 {
 		body.Messages = cleaned
 		log.Printf("[req-trace] id=%s stage=tool_history_sanitized drops=%d detail=%v", requestID, len(notes), notes)
@@ -1699,6 +1728,10 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	}
 	validateCalls := func(stage string, calls []detectedToolCall) ([]detectedToolCall, int) {
 		valid, rejected := validateDetectedToolCalls(calls, toolMaps, body.ToolChoice)
+		// 客户端显式关闭并行时降为单调用。这里是 11 处决策解析的共同收口，放在
+		// 别处会漏掉分支。
+		valid, serialized := enforceParallelToolCalls(valid, body.ParallelToolCalls)
+		rejected = append(rejected, serialized...)
 		for _, call := range rejected {
 			log.Printf("[tool-validation] id=%s stage=%s rejected_name=%q reason=%q", requestID, stage, call.Name, call.Reason)
 		}
@@ -1739,7 +1772,11 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			s.dropTransientConversation(routeRes.ConversationID)
 		}
 		if routeErr != nil {
-			http.Error(w, "tool router: "+routeErr.Error(), http.StatusBadGateway)
+			msg := upstreamStageError("router", routeErr)
+			if IsRateLimited(routeErr) {
+				msg = "upstream is rate limiting; try again shortly"
+			}
+			writeOpenAIError(w, http.StatusBadGateway, "router_error", msg)
 			return
 		}
 		calls, parsed = parseModelToolDecision(routeRes.Text, toolMaps, body.ToolChoice)

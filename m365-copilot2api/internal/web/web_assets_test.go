@@ -28,8 +28,8 @@ func TestWebAssetsMatchAPKSet(t *testing.T) {
 	sort.Strings(got)
 
 	want := []string{"debug.html", "index.html", "login.html"}
-	extraHTML := []string{"workbench.html"}          // 有意新增，见函数注释
-	extraAssets := []string{"favicon.ico"}           // 有意新增：站点图标（壁纸编号05生成）
+	extraHTML := []string{"panel.html", "workbench.html"} // 有意新增，见函数注释
+	extraAssets := []string{"favicon.ico"}                // 有意新增：站点图标（壁纸编号05生成）
 	allowed := append(append([]string{}, want...), extraHTML...)
 	allowed = append(allowed, extraAssets...)
 	sort.Strings(allowed)
@@ -112,6 +112,44 @@ func TestWebIndexAPIEndpointsAreRouted(t *testing.T) {
 		if recorder.Code == http.StatusNotFound &&
 			strings.Contains(recorder.Body.String(), "404 page not found") {
 			t.Errorf("前端调用 %s，但服务端未注册该路由", endpoint)
+		}
+	}
+}
+
+// panel.html 与 index.html 受同一条契约约束。它此前只进了资源白名单和「是不是
+// HTML 文档」这两项检查，7 个 /api 调用一个都没被覆盖 —— 而它恰恰是驱动账号注册
+// 与 OAuth 导入的页面，任一路由缺失都会让功能静默失效。
+func TestWebPanelAPIEndpointsAreRouted(t *testing.T) {
+	body, err := os.ReadFile("../../web/panel.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pattern := regexp.MustCompile(`'(/api/[A-Za-z0-9/_-]+)'`)
+	seen := map[string]bool{}
+	for _, match := range pattern.FindAllStringSubmatch(string(body), -1) {
+		seen[match[1]] = true
+	}
+	// panel.html 实测调用 7 个端点。下界取 5 是为了在页面增删调用时不误报，同时
+	// 仍能在正则失效（匹配数骤降为 0）时立刻失败。
+	if len(seen) < 5 {
+		t.Fatalf("只解析出 %d 个端点，正则可能失效", len(seen))
+	}
+
+	server := &Server{}
+	routes := server.Routes()
+	endpoints := make([]string, 0, len(seen))
+	for endpoint := range seen {
+		endpoints = append(endpoints, endpoint)
+	}
+	sort.Strings(endpoints)
+
+	for _, endpoint := range endpoints {
+		recorder := httptest.NewRecorder()
+		routes.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, endpoint, nil))
+		if recorder.Code == http.StatusNotFound &&
+			strings.Contains(recorder.Body.String(), "404 page not found") {
+			t.Errorf("panel.html 调用 %s，但服务端未注册该路由", endpoint)
 		}
 	}
 }

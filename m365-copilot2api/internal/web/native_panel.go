@@ -1,12 +1,20 @@
 package web
 
-// Native panel support keeps registration and OAuth orchestration inside the
-// 4141 gateway. It does not start FastAPI/uvicorn or make loopback HTTP calls:
-// existing Python programs remain workers, while Go owns their lifecycle.
+// 原生面板：账号数据目录 + Go 内置注册 / OAuth。
+//
+// 历史：注册与批量 OAuth 曾由 4141 网关拉起 M365-自用/ 下的 Python 工作者
+// （Register/*.py、oauth/*.py）完成。那些脚本依赖 Playwright、桌面 Chromium
+// 与 Cloudflare Turnstile，已随工程删除。当前分工：
+//
+//   - 数据目录（config.json、账密清单）仍然读取，供面板状态与账密补齐使用。
+//     目录位置由 M365_NATIVE_PANEL_ROOT 或已保存设置决定，属用户数据而非仓库代码。
+//   - 批量 OAuth 走 Go：ROPC → Device Code → PKCE，不再驱动浏览器填账密。
+//   - 注册走 Go：换 IP（Rust CLI 优先，Go 回退）+ FlareSolverr 取 Turnstile
+//     token + POST /api/register。调用方仍可手动提供 token 作为回退。
+//   - job/poll 仍返回 501。job/stop 会取消当前内嵌注册。
 
 import (
 	"bufio"
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,62 +22,62 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
-	"time"
+
+	"m365-copilot2api/internal/auth"
+	"m365-copilot2api/internal/turnstile"
 )
 
 const (
 	nativePanelRootEnv       = "M365_NATIVE_PANEL_ROOT"
-	nativePanelPythonEnv     = "M365_NATIVE_PANEL_PYTHON"
-	nativePanelLogCap        = 800
-	nativePanelPollLogCap    = 200
 	nativePanelMaxRequest    = 32 << 10
 	nativePanelMaxConfig     = 1 << 20
 	nativePanelMaxCredential = 4 << 20
 	nativePanelMaxLine       = 256 << 10
-	nativePanelMaxLogLine    = 8 << 10
 )
 
-var (
-	errNativePanelBusy        = errors.New("已有注册或 OAuth 任务正在运行")
-	errNativePanelUnavailable = errors.New("本地 Python 工作者未配置或不可用")
-)
+// errNativePanelUnavailable 表示本机没有可用的面板数据目录。它不再与任何
+// 外部运行时相关：目录缺失只影响账密清单与号段展示。
+var errNativePanelUnavailable = errors.New("本地面板数据目录未配置或不可用")
 
-// nativePanelConfig is process-local. Requests cannot choose a Python binary,
-// script, config path, or working directory.
+// nativePanelConfig is process-local. Requests cannot choose a data directory
+// or configuration path.
 type nativePanelConfig struct {
-	Root       string
-	Python     string
-	LogCap     int
-	PollLogCap int
+	Root string
 }
 
 func defaultNativePanelConfig() nativePanelConfig {
 	root := strings.TrimSpace(os.Getenv(nativePanelRootEnv))
+	if root == "" && runtime.GOOS == "android" {
+		// Android GatewayService 把 M365_DATA_DIR 指到 files/gw/data，那才是可写目录。
+		// 可执行文件在 nativeLibraryDir，旁边根本没有 M365-自用。
+		//
+		// 这个回退只对 Android 成立。M365_DATA_DIR 在本模块另有 8 处读者（账号
+		// 缓存、凭据、管理口令、部署、诊断、设置、用量、turnstile），PC 上的操作
+		// 员为那些用途设了它，就会连带把面板根目录搬走：paths() 会在新位置建目录
+		// 并写一份默认 config.json，state() 随即报 native_panel_ready=true 且
+		// cred_total=0 —— 真正的 credentials.txt 变成看不见，注册又从 1000 号重新
+		// 开始。而且没有任何界面能把它改回来。
+		root = strings.TrimSpace(os.Getenv("M365_DATA_DIR"))
+	}
 	if root == "" {
-		// Release layout: place the existing worker tree beside the gateway exe.
 		if exe, err := os.Executable(); err == nil {
 			root = filepath.Join(filepath.Dir(exe), "M365-自用")
 		} else {
 			root = "M365-自用"
 		}
 	}
-	python := strings.TrimSpace(os.Getenv(nativePanelPythonEnv))
-	if python == "" {
-		python = "python"
-	}
-	return nativePanelConfig{Root: root, Python: python, LogCap: nativePanelLogCap, PollLogCap: nativePanelPollLogCap}
+	return nativePanelConfig{Root: root}
 }
 
-// persistedNativePanelConfig resolves the worker location from saved settings so
-// a plain restart keeps registration and OAuth working. The environment variables
-// still take precedence, which matches how every other setting behaves here.
+// persistedNativePanelConfig resolves the panel data location from saved
+// settings so a plain restart keeps credentials and configuration available.
+// The environment variable still takes precedence.
 func persistedNativePanelConfig(server *Server) nativePanelConfig {
 	config := defaultNativePanelConfig()
 	if server == nil || server.settings == nil {
@@ -81,25 +89,7 @@ func persistedNativePanelConfig(server *Server) nativePanelConfig {
 			config.Root = root
 		}
 	}
-	if strings.TrimSpace(os.Getenv(nativePanelPythonEnv)) == "" {
-		if python := strings.TrimSpace(saved.NativePanelPython); python != "" {
-			config.Python = python
-		}
-	}
 	return config
-}
-
-func (c nativePanelConfig) normalized() nativePanelConfig {
-	if c.LogCap <= 0 {
-		c.LogCap = nativePanelLogCap
-	}
-	if c.PollLogCap <= 0 || c.PollLogCap > c.LogCap {
-		c.PollLogCap = min(c.LogCap, nativePanelPollLogCap)
-	}
-	if strings.TrimSpace(c.Python) == "" {
-		c.Python = "python"
-	}
-	return c
 }
 
 type nativePanelPaths struct {
@@ -110,88 +100,232 @@ type nativePanelPaths struct {
 func (c nativePanelConfig) paths() (nativePanelPaths, error) {
 	root := strings.TrimSpace(c.Root)
 	if root == "" {
-		return nativePanelPaths{}, fmt.Errorf("%w: set %s or package M365-自用 beside the gateway executable", errNativePanelUnavailable, nativePanelRootEnv)
+		return nativePanelPaths{}, fmt.Errorf("%w: set %s or M365_DATA_DIR", errNativePanelUnavailable, nativePanelRootEnv)
 	}
 	abs, err := filepath.Abs(root)
 	if err != nil {
-		return nativePanelPaths{}, fmt.Errorf("%w: resolve worker directory", errNativePanelUnavailable)
+		return nativePanelPaths{}, fmt.Errorf("%w: resolve data directory", errNativePanelUnavailable)
 	}
-	resolved, err := filepath.EvalSymlinks(abs)
-	if err != nil {
-		return nativePanelPaths{}, fmt.Errorf("%w: worker directory is unavailable", errNativePanelUnavailable)
+	if err := os.MkdirAll(abs, 0o700); err != nil {
+		return nativePanelPaths{}, fmt.Errorf("%w: create data directory: %v", errNativePanelUnavailable, err)
+	}
+	resolved := abs
+	if link, err := filepath.EvalSymlinks(abs); err == nil && link != "" {
+		resolved = link
 	}
 	info, err := os.Stat(resolved)
 	if err != nil || !info.IsDir() {
-		return nativePanelPaths{}, fmt.Errorf("%w: worker directory is unavailable", errNativePanelUnavailable)
+		return nativePanelPaths{}, fmt.Errorf("%w: data directory is unavailable", errNativePanelUnavailable)
 	}
 	configPath := filepath.Join(resolved, "config.json")
-	configInfo, err := os.Stat(configPath)
-	if err != nil || !configInfo.Mode().IsRegular() {
-		return nativePanelPaths{}, fmt.Errorf("%w: config.json is unavailable", errNativePanelUnavailable)
+	if err := ensureNativePanelConfigFile(configPath); err != nil {
+		return nativePanelPaths{}, err
 	}
 	return nativePanelPaths{root: resolved, configPath: configPath}, nil
 }
 
-func nativePanelPathInside(root, candidate string) bool {
-	rel, err := filepath.Rel(root, candidate)
-	if err != nil || filepath.IsAbs(rel) {
-		return false
+func ensureNativePanelConfigFile(path string) error {
+	info, err := os.Stat(path)
+	if err == nil && info.Mode().IsRegular() {
+		return nil
 	}
-	return rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator))
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("%w: config.json is unavailable", errNativePanelUnavailable)
+	}
+	body, _ := json.MarshalIndent(defaultNativePanelFileConfig(), "", "  ")
+	body = append(body, '\n')
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		return fmt.Errorf("%w: write default config.json: %v", errNativePanelUnavailable, err)
+	}
+	return nil
 }
 
-func (p nativePanelPaths) script(relative string) (string, error) {
-	candidate := filepath.Clean(filepath.Join(p.root, filepath.FromSlash(relative)))
-	if !nativePanelPathInside(p.root, candidate) {
-		return "", fmt.Errorf("%w: invalid worker script", errNativePanelUnavailable)
-	}
-	resolved, err := filepath.EvalSymlinks(candidate)
-	if err != nil || !nativePanelPathInside(p.root, resolved) {
-		return "", fmt.Errorf("%w: worker script is unavailable", errNativePanelUnavailable)
-	}
-	info, err := os.Stat(resolved)
-	if err != nil || !info.Mode().IsRegular() {
-		return "", fmt.Errorf("%w: worker script is unavailable", errNativePanelUnavailable)
-	}
-	return resolved, nil
-}
-
+// nativePanelFileConfig 只保留 Go 侧真正会读的字段：网关地址用于状态展示，
+// register 段用于账密清单、邮箱编号、换 IP 与 /api/register 提交。
 type nativePanelFileConfig struct {
 	Gateway struct {
 		Host string `json:"host"`
 		Port int    `json:"port"`
 	} `json:"gateway"`
 	Register struct {
-		SiteURL        string `json:"site_url"`
-		TurnstileSite  string `json:"turnstile_sitekey"`
-		EmailDomain    string `json:"email_domain"`
-		EmailPrefix    string `json:"email_prefix"`
-		Password       string `json:"password"`
-		EmailStartNum  int    `json:"email_start_num"`
-		CredentialFile string `json:"cred_file"`
+		SiteURL string `json:"site_url"`
+		// TurnstileSite 只解码保留，本模块没有任何读者：站点 key 由注册页自己
+		// 提供，registerReady() 也不再要求它。保留字段是为了让操作员配置里已有
+		// 的这个键在 saveRegisterConfig 整体覆盖时不被丢掉，而不是它还有用。
+		TurnstileSite   string `json:"turnstile_sitekey"`
+		FlareSolverrURL string `json:"flaresolverr_url"`
+		EmailDomain     string `json:"email_domain"`
+		EmailPrefix     string `json:"email_prefix"`
+		Password        string `json:"password"`
+		PlanID          string `json:"plan_id"`
+		DomainID        string `json:"domain_id"`
+		EmailStartNum   int    `json:"email_start_num"`
+		DisplayBase     int    `json:"display_base"`
+		CredentialFile  string `json:"cred_file"`
+		PhoneSOCKS      string `json:"phone_socks"`
+		ClashAPI        string `json:"clash_api"`
+		ClashSecret     string `json:"clash_secret"`
+		ClashGroup      string `json:"clash_group"`
+		ClashProxy      string `json:"clash_proxy"`
+		ClashNodes      []struct {
+			Name     string `json:"name"`
+			ExpectIP string `json:"expect_ip"`
+		} `json:"clash_nodes"`
 	} `json:"register"`
+}
+
+func defaultNativePanelFileConfig() nativePanelFileConfig {
+	var cfg nativePanelFileConfig
+	cfg.Gateway.Host = "127.0.0.1"
+	cfg.Gateway.Port = 4141
+	cfg.Register.SiteURL = "https://office.965007.xyz"
+	cfg.Register.FlareSolverrURL = turnstile.DefaultEndpoint
+	cfg.Register.EmailDomain = "office.bo.edu.kg"
+	cfg.Register.EmailPrefix = "24s05"
+	// Never ship a credential in source. Seed from the environment when it is
+	// available, otherwise leave it blank and let the operator set it in the
+	// panel (POST /api/admin/panel/config) on first run.
+	cfg.Register.Password = strings.TrimSpace(os.Getenv("M365_REGISTER_PASSWORD"))
+	cfg.Register.PlanID = "1"
+	cfg.Register.DomainID = "1"
+	cfg.Register.EmailStartNum = 1000
+	cfg.Register.DisplayBase = 1
+	cfg.Register.CredentialFile = "credentials.txt"
+	return cfg
+}
+
+func (p nativePanelPaths) saveConfig(cfg nativePanelFileConfig) error {
+	if strings.TrimSpace(cfg.Register.CredentialFile) == "" {
+		cfg.Register.CredentialFile = "credentials.txt"
+	}
+	body, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode panel configuration: %w", err)
+	}
+	body = append(body, '\n')
+	if err := os.WriteFile(p.configPath, body, 0o600); err != nil {
+		return fmt.Errorf("write panel configuration: %w", err)
+	}
+	return nil
+}
+
+type nativePanelRegisterConfigRequest struct {
+	SiteURL         string `json:"siteUrl"`
+	EmailDomain     string `json:"emailDomain"`
+	EmailPrefix     string `json:"emailPrefix"`
+	Password        string `json:"password"`
+	EmailStartNum   int    `json:"emailStartNum"`
+	FlareSolverrURL string `json:"flaresolverrUrl"`
+	PhoneSOCKS      string `json:"phoneSocks"`
+	ClashAPI        string `json:"clashApi"`
+	ClashSecret     string `json:"clashSecret"`
+	ClashGroup      string `json:"clashGroup"`
+	ClashProxy      string `json:"clashProxy"`
+}
+
+func (m *nativePanelManager) saveRegisterConfig(req nativePanelRegisterConfigRequest) (nativePanelFileConfig, error) {
+	paths, cfg, err := m.panelData()
+	if err != nil {
+		return nativePanelFileConfig{}, err
+	}
+	if v := strings.TrimSpace(req.SiteURL); v != "" {
+		cfg.Register.SiteURL = strings.TrimRight(v, "/")
+	}
+	if v := strings.TrimSpace(req.FlareSolverrURL); v != "" {
+		cfg.Register.FlareSolverrURL = strings.TrimRight(v, "/")
+	}
+	if v := strings.TrimSpace(req.EmailDomain); v != "" {
+		cfg.Register.EmailDomain = strings.TrimPrefix(v, "@")
+	}
+	if v := strings.TrimSpace(req.EmailPrefix); v != "" {
+		cfg.Register.EmailPrefix = v
+	}
+	if v := strings.TrimSpace(req.Password); v != "" {
+		cfg.Register.Password = v
+	}
+	if req.EmailStartNum > 0 {
+		cfg.Register.EmailStartNum = req.EmailStartNum
+	}
+	if v := strings.TrimSpace(req.PhoneSOCKS); v != "" {
+		cfg.Register.PhoneSOCKS = v
+	}
+	if v := strings.TrimSpace(req.ClashAPI); v != "" {
+		cfg.Register.ClashAPI = strings.TrimRight(v, "/")
+	}
+	if v := strings.TrimSpace(req.ClashSecret); v != "" {
+		cfg.Register.ClashSecret = v
+	}
+	if v := strings.TrimSpace(req.ClashGroup); v != "" {
+		cfg.Register.ClashGroup = v
+	}
+	if v := strings.TrimSpace(req.ClashProxy); v != "" {
+		cfg.Register.ClashProxy = v
+	}
+	if err := paths.saveConfig(cfg); err != nil {
+		return nativePanelFileConfig{}, err
+	}
+	return cfg, nil
 }
 
 func (p nativePanelPaths) loadConfig() (nativePanelFileConfig, error) {
 	f, err := os.Open(p.configPath)
 	if err != nil {
-		return nativePanelFileConfig{}, fmt.Errorf("%w: cannot read worker configuration", errNativePanelUnavailable)
+		return nativePanelFileConfig{}, fmt.Errorf("%w: cannot read panel configuration", errNativePanelUnavailable)
 	}
 	defer f.Close()
 	var cfg nativePanelFileConfig
 	if err := json.NewDecoder(io.LimitReader(f, nativePanelMaxConfig)).Decode(&cfg); err != nil {
-		return nativePanelFileConfig{}, fmt.Errorf("%w: worker configuration is invalid", errNativePanelUnavailable)
+		return nativePanelFileConfig{}, fmt.Errorf("%w: panel configuration is invalid", errNativePanelUnavailable)
 	}
+	// 默认值只在内存里补齐，不回写。
+	//
+	// 早先这里是 if applyRegisterDefaults(&cfg) { p.saveConfig(cfg) }：saveConfig
+	// 用 MarshalIndent 整体覆盖 config.json，而 nativePanelFileConfig 没有兜住未
+	// 知字段的 RawMessage，于是操作员自己加的任何键都会在第一次读取时消失。触发
+	// 点还是 GET /api/admin/panel/state —— 一个名义上只读的端点，无备份、无日志。
+	// 落盘只应该发生在真正的写入路径（saveRegisterConfig）。
+	applyRegisterDefaults(&cfg)
 	return cfg, nil
 }
 
-func (cfg nativePanelFileConfig) registerReady() bool {
-	for _, value := range []string{cfg.Register.SiteURL, cfg.Register.TurnstileSite, cfg.Register.EmailDomain, cfg.Register.EmailPrefix, cfg.Register.Password} {
-		if strings.TrimSpace(value) == "" {
-			return false
+func applyRegisterDefaults(cfg *nativePanelFileConfig) bool {
+	if cfg == nil {
+		return false
+	}
+	def := defaultNativePanelFileConfig()
+	changed := false
+	fill := func(dst *string, src string) {
+		if strings.TrimSpace(*dst) == "" && src != "" {
+			*dst = src
+			changed = true
 		}
 	}
-	return true
+	fill(&cfg.Register.SiteURL, def.Register.SiteURL)
+	fill(&cfg.Register.FlareSolverrURL, def.Register.FlareSolverrURL)
+	fill(&cfg.Register.EmailDomain, def.Register.EmailDomain)
+	fill(&cfg.Register.EmailPrefix, def.Register.EmailPrefix)
+	fill(&cfg.Register.Password, def.Register.Password)
+	if strings.TrimSpace(cfg.Register.CredentialFile) == "" {
+		cfg.Register.CredentialFile = def.Register.CredentialFile
+		changed = true
+	}
+	if cfg.Register.PlanID == "" {
+		cfg.Register.PlanID = def.Register.PlanID
+		changed = true
+	}
+	if cfg.Register.DomainID == "" {
+		cfg.Register.DomainID = def.Register.DomainID
+		changed = true
+	}
+	if cfg.Gateway.Host == "" {
+		cfg.Gateway.Host = def.Gateway.Host
+		changed = true
+	}
+	if cfg.Gateway.Port == 0 {
+		cfg.Gateway.Port = def.Gateway.Port
+		changed = true
+	}
+	return changed
 }
 
 func nativePanelExpandHome(raw string) string {
@@ -253,278 +387,19 @@ func nativePanelReadCredentials(path string) (map[string]string, error) {
 	return out, nil
 }
 
-// The runner is structured rather than shell-based so that request data cannot
-// become an executable command line or an arbitrary working directory.
-type nativePanelCommand struct {
-	Program string
-	Args    []string
-	Dir     string
-	Env     []string
-}
-
-type nativePanelProcess interface {
-	PID() int
-	Wait() (int, error)
-	KillTree() error
-}
-
-type nativePanelRunner interface {
-	Start(context.Context, nativePanelCommand) (nativePanelProcess, io.ReadCloser, error)
-}
-
-type nativePanelExecRunner struct{}
-
-type nativePanelExecProcess struct{ cmd *exec.Cmd }
-
-func (nativePanelExecRunner) Start(ctx context.Context, spec nativePanelCommand) (nativePanelProcess, io.ReadCloser, error) {
-	cmd := exec.CommandContext(ctx, spec.Program, spec.Args...)
-	cmd.Dir, cmd.Env, cmd.Stdin = spec.Dir, spec.Env, nil
-	// 注册/OAuth 脚本必须静默运行：主程序已 FreeConsole，若不显式抑制，
-	// Windows 会为每个控制台子进程新建一个可见的黑框窗口。
-	hideChildWindow(cmd)
-	out, err := cmd.StdoutPipe()
-	if err != nil {
-		return nil, nil, err
-	}
-	// StdoutPipe sets cmd.Stdout to the pipe writer; sharing that writer keeps
-	// Python tracebacks in the same bounded log stream.
-	cmd.Stderr = cmd.Stdout
-	if err := cmd.Start(); err != nil {
-		_ = out.Close()
-		return nil, nil, err
-	}
-	return nativePanelExecProcess{cmd: cmd}, out, nil
-}
-
-func (p nativePanelExecProcess) PID() int {
-	if p.cmd == nil || p.cmd.Process == nil {
-		return 0
-	}
-	return p.cmd.Process.Pid
-}
-
-func (p nativePanelExecProcess) Wait() (int, error) {
-	if p.cmd == nil {
-		return -1, errors.New("worker process is unavailable")
-	}
-	err := p.cmd.Wait()
-	if p.cmd.ProcessState == nil {
-		return -1, err
-	}
-	return p.cmd.ProcessState.ExitCode(), err
-}
-
-func (p nativePanelExecProcess) KillTree() error {
-	if p.cmd == nil || p.cmd.Process == nil {
-		return nil
-	}
-	if runtime.GOOS == "windows" && p.cmd.Process.Pid > 0 {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		cmd := exec.CommandContext(ctx, "taskkill", "/PID", strconv.Itoa(p.cmd.Process.Pid), "/T", "/F")
-		cmd.Stdout, cmd.Stderr = io.Discard, io.Discard
-		// 停止任务时同样不要闪窗。
-		hideChildWindow(cmd)
-		if err := cmd.Run(); err == nil {
-			return nil
-		}
-	}
-	if err := p.cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
-		return err
-	}
-	return nil
-}
-
-type nativePanelJob struct {
-	id       uint64
-	running  bool
-	stopping bool
-	kind     string
-	started  time.Time
-	exit     *int
-	process  nativePanelProcess
-	cancel   context.CancelFunc
-	logs     []string
-	cleanup  func()
-}
-
-// Lines exists for the current 4141 page; Log preserves the older panel API.
-type nativePanelJobSnapshot struct {
-	Running bool     `json:"running"`
-	Kind    string   `json:"kind"`
-	Started int64    `json:"started"`
-	Exit    *int     `json:"exit"`
-	Log     []string `json:"log"`
-	Lines   []string `json:"lines"`
-}
-
+// nativePanelManager 现在只是数据目录的读取入口。没有子进程，也就没有任务
+// 状态、日志环形缓冲和并发控制。
 type nativePanelManager struct {
-	mu     sync.Mutex
 	config nativePanelConfig
-	runner nativePanelRunner
-	now    func() time.Time
-	nextID uint64
-	job    nativePanelJob
 }
 
-func newNativePanelManager(config nativePanelConfig, runner nativePanelRunner) *nativePanelManager {
-	config = config.normalized()
-	if runner == nil {
-		runner = nativePanelExecRunner{}
-	}
-	return &nativePanelManager{config: config, runner: runner, now: time.Now}
+func newNativePanelManager(config nativePanelConfig) *nativePanelManager {
+	return &nativePanelManager{config: config}
 }
 
-func (m *nativePanelManager) appendLogLocked(text string) {
-	text = strings.TrimRight(strings.TrimSpace(text), "\r\n")
-	if text == "" {
-		return
-	}
-	if len(text) > nativePanelMaxLogLine {
-		text = text[:nativePanelMaxLogLine] + " …[truncated]"
-	}
-	if len(m.job.logs) >= m.config.LogCap {
-		copy(m.job.logs, m.job.logs[1:])
-		m.job.logs = m.job.logs[:len(m.job.logs)-1]
-	}
-	m.job.logs = append(m.job.logs, text)
-}
-
-func (m *nativePanelManager) snapshotLocked() nativePanelJobSnapshot {
-	start := 0
-	if len(m.job.logs) > m.config.PollLogCap {
-		start = len(m.job.logs) - m.config.PollLogCap
-	}
-	logs := append([]string(nil), m.job.logs[start:]...)
-	return nativePanelJobSnapshot{Running: m.job.running, Kind: m.job.kind, Started: m.job.started.Unix(), Exit: m.job.exit, Log: logs, Lines: append([]string(nil), logs...)}
-}
-
-func (m *nativePanelManager) snapshot() nativePanelJobSnapshot {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.snapshotLocked()
-}
-
-func (m *nativePanelManager) finish(id uint64, process nativePanelProcess, out io.ReadCloser) {
-	scanner := bufio.NewScanner(out)
-	scanner.Buffer(make([]byte, 4096), nativePanelMaxLine)
-	for scanner.Scan() {
-		m.mu.Lock()
-		if m.job.id == id {
-			m.appendLogLocked(scanner.Text())
-		}
-		m.mu.Unlock()
-	}
-	_ = out.Close()
-	exit, waitErr := process.Wait()
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.job.id != id {
-		return
-	}
-	if m.job.cleanup != nil {
-		m.job.cleanup()
-		m.job.cleanup = nil
-	}
-	m.job.running, m.job.stopping, m.job.process, m.job.cancel = false, false, nil, nil
-	m.job.exit = &exit
-	if waitErr != nil {
-		m.appendLogLocked(fmt.Sprintf("任务结束 exit=%d: %s", exit, waitErr.Error()))
-	} else {
-		m.appendLogLocked(fmt.Sprintf("任务结束 exit=%d", exit))
-	}
-}
-
-func (m *nativePanelManager) start(kind, script string, args []string, prepare func() (func(), error)) (nativePanelJobSnapshot, error) {
-	paths, err := m.config.paths()
-	if err != nil {
-		return nativePanelJobSnapshot{}, err
-	}
-	worker, err := paths.script(script)
-	if err != nil {
-		return nativePanelJobSnapshot{}, err
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	m.mu.Lock()
-	if m.job.running {
-		m.mu.Unlock()
-		cancel()
-		return nativePanelJobSnapshot{}, errNativePanelBusy
-	}
-	m.nextID++
-	id := m.nextID
-	m.job = nativePanelJob{id: id, running: true, kind: kind, started: m.now(), cancel: cancel, logs: make([]string, 0, min(16, m.config.LogCap))}
-	if prepare != nil {
-		cleanup, prepErr := prepare()
-		if prepErr != nil {
-			exit := -1
-			m.job.running, m.job.exit, m.job.cancel = false, &exit, nil
-			m.mu.Unlock()
-			cancel()
-			return nativePanelJobSnapshot{}, prepErr
-		}
-		m.job.cleanup = cleanup
-	}
-	m.appendLogLocked("启动 " + kind)
-	m.mu.Unlock()
-
-	env := append([]string(nil), os.Environ()...)
-	env = append(env, "PYTHONUTF8=1", "PYTHONIOENCODING=utf-8", "M365_CONFIG="+paths.configPath)
-	process, out, err := m.runner.Start(ctx, nativePanelCommand{Program: m.config.Python, Args: append([]string{worker}, args...), Dir: paths.root, Env: env})
-	if err != nil {
-		cancel()
-		m.mu.Lock()
-		if m.job.id == id {
-			if m.job.cleanup != nil {
-				m.job.cleanup()
-			}
-			exit := -1
-			m.job.running, m.job.exit, m.job.cleanup, m.job.cancel = false, &exit, nil, nil
-			m.appendLogLocked("启动失败")
-		}
-		m.mu.Unlock()
-		return nativePanelJobSnapshot{}, fmt.Errorf("启动本地 Python 工作者失败: %w", err)
-	}
-	m.mu.Lock()
-	stopped := m.job.id != id || m.job.stopping || !m.job.running
-	if !stopped {
-		m.job.process = process
-	}
-	m.mu.Unlock()
-	if stopped {
-		cancel()
-		_ = process.KillTree()
-		// finish owns cleanup and the transition to idle even when stop won the
-		// race with process startup.
-		go m.finish(id, process, out)
-		return nativePanelJobSnapshot{}, context.Canceled
-	}
-	go m.finish(id, process, out)
-	return m.snapshot(), nil
-}
-
-func (m *nativePanelManager) stop() nativePanelJobSnapshot {
-	m.mu.Lock()
-	if !m.job.running {
-		snapshot := m.snapshotLocked()
-		m.mu.Unlock()
-		return snapshot
-	}
-	m.job.stopping = true
-	cancel, process := m.job.cancel, m.job.process
-	m.appendLogLocked("已请求停止任务")
-	snapshot := m.snapshotLocked()
-	m.mu.Unlock()
-	if cancel != nil {
-		cancel()
-	}
-	if process != nil {
-		_ = process.KillTree()
-	}
-	return snapshot
-}
-
-func (m *nativePanelManager) workerConfig() (nativePanelPaths, nativePanelFileConfig, error) {
+// panelData 解析数据目录并读出 config.json。名字不再叫 workerConfig：这里已经
+// 没有工作者，只有本机数据。
+func (m *nativePanelManager) panelData() (nativePanelPaths, nativePanelFileConfig, error) {
 	paths, err := m.config.paths()
 	if err != nil {
 		return nativePanelPaths{}, nativePanelFileConfig{}, err
@@ -534,116 +409,6 @@ func (m *nativePanelManager) workerConfig() (nativePanelPaths, nativePanelFileCo
 		return nativePanelPaths{}, nativePanelFileConfig{}, err
 	}
 	return paths, cfg, nil
-}
-
-func nativePanelPositive(value, fallback int) int {
-	if value == 0 {
-		return fallback
-	}
-	return value
-}
-
-func nativePanelClamp(value, lower, upper int) int {
-	if value < lower {
-		return lower
-	}
-	if value > upper {
-		return upper
-	}
-	return value
-}
-
-type nativePanelRegisterRequest struct {
-	Mode        string `json:"mode"`
-	Count       int    `json:"count"`
-	Concurrent  bool   `json:"concurrent"`
-	Concurrency int    `json:"concurrency"`
-	Timeout     int    `json:"timeout"`
-	Start       int    `json:"start"`
-	Resume      bool   `json:"resume"`
-	Reset       bool   `json:"reset"`
-	// StartNum/EndNum 是邮箱编号闭区间，优先于 Start/Count。省略时沿用旧的
-	// Start/Count 语义，因此既有调用方的行为完全不变。见 native_panel_range.go。
-	StartNum int `json:"startNum"`
-	EndNum   int `json:"endNum"`
-}
-
-func (m *nativePanelManager) startRegister(request nativePanelRegisterRequest) (nativePanelJobSnapshot, error) {
-	_, cfg, err := m.workerConfig()
-	if err != nil {
-		return nativePanelJobSnapshot{}, err
-	}
-	if !cfg.registerReady() {
-		return nativePanelJobSnapshot{}, errors.New("注册配置不完整，未启动任务")
-	}
-	mode := strings.ToLower(strings.TrimSpace(request.Mode))
-	if mode == "" {
-		mode = "phone"
-	}
-	count := nativePanelPositive(request.Count, 1)
-	start := nativePanelPositive(request.Start, 1)
-	if count < 1 || count > 1000 || start < 1 || start > 1_000_000 {
-		return nativePanelJobSnapshot{}, errors.New("注册数量或起始序号无效")
-	}
-	// 邮箱编号区间优先。absoluteStart 取决于脚本对 --start 的语义：phone/clash
-	// 收绝对邮箱编号，proxy 两个脚本收 1-based 序号（见 native_panel_range.go）。
-	if r, provided, rangeErr := resolveEmailRange(request.StartNum, request.EndNum, request.Count); provided {
-		if rangeErr != nil {
-			return nativePanelJobSnapshot{}, rangeErr
-		}
-		absolute := mode == "phone" || mode == "clash"
-		resolvedStart, resolvedCount, convErr := registerArgsForRange(r, cfg.Register.EmailStartNum, absolute)
-		if convErr != nil {
-			return nativePanelJobSnapshot{}, convErr
-		}
-		start, count = resolvedStart, resolvedCount
-		// 区间已经决定了数量，覆盖掉可能同时传来的 count，避免两个真相源打架。
-		request.Count = resolvedCount
-	}
-	if request.Concurrent && mode == "proxy" {
-		concurrency := nativePanelClamp(nativePanelPositive(request.Concurrency, 3), 1, maxPanelConcurrency)
-		timeout := nativePanelClamp(nativePanelPositive(request.Timeout, 180), 30, 600)
-		args := []string{"--concurrency", strconv.Itoa(concurrency), "--limit", strconv.Itoa(count), "--timeout", strconv.Itoa(timeout)}
-		if request.Resume {
-			args = append(args, "--resume")
-		}
-		if request.Reset {
-			args = append(args, "--reset")
-		}
-		if start > 1 {
-			args = append(args, "--start", strconv.Itoa(start))
-		}
-		return m.start(fmt.Sprintf("register:proxy×%d", concurrency), "Register/register_accounts_concurrent.py", args, nil)
-	}
-
-	var script string
-	switch mode {
-	case "phone":
-		script = "Register/register_m365_phone.py"
-	case "clash":
-		script = "Register/register_m365_clash.py"
-	case "proxy":
-		script = "Register/register_accounts.py"
-	default:
-		return nativePanelJobSnapshot{}, errors.New("未知注册模式")
-	}
-	args := []string{"--limit", strconv.Itoa(count)}
-	if start > 1 {
-		if request.StartNum > 0 {
-			// 已由 registerArgsForRange 换算成脚本各自的语义，直接透传。
-			args = append(args, "--start", strconv.Itoa(start))
-		} else if mode == "phone" || mode == "clash" {
-			// 旧语义：start 是 1-based 序号，phone/clash 的 --start 要绝对编号。
-			base := cfg.Register.EmailStartNum
-			if base <= 0 {
-				base = 1000
-			}
-			args = append(args, "--start", strconv.Itoa(base+start-1))
-		} else {
-			args = append(args, "--start", strconv.Itoa(start))
-		}
-	}
-	return m.start("register:"+mode, script, args, nil)
 }
 
 type nativePanelOAuthRequest struct {
@@ -658,143 +423,18 @@ func nativePanelValidEmail(email string) bool {
 	return at > 0 && at < len(email)-1 && strings.Count(email, "@") == 1
 }
 
-func (m *nativePanelManager) startOAuth(request nativePanelOAuthRequest) (nativePanelJobSnapshot, error) {
-	email := strings.TrimSpace(request.Email)
-	if !nativePanelValidEmail(email) {
-		return nativePanelJobSnapshot{}, errors.New("email 格式无效")
-	}
-	paths, cfg, err := m.workerConfig()
-	if err != nil {
-		return nativePanelJobSnapshot{}, err
-	}
-	credentialPath, err := paths.credentialPath(cfg)
-	if err != nil {
-		return nativePanelJobSnapshot{}, err
-	}
-	credentials, err := nativePanelReadCredentials(credentialPath)
-	if err != nil {
-		return nativePanelJobSnapshot{}, err
-	}
-	password := credentials[email]
-	if strings.TrimSpace(password) == "" {
-		return nativePanelJobSnapshot{}, errors.New("账密文件中找不到该邮箱")
-	}
-	probe := filepath.Join(paths.root, "oauth", "_pw_probe.txt")
-	prepare := func() (func(), error) {
-		f, err := os.OpenFile(probe, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
-		if err != nil {
-			return nil, err
-		}
-		_, writeErr := f.WriteString(password)
-		closeErr := f.Close()
-		if writeErr != nil || closeErr != nil {
-			_ = os.Remove(probe)
-			if writeErr != nil {
-				return nil, writeErr
-			}
-			return nil, closeErr
-		}
-		return func() { _ = os.Remove(probe) }, nil
-	}
-	return m.start("oauth:"+email, "oauth/oauth_auto.py", []string{email}, prepare)
-}
-
-type nativePanelOAuthBatchRequest struct {
-	Concurrent  *bool `json:"concurrent"`
-	Serial      *bool `json:"serial"`
-	Concurrency int   `json:"concurrency"`
-	Timeout     int   `json:"timeout"`
-	Start       int   `json:"start"`
-	Limit       int   `json:"limit"`
-	Resume      bool  `json:"resume"`
-	Reset       bool  `json:"reset"`
-	// StartNum/EndNum 是邮箱编号闭区间。脚本的 --start 只认排序后清单里的
-	// 1-based 下标，所以这里先把编号区间解析成下标 + 数量再传下去。
-	StartNum int `json:"startNum"`
-	EndNum   int `json:"endNum"`
-}
-
-func (r nativePanelOAuthBatchRequest) serial() bool {
-	if r.Serial != nil {
-		return *r.Serial
-	}
-	return r.Concurrent != nil && !*r.Concurrent
-}
-
-// maxPanelConcurrency 是注册 / OAuth 批量任务的并发上限。
-//
-// 之前是 16。放开到 64 的前提是两个真实缺陷已经修掉：
-//   1. 批量脚本原来所有账号共用一个 browser context（共用 cookie），并发登录
-//      不同账号会互相顶掉会话，表现为 login_timeout；现在每账号一个独立
-//      context。
-//   2. 网关每次 /api/auth/start 都整表覆盖 PKCE state，前 N-1 个账号回调必然
-//      拿到 invalid state（http400）；现在并发模式下多个 state 并存。
-//
-// 实测：修复前 3 并发 1 成功 2 失败（204s）；修复后 5 并发 5 成功（12.6s）。
-// 真正的天花板是本机内存与微软风控，不是这个常量，所以上限给到 64 而不是更高。
-const maxPanelConcurrency = 64
-
-func (m *nativePanelManager) startOAuthBatch(request nativePanelOAuthBatchRequest) (nativePanelJobSnapshot, error) {
-	paths, cfg, err := m.workerConfig()
-	if err != nil {
-		return nativePanelJobSnapshot{}, err
-	}
-	start := nativePanelPositive(request.Start, 1)
-	if start < 1 || start > 1_000_000 || request.Limit < 0 || request.Limit > 1000 {
-		return nativePanelJobSnapshot{}, errors.New("批量 OAuth 参数无效")
-	}
-	// 邮箱编号区间优先。oauth_batch*.py 的 --start 是排序后账密清单的 1-based
-	// 下标，所以必须先把编号区间解析成「下标 + 数量」，否则 482 会被当成下标
-	// 而启动 24s055526 —— 这正是用户报告的现象。
-	if r, provided, rangeErr := resolveEmailRange(request.StartNum, request.EndNum, request.Limit); provided {
-		if rangeErr != nil {
-			return nativePanelJobSnapshot{}, rangeErr
-		}
-		credentialPath, pathErr := paths.credentialPath(cfg)
-		if pathErr != nil {
-			return nativePanelJobSnapshot{}, pathErr
-		}
-		credentials, readErr := nativePanelReadCredentials(credentialPath)
-		if readErr != nil {
-			return nativePanelJobSnapshot{}, readErr
-		}
-		matched, position, selErr := selectEmailsInRange(credentials, strings.TrimSpace(cfg.Register.EmailPrefix), r)
-		if selErr != nil {
-			return nativePanelJobSnapshot{}, selErr
-		}
-		start = position
-		request.Limit = len(matched)
-	}
-	if request.serial() {
-		args := []string{}
-		if start > 1 {
-			args = append(args, "--start", strconv.Itoa(start))
-		}
-		if request.Limit > 0 {
-			args = append(args, "--limit", strconv.Itoa(request.Limit))
-		}
-		return m.start("oauth:batch", "oauth/oauth_batch.py", args, nil)
-	}
-	concurrency := nativePanelClamp(nativePanelPositive(request.Concurrency, 3), 1, maxPanelConcurrency)
-	timeout := nativePanelClamp(nativePanelPositive(request.Timeout, 300), 60, 900)
-	args := []string{"--concurrency", strconv.Itoa(concurrency), "--timeout", strconv.Itoa(timeout)}
-	if request.Resume {
-		args = append(args, "--resume")
-	}
-	if request.Reset {
-		args = append(args, "--reset")
-	}
-	if start > 1 {
-		args = append(args, "--start", strconv.Itoa(start))
-	}
-	if request.Limit > 0 {
-		args = append(args, "--limit", strconv.Itoa(request.Limit))
-	}
-	return m.start(fmt.Sprintf("oauth:batch×%d", concurrency), "oauth/oauth_batch_concurrent.py", args, nil)
-}
-
 func (m *nativePanelManager) state(server *Server) map[string]any {
-	state := map[string]any{"native_panel": true, "native_panel_ready": false, "cred_total": 0, "register_ready": false, "job": m.snapshot()}
+	// register_supported / batch_oauth_supported 告诉前端：Go 内置实现可用。
+	// 注册由内置 FlareSolverr 取 token；批量 OAuth 走 ROPC / 设备码 / PKCE。
+	state := map[string]any{
+		"native_panel":             true,
+		"native_panel_ready":       false,
+		"cred_total":               0,
+		"register_supported":       true,
+		"batch_oauth_supported":    true,
+		"register_needs_turnstile": true,
+		"oauth_modes":              []string{"ropc", "device_code", "pkce"},
+	}
 	if server != nil && server.tokens != nil {
 		accounts := server.tokens.List()
 		emails := make([]string, 0, len(accounts))
@@ -806,20 +446,21 @@ func (m *nativePanelManager) state(server *Server) map[string]any {
 		sort.Strings(emails)
 		state["gw_online"], state["gw_emails"] = len(accounts), emails
 	}
-	paths, cfg, err := m.workerConfig()
+	paths, cfg, err := m.panelData()
 	if err != nil {
 		state["native_panel_error"] = err.Error()
 		return state
 	}
-	state["native_panel_ready"], state["register_ready"] = true, cfg.registerReady()
+	state["native_panel_ready"] = true
+	state["register_ready"] = cfg.registerReady()
 	credentialPath, err := paths.credentialPath(cfg)
 	if err == nil {
 		state["cred_file"] = credentialPath
 		if credentials, readErr := nativePanelReadCredentials(credentialPath); readErr == nil {
 			state["cred_total"] = len(credentials)
-			// 号段边界供前端预填与校验区间，避免用户凭空猜一个不存在的号段。
-			if min, max, ok := credentialEmailNumBounds(credentials, strings.TrimSpace(cfg.Register.EmailPrefix)); ok {
-				state["cred_num_min"], state["cred_num_max"] = min, max
+			// 号段边界让界面能显示账密清单实际覆盖的编号范围。
+			if low, high, ok := credentialEmailNumBounds(credentials, strings.TrimSpace(cfg.Register.EmailPrefix)); ok {
+				state["cred_num_min"], state["cred_num_max"] = low, high
 			}
 		}
 	}
@@ -831,11 +472,25 @@ func (m *nativePanelManager) state(server *Server) map[string]any {
 		port = 4141
 	}
 	state["gw_url"] = "http://" + host + ":" + strconv.Itoa(port)
-	// 邮箱构成规则：<prefix><num>@<domain>。前端据此把编号区间显示成真实邮箱，
-	// 让用户在启动前就能看清 5026-5100 到底代表哪些账号。
+	// 邮箱构成规则：<prefix><num>@<domain>，供界面把编号显示成真实邮箱。
 	state["email_prefix"] = strings.TrimSpace(cfg.Register.EmailPrefix)
 	state["email_domain"] = strings.TrimSpace(cfg.Register.EmailDomain)
 	state["email_start_num"] = cfg.Register.EmailStartNum
+	state["site_url"] = strings.TrimSpace(cfg.Register.SiteURL)
+	state["flaresolverr_url"] = strings.TrimSpace(cfg.Register.FlareSolverrURL)
+	state["register_password"] = cfg.Register.Password
+	// phone / clash 五个字段 saveRegisterConfig 收得下也存得住，却一直没在 state
+	// 里回传，配置往返是单向的：界面无法显示已存的值，也无法看出缺了什么。而
+	// regMode 里明明就有「Clash 节点」这个选项 —— 选了它注册，rotateClash 会以
+	// 「clash api, group and node are required」失败，第二个账号起全部报「上一号
+	// 已写入本地，但换 IP 失败」，而用户在界面上找不到任何能填这些值的地方。
+	state["phone_socks"] = strings.TrimSpace(cfg.Register.PhoneSOCKS)
+	state["clash_api"] = strings.TrimSpace(cfg.Register.ClashAPI)
+	state["clash_group"] = strings.TrimSpace(cfg.Register.ClashGroup)
+	state["clash_proxy"] = strings.TrimSpace(cfg.Register.ClashProxy)
+	// 密钥只回传是否已设置，不回传原值。
+	state["clash_secret_set"] = strings.TrimSpace(cfg.Register.ClashSecret) != ""
+	state["clash_node_total"] = len(cfg.Register.ClashNodes)
 	return state
 }
 
@@ -863,6 +518,12 @@ func nativePanelDecodeJSON(w http.ResponseWriter, r *http.Request, target any, a
 	return true
 }
 
+// nativePanelRemovedRoutes 保留旧路由但明确答复 501。逐条给出原因和可行替代，
+// 避免用户在界面上按下按钮后只看到一句无法定位的失败。
+var nativePanelRemovedRoutes = map[string]string{
+	"/api/admin/panel/job/poll": "任务日志已移除：网关不再拉起本地 Python 工作者进程。注册与批量 OAuth 改为同步返回结果。",
+}
+
 type nativePanelController struct {
 	server  *Server
 	manager *nativePanelManager
@@ -870,7 +531,7 @@ type nativePanelController struct {
 
 func newNativePanelController(server *Server, manager *nativePanelManager) *nativePanelController {
 	if manager == nil {
-		manager = newNativePanelManager(defaultNativePanelConfig(), nil)
+		manager = newNativePanelManager(defaultNativePanelConfig())
 	}
 	return &nativePanelController{server: server, manager: manager}
 }
@@ -888,6 +549,10 @@ func (c *nativePanelController) ServeHTTP(w http.ResponseWriter, r *http.Request
 		writeOpenAIError(w, http.StatusForbidden, "csrf_error", "cross-site panel request denied")
 		return
 	}
+	if reason, removed := nativePanelRemovedRoutes[r.URL.Path]; removed {
+		writeOpenAIError(w, http.StatusNotImplemented, "feature_removed", reason)
+		return
+	}
 
 	switch r.URL.Path {
 	case "/api/admin/panel/state":
@@ -897,31 +562,75 @@ func (c *nativePanelController) ServeHTTP(w http.ResponseWriter, r *http.Request
 			return
 		}
 		jsonOut(w, c.manager.state(c.server))
-	case "/api/admin/panel/job/poll":
-		if r.Method != http.MethodGet {
-			w.Header().Set("Allow", http.MethodGet)
-			writeOpenAIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "GET required")
+	case "/api/admin/panel/config":
+		if r.Method != http.MethodPost && r.Method != http.MethodPut {
+			w.Header().Set("Allow", "POST, PUT")
+			writeOpenAIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "POST or PUT required")
 			return
 		}
-		jsonOut(w, c.manager.snapshot())
+		var body nativePanelRegisterConfigRequest
+		if !nativePanelDecodeJSON(w, r, &body, false) {
+			return
+		}
+		cfg, err := c.manager.saveRegisterConfig(body)
+		if err != nil {
+			writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+			return
+		}
+		jsonOut(w, map[string]any{
+			"ok":             true,
+			"register_ready": cfg.registerReady(),
+			"siteUrl":        cfg.Register.SiteURL,
+			"emailDomain":    cfg.Register.EmailDomain,
+			"emailPrefix":    cfg.Register.EmailPrefix,
+			"emailStartNum":  cfg.Register.EmailStartNum,
+		})
 	case "/api/admin/panel/job/stop":
 		if r.Method != http.MethodPost {
 			w.Header().Set("Allow", http.MethodPost)
 			writeOpenAIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "POST required")
 			return
 		}
-		jsonOut(w, map[string]any{"ok": true, "job": c.manager.stop()})
+		// 如实回报。turnstile.Cancel 在协作目录不存在时（桌面端默认如此）什么也
+		// 做不了，早先这里无条件回 stopped:true，等于告诉用户任务停了而它还在跑。
+		stopped := turnstile.Cancel()
+		out := map[string]any{"ok": true, "stopped": stopped}
+		if !stopped {
+			out["detail"] = "当前没有可取消的 WebView 求解任务；注册请求需要等本轮结束或断开客户端连接"
+		}
+		jsonOut(w, out)
 	case "/api/admin/panel/register":
 		if r.Method != http.MethodPost {
 			w.Header().Set("Allow", http.MethodPost)
 			writeOpenAIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "POST required")
 			return
 		}
-		var body nativePanelRegisterRequest
-		if nativePanelDecodeJSON(w, r, &body, false) {
-			snapshot, err := c.manager.startRegister(body)
-			c.writeStart(w, snapshot, err)
+		var body panelRegisterRequest
+		if !nativePanelDecodeJSON(w, r, &body, false) {
+			return
 		}
+		report, err := c.server.runRegister(r.Context(), c.manager, body)
+		if err != nil {
+			writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+			return
+		}
+		jsonOut(w, report)
+	case "/api/admin/panel/oauth/batch":
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", http.MethodPost)
+			writeOpenAIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "POST required")
+			return
+		}
+		var body panelOAuthBatchRequest
+		if !nativePanelDecodeJSON(w, r, &body, true) {
+			return
+		}
+		report, err := c.server.runOAuthBatch(r.Context(), c.manager, body)
+		if err != nil {
+			writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+			return
+		}
+		jsonOut(w, report)
 	case "/api/admin/panel/oauth":
 		if r.Method != http.MethodPost {
 			w.Header().Set("Allow", http.MethodPost)
@@ -929,40 +638,35 @@ func (c *nativePanelController) ServeHTTP(w http.ResponseWriter, r *http.Request
 			return
 		}
 		var body nativePanelOAuthRequest
-		if nativePanelDecodeJSON(w, r, &body, false) {
-			snapshot, err := c.manager.startOAuth(body)
-			c.writeStart(w, snapshot, err)
-		}
-	case "/api/admin/panel/oauth/batch":
-		if r.Method != http.MethodPost {
-			w.Header().Set("Allow", http.MethodPost)
-			writeOpenAIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "POST required")
+		if !nativePanelDecodeJSON(w, r, &body, false) {
 			return
 		}
-		var body nativePanelOAuthBatchRequest
-		if nativePanelDecodeJSON(w, r, &body, true) {
-			snapshot, err := c.manager.startOAuthBatch(body)
-			c.writeStart(w, snapshot, err)
+		email := strings.TrimSpace(body.Email)
+		if !nativePanelValidEmail(email) {
+			writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "email 格式无效")
+			return
 		}
+		state, authorizationURL, attempt, redirectURI, err := c.server.beginPKCEAuthorization("login")
+		if err != nil {
+			writeOpenAIError(w, http.StatusInternalServerError, "pkce_error", err.Error())
+			return
+		}
+		jsonOut(w, map[string]any{
+			"ok":               true,
+			"status":           "manual_step_required",
+			"mode":             "pkce",
+			"complete":         false,
+			"email":            email,
+			"state":            state,
+			"attempt":          attempt,
+			"authorizationUrl": authorizationURL,
+			"redirectUri":      redirectURI,
+			"logoutUrl":        auth.LogoutURL(),
+			"nextStep":         "请在打开的 Microsoft 页面完成登录,回调完成后账号会自动加入网关。",
+		})
 	default:
 		writeOpenAIError(w, http.StatusNotFound, "not_found", "unknown native panel route")
 	}
-}
-
-func (c *nativePanelController) writeStart(w http.ResponseWriter, snapshot nativePanelJobSnapshot, err error) {
-	if err == nil {
-		jsonOut(w, map[string]any{"ok": true, "kind": snapshot.Kind, "job": snapshot})
-		return
-	}
-	if errors.Is(err, errNativePanelBusy) {
-		writeOpenAIError(w, http.StatusConflict, "job_conflict", err.Error())
-		return
-	}
-	if errors.Is(err, errNativePanelUnavailable) {
-		writeOpenAIError(w, http.StatusServiceUnavailable, "panel_unavailable", err.Error())
-		return
-	}
-	writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 }
 
 var nativePanelManagers sync.Map // map[*Server]*nativePanelManager
@@ -971,7 +675,7 @@ func nativePanelManagerFor(server *Server) *nativePanelManager {
 	if current, ok := nativePanelManagers.Load(server); ok {
 		return current.(*nativePanelManager)
 	}
-	created := newNativePanelManager(persistedNativePanelConfig(server), nil)
+	created := newNativePanelManager(persistedNativePanelConfig(server))
 	actual, _ := nativePanelManagers.LoadOrStore(server, created)
 	return actual.(*nativePanelManager)
 }
@@ -982,17 +686,21 @@ func (s *Server) NativePanelHandler(w http.ResponseWriter, r *http.Request) {
 	newNativePanelController(s, nativePanelManagerFor(s)).ServeHTTP(w, r)
 }
 
-// RegisterNativePanelRoutes is the single server.go integration point. Replace
-// the six panelProxy registrations with this one call on the fresh ServeMux.
+// RegisterNativePanelRoutes is the single server.go integration point.
 func (s *Server) RegisterNativePanelRoutes(mux *http.ServeMux) {
-	for _, path := range []string{
-		"/api/admin/panel/register",
+	paths := []string{
+		"/api/admin/panel/state",
 		"/api/admin/panel/oauth",
 		"/api/admin/panel/oauth/batch",
-		"/api/admin/panel/state",
+		"/api/admin/panel/register",
+		"/api/admin/panel/config",
 		"/api/admin/panel/job/stop",
-		"/api/admin/panel/job/poll",
-	} {
+	}
+	for path := range nativePanelRemovedRoutes {
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+	for _, path := range paths {
 		mux.HandleFunc(path, s.NativePanelHandler)
 	}
 }
