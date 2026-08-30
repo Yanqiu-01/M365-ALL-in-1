@@ -107,6 +107,31 @@ func validateDetectedToolCalls(calls []detectedToolCall, tools []map[string]any,
 	return valid, rejected
 }
 
+// enforceParallelToolCalls 落实客户端的 parallel_tool_calls。
+//
+// codex_catalog.go 向客户端宣告 supports_parallel_tool_calls=true，那就必须同样
+// 尊重显式的 false —— 否则 Codex 关掉并行后仍会收到多个调用，而它一次只执行一
+// 个，剩下的调用不会有结果返回，下一轮历史里就出现「有调用无结果」，被
+// validateToolConversation 判为非法。宣告了一项能力却不实现它的关闭语义，比不
+// 宣告更糟。
+//
+// parallel 为 nil（未指定）或 true 时按原样放行；false 时只保留第一个调用，其余
+// 作为被拒项报告出去，让调用方能记日志。保留第一个而非整批拒绝，是因为「降为
+// 单调用」才是该字段的语义，被丢弃的调用模型下一轮可以重新发起。
+func enforceParallelToolCalls(calls []detectedToolCall, parallel *bool) ([]detectedToolCall, []rejectedToolCall) {
+	if parallel == nil || *parallel || len(calls) <= 1 {
+		return calls, nil
+	}
+	dropped := make([]rejectedToolCall, 0, len(calls)-1)
+	for _, call := range calls[1:] {
+		dropped = append(dropped, rejectedToolCall{
+			Name:   call.Name,
+			Reason: "parallel_tool_calls=false allows one call per turn",
+		})
+	}
+	return calls[:1], dropped
+}
+
 func requestedToolChoiceName(choice any) string {
 	m, ok := choice.(map[string]any)
 	if !ok {

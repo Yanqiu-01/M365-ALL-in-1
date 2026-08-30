@@ -24,19 +24,33 @@ type responsesRequest struct {
 	NewConversation    bool             `json:"new_conversation,omitempty"`
 	// Codex sends these on every /v1/responses call. They were previously dropped
 	// by the decoder without a trace; capture them so the request is represented
-	// faithfully. ParallelToolCalls has no destination on oaiReq yet, so it stays
-	// readable here only -- forwarding it needs a matching field on oaiReq
-	// (server.go). Store and PromptCacheKey are accepted, not acted on: the
-	// gateway keeps no response store and no prompt cache.
+	// faithfully. ParallelToolCalls now has a matching field on oaiReq (server.go)
+	// and is forwarded in the conversion below, so /v1/responses and
+	// /v1/chat/completions agree on it. Store and PromptCacheKey are accepted,
+	// not acted on: the gateway keeps no response store and no prompt cache.
 	ParallelToolCalls *bool  `json:"parallel_tool_calls,omitempty"`
 	Store             *bool  `json:"store,omitempty"`
 	PromptCacheKey    string `json:"prompt_cache_key,omitempty"`
 }
 
-const customExecWorkspaceInstruction = `You are operating through the caller's local OpenCode execution bridge. Never use, request, or mention Microsoft 365/Copilot native tools. The only permitted execution tool is the caller-provided custom exec tool. The executor already starts in the caller-selected project workspace. Use relative paths only; never guess, cd to, or write under /root, /workspace, /tmp, or any other absolute project path. Inspect pwd and ls before changes. Do not create files outside the current working directory. Never claim a file was created, modified, or verified until custom exec returns a successful result. After every execution, use custom exec to verify the result.`
+// customExecWorkspaceInstruction 只约束 custom exec 这一条通道：执行器已经落在
+// 调用方选定的工程目录里，所以一律用相对路径。
+//
+// 这里刻意不再点名 /workspace。runtime_prompt.go 注入的环境说明会告诉 Android
+// 宿主 /workspace 就是可写的工程根，两条提示词进同一个 prompt，一条说那是根目
+// 录、另一条说不准写，模型只能二选一。改为「不要凭猜测使用任何绝对路径」，既
+// 保住原意，又不跟宿主实际情况打架。
+const customExecWorkspaceInstruction = `You are operating through the caller's local OpenCode execution bridge. Never use, request, or mention Microsoft 365/Copilot native tools. The only permitted execution tool is the caller-provided custom exec tool. The executor already starts in the caller-selected project workspace. Use relative paths only; do not guess at, cd to, or write under an absolute path you have not verified with the exec tool. Inspect the working directory and list it before making changes. Do not create files outside the current working directory. Never claim a file was created, modified, or verified until custom exec returns a successful result. After every execution, use custom exec to verify the result.`
 
 func (r responsesRequest) openAI() (oaiReq, error) {
-	o := oaiReq{Model: r.Model, AccountID: r.AccountID, Stream: r.Stream, ToolChoice: r.ToolChoice, User: r.User}
+	o := oaiReq{
+		Model:             r.Model,
+		AccountID:         r.AccountID,
+		Stream:            r.Stream,
+		ToolChoice:        r.ToolChoice,
+		User:              r.User,
+		ParallelToolCalls: r.ParallelToolCalls,
+	}
 	if instructions := strings.TrimSpace(r.Instructions); instructions != "" {
 		o.Messages = append(o.Messages, oaiMsg{Role: "system", Content: instructions})
 	}
@@ -51,6 +65,24 @@ func (r responsesRequest) openAI() (oaiReq, error) {
 		}
 		o.Messages = append(o.Messages, oaiMsg{Role: "user", Content: v})
 	case []any:
+		// Codex 并行调用工具时，input 里会出现连续多个 function_call。OpenAI 的
+		// chat 表示法要求同一轮的并行调用共享一条 assistant 消息：若每个调用各
+		// 占一条，validateToolConversation 会在第二条 assistant 上报「tool results
+		// missing before assistant message at index N」，整个请求以 HTTP 400 被拒
+		// （CC Switch 侧看到的就是这个 400）。
+		//
+		// openCall 指向当前还能继续累加调用的那条 assistant 消息，遇到工具结果或
+		// 普通消息就归零 —— 串行调用因此仍然各自成条，不会被错误地并进同一轮，
+		// 那样会反过来让先前的调用配不上结果。
+		openCall := -1
+		appendToolCall := func(call map[string]any) {
+			if openCall >= 0 {
+				o.Messages[openCall].ToolCalls = append(o.Messages[openCall].ToolCalls, call)
+				return
+			}
+			o.Messages = append(o.Messages, oaiMsg{Role: "assistant", ToolCalls: []map[string]any{call}})
+			openCall = len(o.Messages) - 1
+		}
 		for _, raw := range v {
 			m, ok := raw.(map[string]any)
 			if !ok {
@@ -69,9 +101,11 @@ func (r responsesRequest) openAI() (oaiReq, error) {
 			case "function_call_output":
 				id, _ := m["call_id"].(string)
 				o.Messages = append(o.Messages, oaiMsg{Role: "tool", ToolCallID: id, Content: m["output"]})
+				openCall = -1
 			case "custom_tool_call_output":
 				id, _ := m["call_id"].(string)
 				o.Messages = append(o.Messages, oaiMsg{Role: "tool", ToolCallID: id, Content: m["output"]})
+				openCall = -1
 			case "function_call":
 				id, _ := m["call_id"].(string)
 				name, _ := m["name"].(string)
@@ -82,12 +116,12 @@ func (r responsesRequest) openAI() (oaiReq, error) {
 						args = x
 					}
 				}
-				o.Messages = append(o.Messages, oaiMsg{Role: "assistant", ToolCalls: []map[string]any{{"id": id, "type": "function", "function": map[string]any{"name": name, "arguments": mustJSON(args)}}}})
+				appendToolCall(map[string]any{"id": id, "type": "function", "function": map[string]any{"name": name, "arguments": mustJSON(args)}})
 			case "custom_tool_call":
 				id, _ := m["call_id"].(string)
 				name, _ := m["name"].(string)
 				input, _ := m["input"].(string)
-				o.Messages = append(o.Messages, oaiMsg{Role: "assistant", ToolCalls: []map[string]any{{"id": id, "type": "custom", "function": map[string]any{"name": name, "arguments": mustJSON(map[string]any{"input": input})}}}})
+				appendToolCall(map[string]any{"id": id, "type": "custom", "function": map[string]any{"name": name, "arguments": mustJSON(map[string]any{"input": input})}})
 			default:
 				role, _ := m["role"].(string)
 				if role == "" {
@@ -101,6 +135,7 @@ func (r responsesRequest) openAI() (oaiReq, error) {
 					content = []any{m}
 				}
 				o.Messages = append(o.Messages, oaiMsg{Role: role, Content: content})
+				openCall = -1
 			}
 		}
 	default:
