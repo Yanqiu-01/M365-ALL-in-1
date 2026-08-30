@@ -555,6 +555,15 @@ code,kbd,pre,samp,.mono{font-family:var(--font-mono)}
 .card-note{font-size:var(--fs-caption);color:var(--muted)}
 .card-head-actions{display:flex;align-items:center;gap:var(--sp-2);flex-wrap:wrap}
 .card-body{padding:var(--sp-5)}
+/* 可折叠卡片：标题行整体可点。折叠只隐藏 .card-body，卡片本身、内部按钮与
+   既有 JS 函数一律保留，展开后行为与折叠前完全一致。 */
+.card.is-collapsible>.card-head{cursor:pointer;user-select:none}
+.card.is-collapsed>.card-body{display:none}
+.card-collapse-btn{background:none;border:0;padding:var(--sp-1);color:var(--muted);
+  cursor:pointer;display:inline-flex;align-items:center;border-radius:var(--r-sm)}
+.card-collapse-btn:hover{color:var(--text)}
+.card-collapse-btn .ico{transition:transform .15s ease}
+.card.is-collapsed .card-collapse-btn .ico{transform:rotate(-90deg)}
 /* 卡内小节眉标 */
 .card-section-label{font-size:var(--fs-sm);font-weight:var(--fw-semi);color:var(--muted);
   margin-bottom:var(--sp-3);text-transform:uppercase;letter-spacing:var(--tr-wide)}
@@ -2048,6 +2057,21 @@ if (response.output_text) {
               </div>
             </div>
             <p class="field-err" id="rsErr" hidden></p>
+            <!-- 批量回调：一行一个 账号----密码。分隔符与 native_panel.go 的
+                 凭据清单解析（strings.Cut(line,"----")）以及 credential_sync.go
+                 的 cred_file 格式一致，因此同一份 credentials.txt 可直接粘贴或导入。 -->
+            <div class="form-group" style="margin-top:var(--sp-3)">
+              <label class="form-label" for="rsBulk">批量列表（每行 <code>账号----密码</code>）</label>
+              <textarea class="form-input" id="rsBulk" rows="4" spellcheck="false" autocomplete="off"
+                        placeholder="user1@contoso.onmicrosoft.com----Password1&#10;user2@contoso.onmicrosoft.com----Password2"
+                        oninput="renderBulkSummary()"></textarea>
+              <div class="btn-row" style="margin-top:var(--sp-2)">
+                <button type="button" class="btn" id="rsBulkPick" onclick="$('rsBulkFile').click()">导入 .txt</button>
+                <button type="button" class="btn" onclick="clearBulk()">清空列表</button>
+                <span class="form-hint" id="rsBulkSummary" aria-live="polite"></span>
+              </div>
+              <input type="file" id="rsBulkFile" accept=".txt,text/plain" hidden onchange="importBulkFile(event)">
+            </div>
             <div class="btn-row">
               <button type="button" class="btn primary" id="rsSubmit" onclick="submitRunScripts()"><svg class="ico ico-sm" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M4 14a1 1 0 0 1-.78-1.63l9.9-10.2a.5.5 0 0 1 .86.46l-1.92 6.02A1 1 0 0 0 13 10h7a1 1 0 0 1 .78 1.63l-9.9 10.2a.5.5 0 0 1-.86-.46l1.92-6.02A1 1 0 0 0 11 14z"/></svg> 运行脚本并回调</button>
               <button type="button" class="btn" id="credSyncBtn" onclick="syncCredentials()">从账密清单补齐</button>
@@ -2058,8 +2082,16 @@ if (response.output_text) {
             <div id="rsProgress" style="margin-top:var(--sp-3)" aria-live="polite"></div>
           </div>
         </div>
-        <div class="card">
-          <div class="card-head"><h3 class="card-title">添加账号</h3></div>
+        <!-- 「添加账号」默认收起（按用户要求）。手动 OAuth、回调地址提交与
+             重置授权状态全部保留，点标题行即可展开。 -->
+        <div class="card is-collapsible is-collapsed" id="addAccountCard">
+          <div class="card-head" onclick="toggleCardCollapse('addAccountCard')">
+            <h3 class="card-title">添加账号</h3>
+            <button type="button" class="card-collapse-btn" id="addAccountToggle"
+                    aria-controls="addAccountCard" aria-expanded="false" aria-label="展开添加账号">
+              <svg class="ico ico-sm" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="m6 9 6 6 6-6"/></svg>
+            </button>
+          </div>
           <div class="card-body">
             <div class="onb-steps" style="margin-bottom:var(--sp-4)">
               <div class="onb-step" style="cursor:default">
@@ -3422,6 +3454,133 @@ function openRunScripts(){
 }
 function closeRunScripts(){$('runScriptsCard').hidden=true;}
 
+/* 卡片折叠：只切 class 与 aria-expanded，不动卡片内容与既有处理函数。
+   「添加账号」在 HTML 里就带 is-collapsed，因此首屏即为收起状态，无需
+   等 JS 执行，也不会出现展开后被脚本收回的闪动。 */
+function toggleCardCollapse(id){
+  const card=$(id);if(!card)return;
+  const collapsed=card.classList.toggle('is-collapsed');
+  const btn=card.querySelector('.card-collapse-btn');
+  if(btn){
+    btn.setAttribute('aria-expanded',collapsed?'false':'true');
+    btn.setAttribute('aria-label',(collapsed?'展开':'收起')+(card.querySelector('.card-title')?.textContent||''));
+  }
+}
+function expandCard(id){
+  const card=$(id);if(!card||!card.classList.contains('is-collapsed'))return;
+  toggleCardCollapse(id);
+}
+
+/* ===== 批量账密回调 =====================================================
+   每行 账号----密码，与 native_panel.go 的 strings.Cut(line,"----") 及
+   credential_sync.go 的 cred_file 同格式。列表逐项复用既有单账号端点
+   POST /api/accounts/web/run-scripts，不新增协议、不改后端契约。 */
+const CRED_SEP='----';
+function parseBulkCreds(text){
+  const rows=[],bad=[],dup=[],seen=new Set();
+  String(text||'').split(/\r?\n/).forEach((raw,i)=>{
+    const line=raw.trim();
+    if(!line||line.startsWith('#'))return;
+    const at=line.indexOf(CRED_SEP);
+    if(at<=0){bad.push({line:i+1,text:line});return;}
+    const email=line.slice(0,at).trim();
+    const password=line.slice(at+CRED_SEP.length);
+    if(!email||!password){bad.push({line:i+1,text:line});return;}
+    const key=email.toLowerCase();
+    if(seen.has(key)){dup.push(email);return;}
+    seen.add(key);rows.push({email,password});
+  });
+  return {rows,bad,dup};
+}
+function renderBulkSummary(){
+  const el=$('rsBulkSummary');if(!el)return;
+  const box=$('rsBulk');
+  const {rows,bad,dup}=parseBulkCreds(box?box.value:'');
+  if(!rows.length&&!bad.length&&!dup.length){el.textContent='';return;}
+  const parts=['有效 '+rows.length+' 个'];
+  if(dup.length)parts.push('重复 '+dup.length+' 个已跳过');
+  if(bad.length)parts.push('格式错误 '+bad.length+' 行（第 '+bad.slice(0,5).map(b=>b.line).join('/')+' 行）');
+  el.textContent=parts.join('；');
+}
+function clearBulk(){const b=$('rsBulk');if(b)b.value='';renderBulkSummary();}
+function importBulkFile(e){
+  const file=e.target.files&&e.target.files[0];
+  e.target.value='';                       // 允许连续导入同一个文件
+  if(!file)return;
+  if(file.size>2*1024*1024){showNotice('清单过大（上限 2MB）','error');return;}
+  const reader=new FileReader();
+  reader.onerror=()=>showNotice('读取文件失败','error');
+  reader.onload=()=>{
+    const box=$('rsBulk');if(!box)return;
+    const text=String(reader.result||'');
+    box.value=box.value.trim()?box.value.replace(/\s*$/,'')+'\n'+text:text;
+    renderBulkSummary();
+    const {rows}=parseBulkCreds(box.value);
+    showNotice('已导入清单，解析出 '+rows.length+' 个账号','success');
+  };
+  reader.readAsText(file,'utf-8');
+}
+
+/* 列表模式：逐个调用既有单账号端点，串行执行以免同时打多个上游授权。
+   每行结果独立展示（完成 / 需人工一步 / 失败），不因单行失败中断整批。 */
+async function submitBulkRunScripts(rows){
+  const btn=$('rsSubmit');
+  btn.disabled=true;btn.classList.add('is-busy');
+  const out=$('rsProgress');
+  out.textContent='';
+  const head=document.createElement('p');
+  head.className='form-hint';
+  head.textContent='批量回调进行中：共 '+rows.length+' 个账号，逐个执行…';
+  out.appendChild(head);
+  const list=document.createElement('div');
+  list.className='steps-list';
+  out.appendChild(list);
+  let ok=0,manual=0,failed=0;
+  for(let i=0;i<rows.length;i++){
+    const row=rows[i];
+    const item=document.createElement('div');
+    item.className='steps-item';
+    const title=document.createElement('div');
+    const b=document.createElement('b');
+    b.textContent='['+(i+1)+'/'+rows.length+'] '+row.email;
+    title.appendChild(b);
+    const tag=document.createElement('span');
+    tag.className='badge';
+    tag.style.marginLeft='6px';
+    tag.textContent='执行中';
+    title.appendChild(tag);
+    const detail=document.createElement('p');
+    detail.style.cssText='font-size:var(--fs-caption);color:var(--muted);margin-top:2px;word-break:break-word';
+    title.appendChild(detail);
+    item.appendChild(title);
+    list.appendChild(item);
+    try{
+      const r=await fetch('/api/accounts/web/run-scripts',{
+        method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({email:row.email,password:row.password,saveCredential:true})});
+      const txt=await r.text();
+      let d;try{d=txt?JSON.parse(txt):{};}catch(_){d={};}
+      if(r.ok&&(d.complete===true||d.status==='completed')){
+        ok++;item.classList.add('done');tag.className='badge ok';tag.textContent='完成';
+        detail.textContent=d.hasRefreshToken===false?'已入池，但上游未返回刷新令牌':'已入池，刷新令牌已保存';
+      }else if(r.status===202){
+        manual++;tag.className='badge';tag.textContent='需人工一步';
+        detail.textContent=(d.reason||'上游要求交互式登录')+(d.authorizationUrl?('　授权地址：'+d.authorizationUrl):'');
+      }else{
+        failed++;tag.className='badge err';tag.textContent='失败';
+        detail.textContent=(d&&d.error&&d.error.message)||txt||('HTTP '+r.status);
+      }
+    }catch(err){
+      failed++;tag.className='badge err';tag.textContent='失败';
+      detail.textContent=err.message||String(err);
+    }
+  }
+  head.textContent='批量回调结束：完成 '+ok+'，需人工 '+manual+'，失败 '+failed+'（共 '+rows.length+'）。';
+  btn.disabled=false;btn.classList.remove('is-busy');
+  showNotice('批量回调：完成 '+ok+'，需人工 '+manual+'，失败 '+failed,failed?'error':'success');
+  loadAccounts();loadCredentials();loadStats();
+}
+
 /* 分步进度用 DOM 构造：detail 来自服务端文本，一律 textContent。 */
 function renderRunSteps(steps){
   const box=document.createElement('div');
@@ -3482,6 +3641,20 @@ async function syncCredentials(){
 }
 
 async function submitRunScripts(){
+  // 批量列表优先：填了列表就整批执行，单账号输入框保持原语义不变。
+  const bulkBox=$('rsBulk');
+  if(bulkBox&&bulkBox.value.trim()){
+    const {rows,bad,dup}=parseBulkCreds(bulkBox.value);
+    setFieldErr('rsErr','');
+    if(!rows.length){
+      setFieldErr('rsErr','列表里没有有效的「账号'+CRED_SEP+'密码」行');
+      return;
+    }
+    if(bad.length||dup.length){
+      setFieldErr('rsErr','已跳过 '+bad.length+' 行格式错误、'+dup.length+' 个重复账号，仍将回调 '+rows.length+' 个账号');
+    }
+    return submitBulkRunScripts(rows);
+  }
   const email=$('rsEmail').value.trim();
   const password=$('rsPassword').value;
   setFieldErr('rsErr','');
