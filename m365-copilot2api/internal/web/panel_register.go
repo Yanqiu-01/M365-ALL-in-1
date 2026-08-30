@@ -33,11 +33,14 @@ type panelRegisterRequest struct {
 }
 
 type panelRegisterAccount struct {
-	Num    int    `json:"num"`
-	Email  string `json:"email"`
-	Status string `json:"status"` // success | failed | skipped
-	IP     string `json:"ip,omitempty"`
-	Detail string `json:"detail,omitempty"`
+	Num              int    `json:"num"`
+	Email            string `json:"email"`
+	Status           string `json:"status"` // success | failed | skipped
+	IP               string `json:"ip,omitempty"`
+	Detail           string `json:"detail,omitempty"`
+	OAuthStatus      string `json:"oauthStatus,omitempty"`
+	OAuthDetail      string `json:"oauthDetail,omitempty"`
+	AuthorizationURL string `json:"authorizationUrl,omitempty"`
 }
 
 type panelRegisterReport struct {
@@ -156,26 +159,16 @@ func (s *Server) runRegister(ctx context.Context, manager *nativePanelManager, r
 			lastIP = ip
 		}
 		probeCancel()
-		token, tokenErr := resolveTurnstileToken(ctx, cfg, request.TurnstileToken, proxyURL, display, username)
-		if tokenErr != nil {
-			item.Status, item.Detail = "failed", tokenErr.Error()
+		outcome, outcomeErr := completeRegister(ctx, cfg, request.TurnstileToken, proxyURL, display, username)
+		if outcomeErr != nil {
+			item.Status, item.Detail = "failed", outcomeErr.Error()
 			report.Failed++
 			report.Accounts = append(report.Accounts, item)
 			continue
 		}
-		if strings.HasPrefix(token, "ERROR:") {
-			item.Status, item.Detail = "failed", strings.TrimPrefix(token, "ERROR:")
-			report.Failed++
-			report.Accounts = append(report.Accounts, item)
-			continue
-		}
-		if !strings.HasPrefix(token, "SUBMITTED:") {
-			if err := postRegister(ctx, cfg, username, display, token, proxyURL); err != nil {
-				item.Status, item.Detail = "failed", err.Error()
-				report.Failed++
-				report.Accounts = append(report.Accounts, item)
-				continue
-			}
+		if upn := strings.TrimSpace(outcome.UPN); nativePanelValidEmail(upn) {
+			email = upn
+			item.Email = email
 		}
 		if err := nativePanelAppendCredential(credentialPath, email, cfg.Register.Password); err != nil {
 			item.Status, item.Detail = "failed", "注册成功但写入账密失败: "+err.Error()
@@ -185,6 +178,18 @@ func (s *Server) runRegister(ctx context.Context, manager *nativePanelManager, r
 		}
 		existing[email] = cfg.Register.Password
 		item.Status, item.Detail = "success", "registered"
+		if s != nil && s.tokens != nil {
+			if oauth, _ := s.authorizeAccountWithPassword(email, cfg.Register.Password); oauth.Status != "" {
+				item.OAuthStatus = oauth.Status
+				item.OAuthDetail = oauth.Detail
+				item.AuthorizationURL = oauth.AuthorizationURL
+				if oauth.Status == "imported" {
+					item.Detail = "registered+oauth"
+				} else if oauth.AuthorizationURL != "" {
+					item.Detail = "registered, oauth pending"
+				}
+			}
+		}
 		report.Success++
 		report.Accounts = append(report.Accounts, item)
 
@@ -227,30 +232,51 @@ func probeRegisterIP(ctx context.Context, proxyURL string) (string, error) {
 	return result.IP, nil
 }
 
-func resolveTurnstileToken(ctx context.Context, cfg nativePanelFileConfig, supplied, proxyURL, display, username string) (string, error) {
-	if token := strings.TrimSpace(supplied); token != "" {
-		return token, nil
+type registerOutcome struct {
+	UPN string
+}
+
+func completeRegister(ctx context.Context, cfg nativePanelFileConfig, supplied, proxyURL, display, username string) (registerOutcome, error) {
+	token := strings.TrimSpace(supplied)
+	if token == "" {
+		endpoint := strings.TrimSpace(cfg.Register.FlareSolverrURL)
+		if endpoint == "" {
+			endpoint = turnstile.DefaultEndpoint
+		}
+		page := strings.TrimRight(strings.TrimSpace(cfg.Register.SiteURL), "/")
+		if page == "" {
+			return registerOutcome{}, errors.New("缺少注册页地址")
+		}
+		solved, err := turnstile.Solve(ctx, turnstile.Request{
+			Endpoint:    endpoint,
+			PageURL:     page,
+			Proxy:       proxyURL,
+			DisplayName: display,
+			Username:    username,
+			Password:    cfg.Register.Password,
+		})
+		if err != nil {
+			return registerOutcome{}, err
+		}
+		token = strings.TrimSpace(solved.Token)
 	}
-	endpoint := strings.TrimSpace(cfg.Register.FlareSolverrURL)
-	if endpoint == "" {
-		endpoint = turnstile.DefaultEndpoint
+	if strings.HasPrefix(token, "ERROR:") {
+		return registerOutcome{}, errors.New(strings.TrimPrefix(token, "ERROR:"))
 	}
-	page := strings.TrimRight(strings.TrimSpace(cfg.Register.SiteURL), "/")
-	if page == "" {
-		return "", errors.New("缺少注册页地址，无法请求 FlareSolverr")
+	if strings.HasPrefix(token, "SUBMITTED:") {
+		upn := strings.TrimPrefix(token, "SUBMITTED:")
+		if upn == "registered-ok" {
+			upn = ""
+		}
+		return registerOutcome{UPN: upn}, nil
 	}
-	solved, err := turnstile.Solve(ctx, turnstile.Request{
-		Endpoint:    endpoint,
-		PageURL:     page,
-		Proxy:       proxyURL,
-		DisplayName: display,
-		Username:    username,
-		Password:    cfg.Register.Password,
-	})
-	if err != nil {
-		return "", err
+	if token == "" {
+		return registerOutcome{}, errors.New("注册页已打开，但没有完成填表和提交")
 	}
-	return solved.Token, nil
+	if err := postRegister(ctx, cfg, username, display, token, proxyURL); err != nil {
+		return registerOutcome{}, err
+	}
+	return registerOutcome{}, nil
 }
 
 func firstClashNode(cfg nativePanelFileConfig) string {

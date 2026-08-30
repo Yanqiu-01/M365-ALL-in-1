@@ -152,7 +152,10 @@ func TestSmaliPatchesOnOriginalAPK(t *testing.T) {
 		t.Fatal("ready marker missing")
 	}
 	if !strings.Contains(flare, "setTranslationX") {
-		t.Fatal("solver WebView should stay off-screen")
+		t.Fatal("solver WebView should stay off-screen until a job starts")
+	}
+	if !strings.Contains(flare, "showOverlay") || !strings.Contains(flare, "hideOverlay") {
+		t.Fatal("solver must bring the register page on-screen while filling")
 	}
 	if strings.Contains(flare, "setAlpha") {
 		t.Fatal("alpha=0 can stop WebView from painting Turnstile")

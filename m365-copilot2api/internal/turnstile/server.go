@@ -220,6 +220,6 @@ func timeoutError(jobTaken, pageLoaded bool) error {
 	case !pageLoaded:
 		return errors.New("后台验证没有打开注册站。请检查网络后重试")
 	default:
-		return errors.New("后台验证已打开注册页，但 Turnstile 没有给出 token")
+		return errors.New("注册页已打开，但没有完成填表和提交")
 	}
 }

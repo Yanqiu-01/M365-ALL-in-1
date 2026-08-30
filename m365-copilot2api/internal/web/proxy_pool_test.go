@@ -281,7 +281,7 @@ func TestProxyPoolDashboardHasImportAndSelectedDelete(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := string(page)
-	for _, marker := range []string{"proxyHunterImport()", "openRegisterPage()", "proxyDeleteSelected()", "proxySelectAll"} {
+	for _, marker := range []string{"proxyHunterImport()", "panelStartRegister()", "proxyDeleteSelected()", "proxySelectAll"} {
 		if !strings.Contains(text, marker) {
 			t.Fatalf("dashboard missing %q", marker)
 		}

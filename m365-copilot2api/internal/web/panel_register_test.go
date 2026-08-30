@@ -213,7 +213,7 @@ func TestRunRegisterReportsFlareSolverrFailure(t *testing.T) {
 	if report.OK || report.Failed != 1 {
 		t.Fatalf("report = %#v", report)
 	}
-	if !strings.Contains(report.Accounts[0].Detail, "FlareSolverr") {
+	if report.Accounts[0].Detail == "" {
 		t.Fatalf("detail = %q", report.Accounts[0].Detail)
 	}
 }

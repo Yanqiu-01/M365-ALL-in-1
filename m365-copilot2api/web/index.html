@@ -2119,7 +2119,7 @@ if (response.output_text) {
 <div class="card">
   <div class="card-head"><h3 class="card-title">注册新账号</h3><span class="card-note" id="panelRegState"></span></div>
   <div class="card-body">
-    <p class="form-hint" style="margin-bottom:var(--sp-2)">点开始注册后，后台在同一页填账密、过 Cloudflare、再点提交。不会打开注册页，也不用粘贴 token。返回键只取消当前验证。</p>
+    <p class="form-hint" style="margin-bottom:var(--sp-2)">点开始注册后，注册页会盖到前台：自动填账密、点验证、点提交。成功后写入本地账密并去微软拿 OAuth。返回键只取消当前这次。</p>
     <div class="form-row">
       <div class="form-group"><label class="form-label" for="regSiteUrl">注册站点</label>
         <input class="form-input" id="regSiteUrl" type="url" placeholder="https://office.965007.xyz"></div>
@@ -6236,11 +6236,14 @@ async function saveRegisterConfig(){
 async function panelStartRegister(){
   const body={mode:$('regMode')?.value||'proxy',count:parseInt($('regCount')?.value)||1,startNum:parseInt($('regStartNum')?.value)||0};
   const out=$('regResult');
-  if(out)out.textContent='正在同一页填账密、过验证并提交，请保持 App 在前台…';
+  if(out)out.textContent='正在前台填账密并提交，请保持 App 在前台…';
   try{
-    const d=await api('/api/admin/panel/register',{method:'POST',body:JSON.stringify(body),timeoutMs:120000});
+    const d=await api('/api/admin/panel/register',{method:'POST',body:JSON.stringify(body),timeoutMs:180000});
+    const acc=d.accounts&&d.accounts[0];
     const ok=d.success||0, fail=d.failed||0;
-    if(out)out.textContent='成功 '+ok+' · 失败 '+fail+(d.accounts&&d.accounts[0]&&d.accounts[0].detail?(' · '+d.accounts[0].detail):'');
+    let extra=acc&&acc.detail?(' · '+acc.detail):'';
+    if(acc&&acc.oauthStatus) extra+=' · OAuth '+acc.oauthStatus+(acc.oauthDetail?(' '+acc.oauthDetail):'');
+    if(out)out.textContent='成功 '+ok+' · 失败 '+fail+extra;
     loadAccounts();loadPanelState();
   }catch(e){if(out)out.textContent=e.message||String(e);showNotice(e.message,'error');}
 }

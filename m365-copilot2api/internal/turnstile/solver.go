@@ -148,7 +148,7 @@ func Solve(ctx context.Context, request Request) (Solution, error) {
 	}
 	solution.Token = extractToken(reply.Solution.Response)
 	if solution.Token == "" {
-		return solution, errors.New("FlareSolverr 已打开注册页，但页面里没有 Turnstile token")
+		return solution, errors.New("注册页已打开，但没有完成填表和提交")
 	}
 	return solution, nil
 }

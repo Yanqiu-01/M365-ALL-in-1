@@ -78,7 +78,7 @@ func TestSolveReportsMissingToken(t *testing.T) {
 	}))
 	defer server.Close()
 	_, err := Solve(context.Background(), Request{Endpoint: server.URL, PageURL: "https://office.example.test/"})
-	if err == nil || !strings.Contains(err.Error(), "没有 Turnstile token") {
+	if err == nil || !strings.Contains(err.Error(), "没有完成填表和提交") {
 		t.Fatalf("err = %v", err)
 	}
 }
