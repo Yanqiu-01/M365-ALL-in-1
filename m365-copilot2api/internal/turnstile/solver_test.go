@@ -83,6 +83,13 @@ func TestSolveReportsMissingToken(t *testing.T) {
 	}
 }
 
+func TestExtractTokenSubmittedMarker(t *testing.T) {
+	html := `<input name="cf-turnstile-response" value="SUBMITTED:24s055026@office.example.test">`
+	if got := extractToken(html); got != "SUBMITTED:24s055026@office.example.test" {
+		t.Fatalf("got %q", got)
+	}
+}
+
 func TestSolveReportsEndpointDown(t *testing.T) {
 	_, err := Solve(context.Background(), Request{
 		Endpoint: "http://127.0.0.1:1/v1",

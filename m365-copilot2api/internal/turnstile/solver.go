@@ -137,7 +137,7 @@ func Solve(ctx context.Context, request Request) (Solution, error) {
 		if message == "" {
 			message = fmt.Sprintf("HTTP %d", resp.StatusCode)
 		}
-		return Solution{}, fmt.Errorf("FlareSolverr 求解失败: %s", message)
+		return Solution{}, errors.New(message)
 	}
 
 	solution := Solution{UserAgent: strings.TrimSpace(reply.Solution.UserAgent)}
@@ -154,12 +154,23 @@ func Solve(ctx context.Context, request Request) (Solution, error) {
 }
 
 func extractToken(document string) string {
+	raw := strings.TrimSpace(document)
+	if strings.HasPrefix(raw, "SUBMITTED:") || strings.HasPrefix(raw, "ERROR:") {
+		return raw
+	}
 	for _, pattern := range tokenPatterns {
 		if match := pattern.FindStringSubmatch(document); len(match) == 2 {
 			if token := strings.TrimSpace(match[1]); token != "" {
 				return token
 			}
 		}
+	}
+	if i := strings.Index(document, "SUBMITTED:"); i >= 0 {
+		end := strings.IndexAny(document[i:], "\"'<> \n")
+		if end < 0 {
+			return strings.TrimSpace(document[i:])
+		}
+		return strings.TrimSpace(document[i : i+end])
 	}
 	return ""
 }

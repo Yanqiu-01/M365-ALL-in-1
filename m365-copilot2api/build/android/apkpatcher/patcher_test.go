@@ -158,13 +158,13 @@ func TestSmaliPatchesOnOriginalAPK(t *testing.T) {
 		t.Fatal("solver must keep a paintable register WebView while filling")
 	}
 	if strings.Contains(flare, "bringToFront") {
-		t.Fatal("register WebView must stay behind the dashboard")
+		t.Fatal("register WebView must not cover the whole dashboard")
 	}
-	if !strings.Contains(flare, "setTranslationZ") {
-		t.Fatal("register WebView must sit under the dashboard")
+	if !strings.Contains(flare, "const/16 v4, 0x168") {
+		t.Fatal("register window must be a corner pane, not full screen")
 	}
-	if !strings.Contains(flare, "setClickable") {
-		t.Fatal("background register WebView must not steal dashboard touches")
+	if !strings.Contains(flare, "tapAt") {
+		t.Fatal("solver must dispatch a real tap to Turnstile")
 	}
 	if strings.Contains(flare, "setAlpha") {
 		t.Fatal("alpha=0 can stop WebView from painting Turnstile")
@@ -176,7 +176,7 @@ func TestSmaliPatchesOnOriginalAPK(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, needle := range []string{"displayName", "turnstileBox", "__m365Filled", "__m365Clicked", "submitBtn", "SUBMITTED:"} {
+	for _, needle := range []string{"displayName", "turnstileBox", "__m365Filled", "__m365Clicked", "submitBtn", "SUBMITTED:", "M365Flare.tap"} {
 		if !strings.Contains(clientJS, needle) {
 			t.Fatalf("solver script missing %s", needle)
 		}

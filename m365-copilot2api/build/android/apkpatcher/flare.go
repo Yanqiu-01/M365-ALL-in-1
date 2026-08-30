@@ -69,6 +69,7 @@ func patchFlareSolver(work string) error {
 		"FlareSolver$Loop.smali":   flareLoopSmali,
 		"FlareSolver$Load.smali":   flareLoadSmali,
 		"FlareSolver$Hide.smali":   flareHideSmali,
+		"FlareSolver$Tap.smali":    flareTapSmali,
 	}
 	for name, body := range files {
 		if err := writeFile(filepath.Join(packageDir, name), body); err != nil {
@@ -120,7 +121,7 @@ func patchFlareSolver(work string) error {
 	return nil
 }
 
-const flareWatchJS = `(function(){if(window.__m365Flare)return;window.__m365Flare=1;function val(fn){try{return String(fn()||'')}catch(e){return ''}}function set(id,v){var el=document.getElementById(id);if(!el||!v||el.value===v)return;el.value=v;el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));}function layout(){if(window.__m365Laid)return;window.__m365Laid=1;var info=document.querySelector('.info-column');if(info)info.style.display='none';var shell=document.querySelector('.page-shell');if(shell){shell.style.display='block';shell.style.gridTemplateColumns='1fr';shell.style.width='100%';}}function fill(){if(window.__m365Filled)return;if(!document.getElementById('username'))return;set('displayName',val(M365Flare.displayName));set('username',val(M365Flare.username));set('password',val(M365Flare.password));layout();window.__m365Filled=1;}function verified(){var el=document.querySelector('input[name=cf-turnstile-response]');var v=el&&el.value;return !!(v&&v.length>20)}function clickBox(){if(verified())return;if(window.__m365Clicked&&Date.now()-window.__m365Clicked<8000)return;var box=document.getElementById('turnstileBox');if(!box||box.classList.contains('hidden'))return;var t=box.querySelector('iframe')||box;var r=t.getBoundingClientRect();if(r.width<50||r.height<50)return;t.scrollIntoView({block:'center'});var x=r.left+28,y=r.top+r.height/2;var n=document.elementFromPoint(x,y)||t;try{n.dispatchEvent(new MouseEvent('click',{bubbles:true,cancelable:true,clientX:x,clientY:y,view:window}));}catch(e){}try{n.click()}catch(e){}window.__m365Clicked=Date.now();}function submit(){if(window.__m365Submitted||!window.__m365Filled||!verified())return;var btn=document.getElementById('submitBtn');if(!btn||btn.disabled)return;var form=document.getElementById('registerForm');try{if(form&&form.requestSubmit)form.requestSubmit();else btn.click()}catch(e){try{btn.click()}catch(x){}}window.__m365Submitted=1;}function finish(){var msg=document.getElementById('message');var text=(msg&&(msg.textContent||'').trim())||'';var cls=(msg&&msg.className)||'';var btn=document.getElementById('submitBtn');if(/success/.test(cls)||/注册成功/.test(text)||(btn&&btn.classList.contains('login-ready'))){var m=text.match(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+/);M365Flare.done('SUBMITTED:'+(m?m[0]:'registered-ok'));return true}if(/error/.test(cls)&&text.length>2&&!/正在创建/.test(text)){M365Flare.done('ERROR:'+text.slice(0,160));return true}return false}fill();setInterval(function(){fill();clickBox();submit();finish()},800)})();`
+const flareWatchJS = `(function(){if(window.__m365Flare)return;window.__m365Flare=1;function val(fn){try{return String(fn()||'')}catch(e){return ''}}function set(id,v){var el=document.getElementById(id);if(!el||!v||el.value===v)return;el.value=v;el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));}function layout(){if(window.__m365Laid)return;window.__m365Laid=1;var info=document.querySelector('.info-column');if(info)info.style.display='none';var shell=document.querySelector('.page-shell');if(shell){shell.style.display='block';shell.style.gridTemplateColumns='1fr';shell.style.width='100%';}}function ready(){var u=document.getElementById('username');var b=document.getElementById('submitBtn');return !!(u&&b&&!b.disabled)}function fill(){if(window.__m365Filled||!ready())return;var plan=document.getElementById('planId');if(plan&&plan.options&&plan.options.length&&!plan.value){plan.selectedIndex=0;plan.dispatchEvent(new Event('change',{bubbles:true}));}set('displayName',val(M365Flare.displayName));set('username',val(M365Flare.username));set('password',val(M365Flare.password));layout();window.__m365Filled=1;}function verified(){var el=document.querySelector('input[name=cf-turnstile-response]');var v=el&&el.value;return !!(v&&v.length>20)}function clickBox(){if(verified())return;if(window.__m365Clicked&&Date.now()-window.__m365Clicked<6000)return;var box=document.getElementById('turnstileBox');if(!box||box.classList.contains('hidden'))return;var t=box.querySelector('iframe')||box;var r=t.getBoundingClientRect();if(r.width<50||r.height<50)return;t.scrollIntoView({block:'center'});var x=r.left+28,y=r.top+r.height/2;try{if(M365Flare.tap)M365Flare.tap(x,y)}catch(e){}window.__m365Clicked=Date.now();}function submit(){if(window.__m365Submitted||!window.__m365Filled||!verified())return;var btn=document.getElementById('submitBtn');if(!btn||btn.disabled)return;var form=document.getElementById('registerForm');try{if(form&&form.requestSubmit)form.requestSubmit();else btn.click()}catch(e){try{btn.click()}catch(x){}}window.__m365Submitted=1;}function finish(){var msg=document.getElementById('message');var text=(msg&&(msg.textContent||'').trim())||'';var cls=(msg&&msg.className)||'';var btn=document.getElementById('submitBtn');if(/success/.test(cls)||/注册成功/.test(text)||(btn&&btn.classList.contains('login-ready'))){var m=text.match(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+/);M365Flare.done('SUBMITTED:'+(m?m[0]:'registered-ok'));return true}if(/error/.test(cls)&&text.length>2&&!/正在创建/.test(text)){M365Flare.done('ERROR:'+text.slice(0,160));return true}return false}fill();setInterval(function(){fill();clickBox();submit();finish()},800)})();`
 
 const flareSolverSmali = `.class public Lcom/m365/gateway/FlareSolver;
 .super Ljava/lang/Object;
@@ -164,16 +165,6 @@ const flareSolverSmali = `.class public Lcom/m365/gateway/FlareSolver;
 
     invoke-virtual {v0, v2}, Landroid/widget/FrameLayout;->setBackgroundColor(I)V
 
-    const/4 v2, 0x0
-
-    invoke-virtual {v0, v2}, Landroid/widget/FrameLayout;->setClickable(Z)V
-
-    invoke-virtual {v0, v2}, Landroid/widget/FrameLayout;->setFocusable(Z)V
-
-    const v2, 0xc2c80000    # -100.0f
-
-    invoke-virtual {v0, v2}, Landroid/widget/FrameLayout;->setTranslationZ(F)V
-
     const v2, 0x461c4000    # 10000.0f
 
     invoke-virtual {v0, v2}, Landroid/widget/FrameLayout;->setTranslationX(F)V
@@ -214,10 +205,6 @@ const flareSolverSmali = `.class public Lcom/m365/gateway/FlareSolver;
 
     invoke-virtual {v2, v5, v6}, Landroid/webkit/WebView;->setLayerType(ILandroid/graphics/Paint;)V
 
-    invoke-virtual {v2, v6}, Landroid/webkit/WebView;->setClickable(Z)V
-
-    invoke-virtual {v2, v6}, Landroid/webkit/WebView;->setFocusable(Z)V
-
     invoke-static {}, Landroid/webkit/CookieManager;->getInstance()Landroid/webkit/CookieManager;
 
     move-result-object v3
@@ -252,7 +239,21 @@ const flareSolverSmali = `.class public Lcom/m365/gateway/FlareSolver;
 
     new-instance v2, Landroid/widget/FrameLayout$LayoutParams;
 
+    const/16 v4, 0x168
+
+    const/16 v5, 0x280
+
     invoke-direct {v2, v4, v5}, Landroid/widget/FrameLayout$LayoutParams;-><init>(II)V
+
+    const/16 v4, 0x55
+
+    iput v4, v2, Landroid/widget/FrameLayout$LayoutParams;->gravity:I
+
+    const/16 v4, 0x10
+
+    iput v4, v2, Landroid/view/ViewGroup$MarginLayoutParams;->rightMargin:I
+
+    iput v4, v2, Landroid/view/ViewGroup$MarginLayoutParams;->bottomMargin:I
 
     invoke-virtual {v1, v0, v2}, Landroid/app/Activity;->addContentView(Landroid/view/View;Landroid/view/ViewGroup$LayoutParams;)V
 
@@ -339,7 +340,7 @@ const flareSolverSmali = `.class public Lcom/m365/gateway/FlareSolver;
 
     invoke-virtual {v0, v1}, Landroid/widget/FrameLayout;->setTranslationX(F)V
 
-    const v1, 0xc2c80000    # -100.0f
+    const v1, 0x41a00000    # 20.0f
 
     invoke-virtual {v0, v1}, Landroid/widget/FrameLayout;->setTranslationZ(F)V
 
@@ -357,6 +358,63 @@ const flareSolverSmali = `.class public Lcom/m365/gateway/FlareSolver;
     const v1, 0x461c4000    # 10000.0f
 
     invoke-virtual {v0, v1}, Landroid/widget/FrameLayout;->setTranslationX(F)V
+
+    :done
+    return-void
+.end method
+
+.method public tapAt(FF)V
+    .locals 11
+
+    iget-object v8, p0, Lcom/m365/gateway/FlareSolver;->web:Landroid/webkit/WebView;
+
+    if-eqz v8, :done
+
+    invoke-static {}, Landroid/os/SystemClock;->uptimeMillis()J
+
+    move-result-wide v9
+
+    move-wide v0, v9
+
+    move-wide v2, v9
+
+    const/4 v4, 0x0
+
+    move v5, p1
+
+    move v6, p2
+
+    const/4 v7, 0x0
+
+    invoke-static/range {v0 .. v7}, Landroid/view/MotionEvent;->obtain(JJIFFI)Landroid/view/MotionEvent;
+
+    move-result-object v0
+
+    invoke-virtual {v8, v0}, Landroid/webkit/WebView;->dispatchTouchEvent(Landroid/view/MotionEvent;)Z
+
+    invoke-virtual {v0}, Landroid/view/MotionEvent;->recycle()V
+
+    invoke-static {}, Landroid/os/SystemClock;->uptimeMillis()J
+
+    move-result-wide v2
+
+    move-wide v0, v9
+
+    const/4 v4, 0x1
+
+    move v5, p1
+
+    move v6, p2
+
+    const/4 v7, 0x0
+
+    invoke-static/range {v0 .. v7}, Landroid/view/MotionEvent;->obtain(JJIFFI)Landroid/view/MotionEvent;
+
+    move-result-object v0
+
+    invoke-virtual {v8, v0}, Landroid/webkit/WebView;->dispatchTouchEvent(Landroid/view/MotionEvent;)Z
+
+    invoke-virtual {v0}, Landroid/view/MotionEvent;->recycle()V
 
     :done
     return-void
@@ -585,6 +643,27 @@ const flareBridgeSmali = `.class Lcom/m365/gateway/FlareSolver$Bridge;
     const-string v0, ""
 
     return-object v0
+.end method
+
+.method public tap(FF)V
+    .locals 3
+    .annotation runtime Landroid/webkit/JavascriptInterface;
+    .end annotation
+
+    iget-object v0, p0, Lcom/m365/gateway/FlareSolver$Bridge;->this$0:Lcom/m365/gateway/FlareSolver;
+
+    iget-object v1, v0, Lcom/m365/gateway/FlareSolver;->web:Landroid/webkit/WebView;
+
+    if-eqz v1, :done
+
+    new-instance v2, Lcom/m365/gateway/FlareSolver$Tap;
+
+    invoke-direct {v2, v0, p1, p2}, Lcom/m365/gateway/FlareSolver$Tap;-><init>(Lcom/m365/gateway/FlareSolver;FF)V
+
+    invoke-virtual {v1, v2}, Landroid/webkit/WebView;->post(Ljava/lang/Runnable;)Z
+
+    :done
+    return-void
 .end method
 
 .method public done(Ljava/lang/String;)V
@@ -921,6 +1000,45 @@ const flareHideSmali = `.class Lcom/m365/gateway/FlareSolver$Hide;
     iget-object v0, p0, Lcom/m365/gateway/FlareSolver$Hide;->this$0:Lcom/m365/gateway/FlareSolver;
 
     invoke-virtual {v0}, Lcom/m365/gateway/FlareSolver;->hideOverlay()V
+
+    return-void
+.end method
+`
+
+const flareTapSmali = `.class Lcom/m365/gateway/FlareSolver$Tap;
+.super Ljava/lang/Object;
+.source "FlareSolver.java"
+
+.implements Ljava/lang/Runnable;
+
+.field final this$0:Lcom/m365/gateway/FlareSolver;
+.field final x:F
+.field final y:F
+
+.method constructor <init>(Lcom/m365/gateway/FlareSolver;FF)V
+    .locals 0
+
+    iput-object p1, p0, Lcom/m365/gateway/FlareSolver$Tap;->this$0:Lcom/m365/gateway/FlareSolver;
+
+    iput p2, p0, Lcom/m365/gateway/FlareSolver$Tap;->x:F
+
+    iput p3, p0, Lcom/m365/gateway/FlareSolver$Tap;->y:F
+
+    invoke-direct {p0}, Ljava/lang/Object;-><init>()V
+
+    return-void
+.end method
+
+.method public run()V
+    .locals 3
+
+    iget-object v0, p0, Lcom/m365/gateway/FlareSolver$Tap;->this$0:Lcom/m365/gateway/FlareSolver;
+
+    iget v1, p0, Lcom/m365/gateway/FlareSolver$Tap;->x:F
+
+    iget v2, p0, Lcom/m365/gateway/FlareSolver$Tap;->y:F
+
+    invoke-virtual {v0, v1, v2}, Lcom/m365/gateway/FlareSolver;->tapAt(FF)V
 
     return-void
 .end method
