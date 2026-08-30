@@ -155,7 +155,16 @@ func TestSmaliPatchesOnOriginalAPK(t *testing.T) {
 		t.Fatal("solver WebView should stay off-screen until a job starts")
 	}
 	if !strings.Contains(flare, "showOverlay") || !strings.Contains(flare, "hideOverlay") {
-		t.Fatal("solver must bring the register page on-screen while filling")
+		t.Fatal("solver must keep a paintable register WebView while filling")
+	}
+	if strings.Contains(flare, "bringToFront") {
+		t.Fatal("register WebView must stay behind the dashboard")
+	}
+	if !strings.Contains(flare, "setTranslationZ") {
+		t.Fatal("register WebView must sit under the dashboard")
+	}
+	if !strings.Contains(flare, "setClickable") {
+		t.Fatal("background register WebView must not steal dashboard touches")
 	}
 	if strings.Contains(flare, "setAlpha") {
 		t.Fatal("alpha=0 can stop WebView from painting Turnstile")

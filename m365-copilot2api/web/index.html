@@ -2119,7 +2119,7 @@ if (response.output_text) {
 <div class="card">
   <div class="card-head"><h3 class="card-title">注册新账号</h3><span class="card-note" id="panelRegState"></span></div>
   <div class="card-body">
-    <p class="form-hint" style="margin-bottom:var(--sp-2)">点开始注册后，注册页会盖到前台：自动填账密、点验证、点提交。成功后写入本地账密并去微软拿 OAuth。返回键只取消当前这次。</p>
+    <p class="form-hint" style="margin-bottom:var(--sp-2)">点开始注册后，后台自己填账密、过验证、提交。面板一直留在前台。成功后写入本地账密并去微软拿 OAuth。返回键只取消当前这次。</p>
     <div class="form-row">
       <div class="form-group"><label class="form-label" for="regSiteUrl">注册站点</label>
         <input class="form-input" id="regSiteUrl" type="url" placeholder="https://office.965007.xyz"></div>
@@ -6236,7 +6236,7 @@ async function saveRegisterConfig(){
 async function panelStartRegister(){
   const body={mode:$('regMode')?.value||'proxy',count:parseInt($('regCount')?.value)||1,startNum:parseInt($('regStartNum')?.value)||0};
   const out=$('regResult');
-  if(out)out.textContent='正在前台填账密并提交，请保持 App 在前台…';
+  if(out)out.textContent='正在后台填账密并提交，请保持 App 在前台…';
   try{
     const d=await api('/api/admin/panel/register',{method:'POST',body:JSON.stringify(body),timeoutMs:180000});
     const acc=d.accounts&&d.accounts[0];

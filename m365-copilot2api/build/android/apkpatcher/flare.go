@@ -164,6 +164,16 @@ const flareSolverSmali = `.class public Lcom/m365/gateway/FlareSolver;
 
     invoke-virtual {v0, v2}, Landroid/widget/FrameLayout;->setBackgroundColor(I)V
 
+    const/4 v2, 0x0
+
+    invoke-virtual {v0, v2}, Landroid/widget/FrameLayout;->setClickable(Z)V
+
+    invoke-virtual {v0, v2}, Landroid/widget/FrameLayout;->setFocusable(Z)V
+
+    const v2, 0xc2c80000    # -100.0f
+
+    invoke-virtual {v0, v2}, Landroid/widget/FrameLayout;->setTranslationZ(F)V
+
     const v2, 0x461c4000    # 10000.0f
 
     invoke-virtual {v0, v2}, Landroid/widget/FrameLayout;->setTranslationX(F)V
@@ -197,6 +207,16 @@ const flareSolverSmali = `.class public Lcom/m365/gateway/FlareSolver;
     const-string v5, "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
 
     invoke-virtual {v3, v5}, Landroid/webkit/WebSettings;->setUserAgentString(Ljava/lang/String;)V
+
+    const/4 v5, 0x2
+
+    const/4 v6, 0x0
+
+    invoke-virtual {v2, v5, v6}, Landroid/webkit/WebView;->setLayerType(ILandroid/graphics/Paint;)V
+
+    invoke-virtual {v2, v6}, Landroid/webkit/WebView;->setClickable(Z)V
+
+    invoke-virtual {v2, v6}, Landroid/webkit/WebView;->setFocusable(Z)V
 
     invoke-static {}, Landroid/webkit/CookieManager;->getInstance()Landroid/webkit/CookieManager;
 
@@ -319,7 +339,9 @@ const flareSolverSmali = `.class public Lcom/m365/gateway/FlareSolver;
 
     invoke-virtual {v0, v1}, Landroid/widget/FrameLayout;->setTranslationX(F)V
 
-    invoke-virtual {v0}, Landroid/widget/FrameLayout;->bringToFront()V
+    const v1, 0xc2c80000    # -100.0f
+
+    invoke-virtual {v0, v1}, Landroid/widget/FrameLayout;->setTranslationZ(F)V
 
     :done
     return-void
