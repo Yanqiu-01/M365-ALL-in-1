@@ -59,6 +59,9 @@ func TestSmaliPatchesOnOriginalAPK(t *testing.T) {
 		t.Fatal(err)
 	}
 	secret := filepath.Join(t.TempDir(), "admin.txt")
+	// The real password never lives in the repository; inject a throwaway one.
+	const testAdminPassword = "test-admin-pw"
+	t.Setenv(adminPasswordEnv, testAdminPassword)
 	if err := patchAdminPassword(work, secret); err != nil {
 		t.Fatal(err)
 	}
@@ -118,14 +121,14 @@ func TestSmaliPatchesOnOriginalAPK(t *testing.T) {
 	if !strings.Contains(stringsXML, ">修改版M365<") {
 		t.Fatal(stringsXML)
 	}
-	if !strings.Contains(stringsXML, ">***REMOVED-CREDENTIAL***<") {
+	if !strings.Contains(stringsXML, ">"+testAdminPassword+"<") {
 		t.Fatal("admin password not written")
 	}
 	got, err := os.ReadFile(secret)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.TrimSpace(string(got)) != defaultAdminPassword {
+	if strings.TrimSpace(string(got)) != testAdminPassword {
 		t.Fatalf("secret file = %q", got)
 	}
 	if _, err := os.Stat(filepath.Join(work, "smali", "com", "m365", "gateway", "FlareSolver.smali")); err != nil {

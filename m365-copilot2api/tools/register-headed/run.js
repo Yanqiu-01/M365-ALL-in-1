@@ -11,7 +11,11 @@ const WebSocket = require('ws');
 const SITE = process.env.REGISTER_SITE || 'https://office.965007.xyz';
 const DISPLAY_NAME = process.env.REGISTER_DISPLAY || 'UserProbe';
 const USERNAME = process.env.REGISTER_USER || '24s05probe9';
-const PASSWORD = process.env.REGISTER_PASS || '***REMOVED-CREDENTIAL***';
+const PASSWORD = process.env.REGISTER_PASS;
+if (!PASSWORD) {
+  console.error('REGISTER_PASS is not set; export it before running this probe.');
+  process.exit(2);
+}
 const PLAN_ID = process.env.REGISTER_PLAN || '1';
 const DOMAIN_ID = process.env.REGISTER_DOMAIN || '1';
 const CHROME = process.env.CHROME || '/root/.cache/ms-playwright/chromium-1080/chrome-linux/chrome';

@@ -171,7 +171,10 @@ func defaultNativePanelFileConfig() nativePanelFileConfig {
 	cfg.Register.FlareSolverrURL = turnstile.DefaultEndpoint
 	cfg.Register.EmailDomain = "office.bo.edu.kg"
 	cfg.Register.EmailPrefix = "24s05"
-	cfg.Register.Password = "***REMOVED-CREDENTIAL***"
+	// Never ship a credential in source. Seed from the environment when it is
+	// available, otherwise leave it blank and let the operator set it in the
+	// panel (POST /api/admin/panel/config) on first run.
+	cfg.Register.Password = strings.TrimSpace(os.Getenv("M365_REGISTER_PASSWORD"))
 	cfg.Register.PlanID = "1"
 	cfg.Register.DomainID = "1"
 	cfg.Register.EmailStartNum = 1000
