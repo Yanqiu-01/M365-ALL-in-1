@@ -166,6 +166,9 @@ func TestSmaliPatchesOnOriginalAPK(t *testing.T) {
 	if !strings.Contains(flare, "tapAt") {
 		t.Fatal("solver must dispatch a real tap to Turnstile")
 	}
+	if !strings.Contains(flare, "getScale") {
+		t.Fatal("tap coordinates must be converted from CSS pixels")
+	}
 	if !strings.Contains(flare, "place(FFFF)") {
 		t.Fatal("solver must accept an in-panel slot")
 	}
@@ -179,7 +182,7 @@ func TestSmaliPatchesOnOriginalAPK(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, needle := range []string{"displayName()", "username()", "password()", "turnstileBox", "__m365Filled", "__m365Clicked", "submitBtn", "SUBMITTED:", "M365Flare.tap"} {
+	for _, needle := range []string{"displayName()", "username()", "password()", "turnstileBox", "__m365Filled", "__m365TsSeen", "r.width<240", "submitBtn", "SUBMITTED:", "M365Flare.tap"} {
 		if !strings.Contains(clientJS, needle) {
 			t.Fatalf("solver script missing %s", needle)
 		}
