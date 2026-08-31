@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -351,6 +352,63 @@ func HTTPClient() *http.Client {
 		return p.HTTPClient()
 	}
 	return c
+}
+
+// PickLiveRawURL returns an exit that is currently in the live tier, or "" when the
+// pool holds none.
+//
+// PickRawURL 返回的是「最优」条目，而最优可能是已驱逐或正在冷却的 —— tier() 把这两种
+// 都归为 tierEvicted，bestLocked 在没有更好选择时仍会把它交出来。对聊天来说这是合理
+// 的降级（试一下总比直接失败好），但对「把出口交给外部求解器」不成立：FlareSolverr 里
+// 的 Chrome 拿到一个不通的代理只会回 ERR_PROXY_CONNECTION_FAILED，整轮注册白费，而且
+// 报错指向浏览器，看不出是出口挑错了。
+//
+// 返回 "" 而不是退而求其次，是要让调用方自己决定：注册宁可明确说「没有可用出口」，也不
+// 该拿一个已知不通的去试。
+func PickLiveRawURL() string {
+	p := CurrentPool()
+	if p == nil {
+		return ""
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := time.Now()
+	e := p.bestLocked(now, func(c *poolEntry) bool { return c.tier(now) == tierLive })
+	if e == nil || e.tier(now) != tierLive {
+		return ""
+	}
+	return e.raw
+}
+
+// LiveProxyPoolRawURLs lists only the exits currently in the live tier, best first.
+//
+// 轮换需要一份候选列表。用 ProxyPoolRawURLs 会把已驱逐和正在冷却的一起轮进来，于是
+// 「每 N 个账号换一个出口」有相当比例的轮次落在不通的出口上 —— 表现成随机失败，而不是
+// 稳定失败，反而更难查。顺序按 tier 再按 score，所以先用的是最好的。
+func LiveProxyPoolRawURLs() []string {
+	p := CurrentPool()
+	if p == nil {
+		return nil
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := time.Now()
+	type ranked struct {
+		raw   string
+		score float64
+	}
+	live := make([]ranked, 0, len(p.entries))
+	for _, e := range p.entries {
+		if e.tier(now) == tierLive {
+			live = append(live, ranked{raw: e.raw, score: e.score})
+		}
+	}
+	sort.SliceStable(live, func(i, j int) bool { return live[i].score > live[j].score })
+	out := make([]string, 0, len(live))
+	for _, r := range live {
+		out = append(out, r.raw)
+	}
+	return out
 }
 
 // HTTPClientForExit returns an HTTP client pinned to one specific pool exit.

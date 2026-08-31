@@ -137,9 +137,20 @@ func (s *Server) runRegister(ctx context.Context, manager *nativePanelManager, r
 		return report, err
 	}
 
+	// 出口优先取探测通过的那些。
+	//
+	// 这里原本是 outbound.PickRawURL()，它返回「最优」条目 —— 而 tier() 把已驱逐和正在
+	// 冷却的都归为同一档，没有更好选择时 bestLocked 仍会把它交出来。这个出口随后被递给
+	// FlareSolverr，容器里的 Chrome 拿到一个不通的代理只会回
+	// ERR_PROXY_CONNECTION_FAILED：整轮注册作废，而报错指向浏览器，完全看不出是出口挑
+	// 错了。池子本身知道哪些是 live 的（入池时 ValidateProxyCandidate 探过 L2，之后由巡检
+	// 维护状态），所以这里该问它要一个 live 的。
+	//
+	// PickLiveRawURL 没有 live 出口时返回 ""，此时回落到 PickRawURL：那是刻意的降级 ——
+	// 用一个状态未知的去试，仍然好过完全不带代理直连（用户明确要求不能走直连）。
 	proxyURL := firstNonEmpty(request.Proxy, cfg.Register.PhoneSOCKS, cfg.Register.ClashProxy)
 	if mode == "proxy" || strings.TrimSpace(proxyURL) == "" {
-		proxyURL = firstNonEmpty(proxyURL, outbound.PickRawURL())
+		proxyURL = firstNonEmpty(proxyURL, outbound.PickLiveRawURL(), outbound.PickRawURL())
 	}
 	rotateReq := exitrotate.Request{
 		Mode:        mode,
@@ -161,7 +172,14 @@ func (s *Server) runRegister(ctx context.Context, manager *nativePanelManager, r
 	// request.Node 非空表示调用方指定了节点，此时不轮换 —— 那是显式意图。
 	nodes := clashNodes(cfg)
 	pinnedNode := strings.TrimSpace(request.Node) != ""
-	poolURLs := outbound.ProxyPoolRawURLs()
+	// 轮换候选也只用 live 的，否则轮换会把已驱逐的出口重新轮进来 ——
+	// 那正是「注册随机失败」的形态：前一个号成功，下一个号换到死出口就报
+	// ERR_PROXY_CONNECTION_FAILED。没有 live 出口时回落到全量列表，理由同上：
+	// 状态未知也好过不带代理。
+	poolURLs := outbound.LiveProxyPoolRawURLs()
+	if len(poolURLs) == 0 {
+		poolURLs = outbound.ProxyPoolRawURLs()
+	}
 	exitTurn := 0
 	var lastIP string
 	for i := 0; i < count; i++ {

@@ -213,7 +213,11 @@ func (s *Server) runOAuthBatch(ctx context.Context, manager *nativePanelManager,
 	// processed%100==0 永远不成立，759 个账号分成 12 批就会全部走同一个出口 ——
 	// 轮换等于没实现。恢复流程恰恰是「多次请求累计几百个账号」这种形态，所以计数
 	// 归服务端所有。
-	exits := outbound.ProxyPoolRawURLs()
+	// 同 panel_register：只轮换 live 出口，否则每 100 个号可能换到一个不通的。
+	exits := outbound.LiveProxyPoolRawURLs()
+	if len(exits) == 0 {
+		exits = outbound.ProxyPoolRawURLs()
+	}
 	currentExit := func() string {
 		if len(exits) == 0 {
 			return ""

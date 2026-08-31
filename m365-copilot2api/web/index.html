@@ -997,9 +997,17 @@ textarea.form-input{min-height:80px;line-height:var(--lh-normal);resize:vertical
   cursor:pointer;font-family:inherit;padding:var(--sp-1) var(--sp-2);border-radius:6px;
   transition:color var(--dur-fast) ease,background var(--dur-fast) ease}
 .term-clear:hover{color:#fff;background:rgba(255,255,255,0.08)}
-.reg-frame{height:min(70vh,640px);min-height:420px;margin-top:var(--sp-3);
-  border:1px solid var(--line);border-radius:var(--radius-sm);background:#fff;
+/* 空态不占半屏，也不是一块白。
+   原来是 height:min(70vh,640px) 加 min-height:420px 和写死的 background:#fff：注册站
+   iframe 只在开始注册后才插入，在那之前（以及注册根本拉不起来时）这里就是一个半页高的
+   纯白块，在深色主题下尤其突兀，而且它什么也不说明。
+   现在空态只占一行提示的高度并跟随主题；真正插入 iframe 后才由 .reg-frame.is-active
+   撑到原来的尺寸并给出白底 —— 那是网页内容需要的。 */
+.reg-frame{min-height:96px;margin-top:var(--sp-3);
+  border:1px dashed var(--line);border-radius:var(--radius-sm);background:var(--panel);
   overflow:hidden;position:relative}
+.reg-frame.is-active{height:min(70vh,640px);min-height:420px;
+  border-style:solid;background:#fff}
 .reg-frame-hint{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
   color:var(--muted);font-size:var(--fs-sm);padding:var(--sp-4);text-align:center;pointer-events:none}
 .term-body{height:260px;overflow-y:auto;padding:var(--sp-3);
@@ -6425,7 +6433,8 @@ async function loadPanelState(){
     // 密码不预填真值：后端只回 register_password_set，不再回显明文。留空提交等于
     // 保持不变（saveRegisterConfig 对空字符串跳过赋值），所以占位符足够说明状态。
     (()=>{ const el=$('regPassword'); if(!el) return;
-      el.placeholder = d.register_password_set ? '已设置，留空则保持不变' : '尚未设置'; })();
+      el.placeholder = d.register_password_set ? '已设置，留空则保持不变' : '尚未设置（注册前必须填一次）'; })();
+    describeRegisterFrame();
     fill('regFlareSolverr', d.flaresolverr_url);
     // Clash 配置往返。密钥同密码处理：只显示是否已设置，不回显原值。
     fill('regClashApi', d.clash_api);
@@ -6474,11 +6483,32 @@ async function saveRegisterConfig(){
     loadPanelState();
   }catch(e){showNotice(e.message||String(e),'error');}
 }
+// 这个框只有 Android 版能用：它是给 App 内 WebView 覆盖上来的原生注册页留的位置，
+// 靠 window.M365Native.placeRegister 这个 JS 桥定位。桌面浏览器里那个桥不存在，
+// 所以永远不会有东西被放进来 —— 而它原本写死了 background:#fff 和 420px 最小高度，
+// 于是在 PC 上就是一块半页高、什么也不说明的白板。
+function nativeRegisterBridgeAvailable(){
+  return !!(window.M365Native && typeof M365Native.placeRegister==='function');
+}
+function describeRegisterFrame(){
+  const el=$('regFrame'); if(!el) return;
+  const hint=el.querySelector('.reg-frame-hint');
+  if(!hint) return;
+  if(nativeRegisterBridgeAvailable()){
+    hint.textContent='开始注册后，注册站会出现在这里';
+    return;
+  }
+  // 桌面端说清楚为什么这里不会出现东西，以及注册实际走的是哪条路。
+  hint.textContent='内嵌注册页仅 Android 版可用（需要 App 内 WebView）。'
+    +'桌面端注册通过本机 FlareSolverr 完成，过程不在此处显示。';
+}
 function placeRegisterFrame(){
   const el=$('regFrame');
-  if(!el||!window.M365Native||typeof M365Native.placeRegister!=='function') return;
+  if(!el||!nativeRegisterBridgeAvailable()) return;
   const r=el.getBoundingClientRect();
   if(r.width<80||r.height<80) return;
+  // 只有真的放进了原生页才撑到全尺寸并给白底；否则保持空态的一行高度。
+  el.classList.add('is-active');
   M365Native.placeRegister(r.left,r.top,r.width,r.height);
 }
 async function panelStartRegister(){
