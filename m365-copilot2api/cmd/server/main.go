@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -56,9 +57,21 @@ func main() {
 	// 内建 FlareSolverr 自带一个 http.Server，不经过网关的任何中间件，也没有任何
 	// 鉴权。因此监听地址只允许回环：把它绑到 0.0.0.0 会把一个无鉴权的求解接口
 	// 直接摆到局域网上。非回环地址不静默接受，记一行日志后退回回环。
+	// 内置求解器只在 Android 上有意义：它自己解不了 Turnstile，只是把任务通过
+	// M365_DATA_DIR 下的协作目录转交给 App 内的 WebView。桌面端没有那个 WebView，
+	// 它永远解不出 token，只会回一句「请打开修改版M365」——在 PC 上毫无意义。
+	//
+	// 更要紧的是 8191 正是真实 FlareSolverr（Docker/独立部署）的默认端口。让这个
+	// 解不出结果的中继占着它，用户就再也起不了能用的求解器，而注册配置里的默认
+	// 端点又恰好指向 8191。所以桌面端一律不启动它，把端口留给真家伙。
 	turnstileDone := make(chan struct{})
 	go func() {
 		defer close(turnstileDone)
+		if !turnstile.WebViewAvailable() {
+			log.Printf("built-in FlareSolverr: not started on %s (it only relays to the Android in-app WebView); "+
+				"leaving 127.0.0.1:8191 free for a real FlareSolverr", runtime.GOOS)
+			return
+		}
 		addr := "127.0.0.1:8191"
 		if v := strings.TrimSpace(os.Getenv("M365_FLARESOLVERR_LISTEN")); v != "" {
 			if loopbackListenAddr(v) {

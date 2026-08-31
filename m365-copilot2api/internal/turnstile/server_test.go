@@ -25,6 +25,9 @@ func TestHandleV1RequiresURL(t *testing.T) {
 }
 
 func TestHandleV1ReadsWebViewResult(t *testing.T) {
+	// WebView 中继只在 Android 上成立，而测试跑在开发机上。这里显式声明被测平台，
+	// 否则这条路径在任何非 Android 机器上都测不到。
+	t.Setenv("M365_TURNSTILE_FORCE_OS", "android")
 	root := t.TempDir()
 	t.Setenv("M365_DATA_DIR", root)
 	dir := filepath.Join(root, "flare")
@@ -70,6 +73,7 @@ func TestHandleV1ReadsWebViewResult(t *testing.T) {
 }
 
 func TestHandleV1RequiresReadyWebView(t *testing.T) {
+	t.Setenv("M365_TURNSTILE_FORCE_OS", "android")
 	root := t.TempDir()
 	t.Setenv("M365_DATA_DIR", root)
 	recorder := httptest.NewRecorder()

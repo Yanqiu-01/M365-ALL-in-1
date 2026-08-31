@@ -4,6 +4,13 @@
 *.test
 *.out
 
+# 交叉编译时（GOOS=linux go build ./...）产出的可执行文件没有扩展名，*.exe 兜不住。
+# 按 main 包名逐一挡掉：实测漏过一个 34MB 的 server 文件。
+/m365-copilot2api/server
+/m365-copilot2api/apktool
+/m365-copilot2api/proxy-quality-guard
+/m365-copilot2api/token-reissue-probe
+
 # Go 覆盖率与性能剖析输出
 coverage.txt
 *.prof

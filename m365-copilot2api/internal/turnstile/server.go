@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -155,6 +156,12 @@ type localSolution struct {
 }
 
 func solveLocal(ctx context.Context, page, display, username, password, proxy string) (localSolution, error) {
+	// 桌面端根本不该走到这里：内置求解器只是转交给 App 内 WebView 的中继，
+	// cmd/server 在非 Android 上已经不启动它。万一用户把 flaresolverr_url 指到了
+	// 一台跑着本程序的桌面机，也要给出能照着做的提示，而不是叫他去开安卓 App。
+	if err := webViewSupported(hostOS()); err != nil {
+		return localSolution{}, err
+	}
 	dir := flareDir()
 	if dir == "" {
 		return localSolution{}, errors.New("内置 FlareSolverr 需要 App 数据目录。请打开修改版M365 后再注册")
@@ -183,6 +190,39 @@ func Cancel() bool {
 	// result 只是给等待方的提示，写不成也不影响 cancel 标记本身已经生效。
 	_ = os.WriteFile(filepath.Join(dir, "result"), []byte("0\nCANCEL\n"), 0o600)
 	return true
+}
+
+// hostOS 报告当前平台，可用 M365_TURNSTILE_FORCE_OS 覆盖。
+//
+// 存在这个覆盖点，是因为直接读 runtime.GOOS 的判断在构造上就无法测试：WebView 中
+// 继路径只在 Android 成立，而测试跑在开发机上。硬编码会让那条路径永远测不到。
+func hostOS() string {
+	if v := strings.TrimSpace(os.Getenv("M365_TURNSTILE_FORCE_OS")); v != "" {
+		return v
+	}
+	return runtime.GOOS
+}
+
+// WebViewAvailable 报告这台机器上内置求解器是否可能解出结果。
+//
+// cmd/server 据此决定要不要启动它。桌面端不启动有两个理由：它必然解不出来，而且
+// 8191 正是真实 FlareSolverr 的默认端口 —— 让一个解不出结果的中继占着它，用户就
+// 再也起不了能用的求解器。
+func WebViewAvailable() bool { return webViewSupported(hostOS()) == nil }
+
+// webViewSupported 说明为什么这台机器上没有内置求解器，并给出能照着做的替代方案。
+//
+// 内置求解器自己解不了 Turnstile —— 它只是把任务通过协作目录转交给 App 内的
+// WebView。桌面端没有那个 WebView，所以这里必须明确拒绝，而不是回一句「请打开修改
+// 版M365」把 PC 用户引到一个不存在的 App 上。
+func webViewSupported(goos string) error {
+	if goos == "android" {
+		return nil
+	}
+	return fmt.Errorf(
+		"内置求解器只在 Android 上可用：它把验证任务转交给 App 内的 WebView，而 %s 上没有这个 WebView。"+
+			"请在本机起一个真正的 FlareSolverr（例如 docker run -d -p 8191:8191 ghcr.io/flaresolverr/flaresolverr:latest），"+
+			"再把面板里的 flaresolverr_url 指向它", goos)
 }
 
 func flareDir() string {
