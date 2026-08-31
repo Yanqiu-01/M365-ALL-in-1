@@ -77,8 +77,10 @@ func TestSolveReportsMissingToken(t *testing.T) {
 		})
 	}))
 	defer server.Close()
+	// 报错要说清「为什么取不到」和「怎么办」。原来那句「没有完成填表和提交」把原因
+	// 指向填表，而真实原因是快照里根本没有 token。详见 flare_wait_test.go。
 	_, err := Solve(context.Background(), Request{Endpoint: server.URL, PageURL: "https://office.example.test/"})
-	if err == nil || !strings.Contains(err.Error(), "没有完成填表和提交") {
+	if err == nil || !strings.Contains(err.Error(), "取不到 Turnstile token") {
 		t.Fatalf("err = %v", err)
 	}
 }

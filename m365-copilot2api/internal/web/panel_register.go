@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -148,9 +149,37 @@ func (s *Server) runRegister(ctx context.Context, manager *nativePanelManager, r
 	//
 	// PickLiveRawURL 没有 live 出口时返回 ""，此时回落到 PickRawURL：那是刻意的降级 ——
 	// 用一个状态未知的去试，仍然好过完全不带代理直连（用户明确要求不能走直连）。
-	proxyURL := firstNonEmpty(request.Proxy, cfg.Register.PhoneSOCKS, cfg.Register.ClashProxy)
+	//
+	// 还要看「谁来解 Turnstile」：容器里的 FlareSolverr 连不上宿主的回环代理，也连不
+	// 上 socks5 出口（实测 http 出口回 302，socks5/socks5h 都是 000）。把这种出口递给
+	// 它，报错就是用户反复贴的 ERR_PROXY_CONNECTION_FAILED —— 而报错指向浏览器，完全
+	// 看不出是出口挑错了。本机 Chrome 没有这个限制。
+	solverUsable := turnstile.ExitUsableByFlareSolverr
+	if useChromeSolver(cfg) {
+		solverUsable = turnstile.ExitUsableByChrome
+	}
+	// proxy 模式的语义是「从网关代理池取出口」。原先这里把配置里的 phone_socks /
+	// clash_proxy 放在池子前面，即使用户明确选了 proxy，首轮也会固定走 127.0.0.1 的
+	// 本地 SOCKS，再在重试时才进池子。这不但违背模式选择，还让每个号白烧第一次尝试。
+	//
+	// 显式 request.Proxy 仍然优先：那是调用方把本轮出口钉住的明确意图。phone / clash
+	// 模式才使用各自配置的本地出口。
+	proxyURL := strings.TrimSpace(request.Proxy)
+	if mode != "proxy" {
+		proxyURL = firstNonEmpty(proxyURL, cfg.Register.PhoneSOCKS, cfg.Register.ClashProxy)
+	}
 	if mode == "proxy" || strings.TrimSpace(proxyURL) == "" {
-		proxyURL = firstNonEmpty(proxyURL, outbound.PickLiveRawURL(), outbound.PickRawURL())
+		// 第一个候选也按近期表现排：否则每一轮注册都从同一个已知过不了 CF 的出口开始，
+		// 白烧一次重试额度。
+		usableLive := turnstile.PreferProvenExits(turnstile.FilterExits(outbound.LiveProxyPoolRawURLs(), solverUsable))
+		usableAll := turnstile.PreferProvenExits(turnstile.FilterExits(outbound.ProxyPoolRawURLs(), solverUsable))
+		proxyURL = firstNonEmpty(proxyURL, firstOf(usableLive), firstOf(usableAll))
+	}
+	// 调用方显式指定的出口也要能被求解器用到，否则整轮注册必然失败，且失败原因
+	// 落在浏览器报错上。这里不改它，只如实说清楚。
+	if p := strings.TrimSpace(proxyURL); p != "" && !solverUsable(p) {
+		report.Notes = append(report.Notes,
+			fmt.Sprintf("出口 %s 求解器用不了（容器里的 FlareSolverr 连不上回环地址和 socks5 出口），Turnstile 可能解不出来", redactExitForNote(p)))
 	}
 	rotateReq := exitrotate.Request{
 		Mode:        mode,
@@ -176,10 +205,19 @@ func (s *Server) runRegister(ctx context.Context, manager *nativePanelManager, r
 	// 那正是「注册随机失败」的形态：前一个号成功，下一个号换到死出口就报
 	// ERR_PROXY_CONNECTION_FAILED。没有 live 出口时回落到全量列表，理由同上：
 	// 状态未知也好过不带代理。
-	poolURLs := outbound.LiveProxyPoolRawURLs()
+	//
+	// 轮换候选同样要过求解器那道筛：否则「每个号换一个出口」有一部分轮次会换到求解器
+	// 用不了的出口上，表现成随机失败。
+	poolURLs := turnstile.FilterExits(outbound.LiveProxyPoolRawURLs(), solverUsable)
 	if len(poolURLs) == 0 {
-		poolURLs = outbound.ProxyPoolRawURLs()
+		poolURLs = turnstile.FilterExits(outbound.ProxyPoolRawURLs(), solverUsable)
 	}
+	// 按「近期能不能过 CF」重排候选顺序。
+	//
+	// 实测三轮注册都从池子的同一个顺序开头挑，于是每个号都要把同一批过不了 CF 的出口
+	// 重新踩一遍 —— 第一个候选每次都是同一个，六次重试有一半以上花在已经确认不行的出口
+	// 上。这里只重排先后，不增不删，用户的代理列表和池子状态都不受影响。
+	poolURLs = turnstile.PreferProvenExits(poolURLs)
 	exitTurn := 0
 	var lastIP string
 	for i := 0; i < count; i++ {
@@ -207,18 +245,89 @@ func (s *Server) runRegister(ctx context.Context, manager *nativePanelManager, r
 			emailStart = start
 		}
 		display := fmt.Sprintf("User%d", num-(emailStart-displayBase))
-		probeCtx, probeCancel := context.WithTimeout(ctx, 8*time.Second)
-		if ip, err := probeRegisterIP(probeCtx, proxyURL); err == nil {
-			item.IP = ip
-			lastIP = ip
+		// 一个号要允许在多个出口上试。
+		//
+		// 原先每个号只试 proxyURL 一个出口，失败即判死 —— 而实测池子里大多数 live 出口
+		// 都过不了这一关：有的页面根本加载不出来，有的页面正常但 Cloudflare 认定该 IP
+		// 高风险、一直不发 token。于是「抽签抽中坏出口」= 这个号永久失败，这正是用户反
+		// 复看到的注册失败。
+		//
+		// 只在错误确实指向出口时才换（见 turnstile.ExitAttributable）：要邮箱验证、要邀
+		// 请码这类换一百个出口也是同样的错，立刻返回。站点每个 IP 每天只允许成功注册 1
+		// 次，出口是有成本的资源，不能拿来乱撞。
+		var (
+			outcome    registerOutcome
+			outcomeErr error
+			attempts   int
+			triedExits []string
+		)
+		for {
+			attempts++
+			probeCtx, probeCancel := context.WithTimeout(ctx, 8*time.Second)
+			if ip, err := probeRegisterIP(probeCtx, proxyURL); err == nil {
+				item.IP = ip
+				lastIP = ip
+			}
+			probeCancel()
+			if p := strings.TrimSpace(proxyURL); p != "" {
+				triedExits = append(triedExits, redactExitForNote(p))
+			}
+			outcome, outcomeErr = completeRegister(ctx, cfg, request.TurnstileToken, proxyURL, display, username)
+			// 记下这个出口在 Turnstile 这一关的表现，只用来决定下一次先试谁。
+			// 出口是否可用由代理池自己判断，这里不碰它的状态，也不动用户的列表。
+			if p := strings.TrimSpace(proxyURL); p != "" {
+				if outcomeErr == nil || !turnstile.ExitAttributable(outcomeErr) {
+					// 走到站点侧回话（成功，或「邮箱已注册」这类业务错误）就说明这个出口
+					// 确实过了 CF —— 那正是下一个号该优先用的出口。
+					turnstile.NoteExitTurnstileOK(p)
+				} else {
+					turnstile.NoteExitTurnstileFailed(p)
+				}
+			}
+			if outcomeErr == nil {
+				break
+			}
+			// 换出口只对 proxy 模式有意义：phone/clash 模式的出口由外部设备或 Clash
+			// 控制，这里手上没有可切换的候选列表。
+			if mode != "proxy" || !turnstile.ExitAttributable(outcomeErr) {
+				break
+			}
+			next := nextExitAfter(poolURLs, proxyURL)
+			if next == "" || attempts >= registerExitAttempts {
+				break
+			}
+			if ctx.Err() != nil {
+				break
+			}
+			proxyURL = next
+			exitTurn++
 		}
-		probeCancel()
-		outcome, outcomeErr := completeRegister(ctx, cfg, request.TurnstileToken, proxyURL, display, username)
 		if outcomeErr != nil {
-			item.Status, item.Detail = "failed", outcomeErr.Error()
+			item.Status = "failed"
+			item.Detail = outcomeErr.Error()
+			// 试了多个出口就要说清楚试了哪些：否则报错只剩最后一个出口的症状，
+			// 看不出前面几个是同样的问题还是各有不同。
+			if attempts > 1 {
+				item.Detail = fmt.Sprintf("%s（已换 %d 个出口重试：%s）",
+					item.Detail, attempts, strings.Join(triedExits, "、"))
+			}
 			report.Failed++
 			report.Accounts = append(report.Accounts, item)
+			// 这个号失败后要把出口推进，否则下一个号会从刚刚失败的那个出口重新开始，
+			// 把重试额度浪费在同一个已知坏出口上。成功路径不在这里推进 —— 它走下面
+			// 那段轮换逻辑，那里还要处理 clash 模式和「池子只有一个出口」的情形。
+			if mode == "proxy" {
+				if next := nextExitAfter(poolURLs, proxyURL); next != "" {
+					proxyURL = next
+					exitTurn++
+				}
+			}
 			continue
+		}
+		if attempts > 1 {
+			report.Notes = append(report.Notes,
+				fmt.Sprintf("第 %d 号换了 %d 个出口才成功，前面的出口不可用：%s",
+					num, attempts, strings.Join(triedExits[:len(triedExits)-1], "、")))
 		}
 		if upn := strings.TrimSpace(outcome.UPN); nativePanelValidEmail(upn) {
 			email = upn
@@ -309,6 +418,95 @@ func (s *Server) runRegister(ctx context.Context, manager *nativePanelManager, r
 	return report, nil
 }
 
+// useChromeSolver 决定这一轮用哪个后端解 Turnstile。
+//
+// auto（默认）：本机有 Chrome/Edge 就用它，否则退回 FlareSolverr。之所以默认偏向浏览
+// 器，是因为两者能力不同 —— FlareSolverr 的 request.get 只能回一张 page_source 快照，
+// 而 Turnstile 把 token 写在隐藏 input 的 value property 上，序列化的 HTML 里没有这个
+// 值；它也不会替你点控件、提交表单。实测下这个站点走 FlareSolverr 永远拿不到 token。
+//
+// chrome / flaresolverr：显式指定。配置成 chrome 但本机没有浏览器时不硬撑，回落到
+// FlareSolverr 并由它自己报出装浏览器的建议 —— 那条消息比这里再造一句更准确。
+func useChromeSolver(cfg nativePanelFileConfig) bool {
+	switch strings.ToLower(strings.TrimSpace(cfg.Register.Solver)) {
+	case "flaresolverr", "flare":
+		return false
+	case "chrome", "browser", "edge":
+		return turnstile.ChromeAvailable()
+	default:
+		return turnstile.ChromeAvailable()
+	}
+}
+
+// firstOf 取列表里第一个条目，空列表返回空串。
+// registerExitAttempts 是单个号最多试几个出口。
+//
+// 上限存在的意义是别把一次注册变成把整个池子撞完：真正是站点侧的问题（结构变了、
+// 参数不对）时，96 个出口会一个不落地失败，每个都要跑满 Turnstile 预算。
+//
+// 定在 10：实测能过 CF 的 http 出口约占三分之一，10 次把「一个号也挑不到好出口」的概率
+// 压到 2% 以下。代价可控 —— 加了提前判死之后，一个坏出口约 22 秒就能识别出来（原先要
+// 55 秒），10 次最差约 4 分钟，仍然能在一次请求里把真实错误报回来。
+const registerExitAttempts = 10
+
+// nextExitAfter 返回 current 在候选列表里的下一个出口，用于同一个号的换出口重试。
+//
+// 从 current 的位置往后取，而不是从头开始：这样重试不会反复撞在同一批前缀上。列表里
+// 找不到 current（例如调用方钉了一个池外的出口）时从头取。候选不足 2 个时返回空串，
+// 由调用方停止重试 —— 拿同一个出口再试一遍没有意义。
+func nextExitAfter(pool []string, current string) string {
+	if len(pool) == 0 {
+		return ""
+	}
+	cur := strings.TrimSpace(current)
+	idx := -1
+	for i, p := range pool {
+		if strings.TrimSpace(p) == cur {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		if next := strings.TrimSpace(pool[0]); next != cur {
+			return next
+		}
+		if len(pool) < 2 {
+			return ""
+		}
+		return strings.TrimSpace(pool[1])
+	}
+	if len(pool) < 2 {
+		return ""
+	}
+	return strings.TrimSpace(pool[(idx+1)%len(pool)])
+}
+
+func firstOf(values []string) string {
+	if len(values) == 0 {
+		return ""
+	}
+	return values[0]
+}
+
+// redactExitForNote 让出口能出现在报告里而不泄露代理密码。
+//
+// Notes 会原样进管理接口的响应，也就是进浏览器的 devtools —— 池子里的条目可能带
+// user:pass，不能整条抄进去。
+func redactExitForNote(raw string) string {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || parsed == nil || parsed.Host == "" {
+		return "(已隐藏)"
+	}
+	scheme := parsed.Scheme
+	if scheme == "" {
+		scheme = "http"
+	}
+	if parsed.User != nil {
+		return scheme + "://***@" + parsed.Host
+	}
+	return scheme + "://" + parsed.Host
+}
+
 var rotateExit = exitrotate.Rotate
 
 func probeRegisterIP(ctx context.Context, proxyURL string) (string, error) {
@@ -326,26 +524,47 @@ type registerOutcome struct {
 func completeRegister(ctx context.Context, cfg nativePanelFileConfig, supplied, proxyURL, display, username string) (registerOutcome, error) {
 	token := strings.TrimSpace(supplied)
 	if token == "" {
-		endpoint := strings.TrimSpace(cfg.Register.FlareSolverrURL)
-		if endpoint == "" {
-			endpoint = turnstile.DefaultEndpoint
-		}
 		page := strings.TrimRight(strings.TrimSpace(cfg.Register.SiteURL), "/")
 		if page == "" {
 			return registerOutcome{}, errors.New("缺少注册页地址")
 		}
-		solved, err := turnstile.Solve(ctx, turnstile.Request{
-			Endpoint:    endpoint,
-			PageURL:     page,
-			Proxy:       proxyURL,
-			DisplayName: display,
-			Username:    username,
-			Password:    cfg.Register.Password,
-		})
-		if err != nil {
-			return registerOutcome{}, err
+		// 本机有浏览器就走浏览器。这不是偏好问题：FlareSolverr 的 request.get 只回一
+		// 张页面快照，而 Turnstile 把 token 写在隐藏 input 的 value property 上，
+		// 序列化的 HTML 里没有它 —— 那条路在这个站点上结构性地取不到 token。
+		//
+		// 配置里 solver=flaresolverr 时仍然听配置：显式意图不该被代码悄悄改掉。
+		if useChromeSolver(cfg) {
+			solved, err := turnstile.SolveWithChrome(ctx, turnstile.ChromeRequest{
+				PageURL:     page,
+				Proxy:       proxyURL,
+				DisplayName: display,
+				Username:    username,
+				Password:    cfg.Register.Password,
+				PlanID:      strings.TrimSpace(cfg.Register.PlanID),
+				DomainID:    strings.TrimSpace(cfg.Register.DomainID),
+			})
+			if err != nil {
+				return registerOutcome{}, err
+			}
+			token = strings.TrimSpace(solved.Token)
+		} else {
+			endpoint := strings.TrimSpace(cfg.Register.FlareSolverrURL)
+			if endpoint == "" {
+				endpoint = turnstile.DefaultEndpoint
+			}
+			solved, err := turnstile.Solve(ctx, turnstile.Request{
+				Endpoint:    endpoint,
+				PageURL:     page,
+				Proxy:       proxyURL,
+				DisplayName: display,
+				Username:    username,
+				Password:    cfg.Register.Password,
+			})
+			if err != nil {
+				return registerOutcome{}, err
+			}
+			token = strings.TrimSpace(solved.Token)
 		}
-		token = strings.TrimSpace(solved.Token)
 	}
 	if strings.HasPrefix(token, "ERROR:") {
 		return registerOutcome{}, errors.New(strings.TrimPrefix(token, "ERROR:"))

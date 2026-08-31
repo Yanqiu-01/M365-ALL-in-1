@@ -38,7 +38,17 @@ type Request struct {
 	DisplayName string        // filled into #displayName
 	Username    string        // filled into #username
 	Password    string        // filled into #password
+	// Wait 让服务端在快照之前多等一会儿。这个注册页的控件是 explicit render：
+	// app.js 要先取 site-config，再加载 challenges.cloudflare.com 的 api.js，之后
+	// 才 render。不等的话快照里连隐藏 input 都还没出现。
+	Wait time.Duration
 }
+
+// DefaultWait 是快照前的等待时长。
+//
+// 实测：直连、等 18 秒时快照里能看到 Turnstile 注入的隐藏 input；走代理时 api.js
+// 的 302 + 正文要 9 秒以上，等不够就只剩一个空的 #turnstileBox。
+const DefaultWait = 20 * time.Second
 
 // Solution carries what the solver produced.
 type Solution struct {
@@ -58,6 +68,10 @@ type flareSolution struct {
 	Response  string        `json:"response"`
 	UserAgent string        `json:"userAgent"`
 	Cookies   []flareCookie `json:"cookies"`
+	// TurnstileToken 是本机这个 FlareSolverr 镜像的扩展字段（上游 3.5.0 没有）。
+	// 它靠 tabs_till_verify 按 Tab/Space 点控件后从 input 上读，能读到就直接用 ——
+	// 那是 DOM property，比从快照 HTML 里正则更可靠。
+	TurnstileToken string `json:"turnstile_token"`
 }
 
 type flareReply struct {
@@ -94,6 +108,15 @@ func Solve(ctx context.Context, request Request) (Solution, error) {
 		budget = DefaultTimeout
 	}
 
+	wait := request.Wait
+	if wait <= 0 {
+		wait = DefaultWait
+	}
+	// 等待占用的是同一份预算，留不出等待时间就别等 —— 否则服务端会先被 maxTimeout
+	// 掐断，连快照都拿不到。
+	if wait >= budget-10*time.Second {
+		wait = 0
+	}
 	payload := map[string]any{
 		"cmd":         "request.get",
 		"url":         page,
@@ -101,6 +124,9 @@ func Solve(ctx context.Context, request Request) (Solution, error) {
 		"displayName": strings.TrimSpace(request.DisplayName),
 		"username":    strings.TrimSpace(request.Username),
 		"password":    strings.TrimSpace(request.Password),
+	}
+	if seconds := int(wait / time.Second); seconds > 0 {
+		payload["waitInSeconds"] = seconds
 	}
 	if proxy := strings.TrimSpace(request.Proxy); proxy != "" {
 		payload["proxy"] = map[string]any{"url": proxy}
@@ -146,12 +172,30 @@ func Solve(ctx context.Context, request Request) (Solution, error) {
 			solution.Clearance = strings.TrimSpace(cookie.Value)
 		}
 	}
+	// 服务端直接给出 token 时优先用它：那是从 DOM property 上读的，而快照 HTML 里
+	// 只有属性 —— Turnstile 是给 input.value 赋值，序列化出来看不到。
+	if direct := strings.TrimSpace(reply.Solution.TurnstileToken); direct != "" {
+		solution.Token = direct
+		return solution, nil
+	}
 	solution.Token = extractToken(reply.Solution.Response)
 	if solution.Token == "" {
-		return solution, errors.New("注册页已打开，但没有完成填表和提交")
+		return solution, errors.New(flareNoTokenAdvice)
 	}
 	return solution, nil
 }
+
+// flareNoTokenAdvice 说明 FlareSolverr 拿不到 token 的真实原因和出路。
+//
+// 原来的「注册页已打开，但没有完成填表和提交」把责任推给了填表，让人以为是字段没
+// 填对。实际原因是结构性的：request.get 只回一张 driver.page_source 快照，而
+// Turnstile 是给隐藏 input 赋 value property，序列化的 HTML 里没有这个值；快照里
+// 也不可能有「点过控件」这件事。所以这条路在这个站点上永远取不到 token，正确的出路
+// 是走本机浏览器。
+const flareNoTokenAdvice = "FlareSolverr 只能返回页面快照，取不到 Turnstile token：" +
+	"控件把 token 写在隐藏 input 的 value property 上，序列化后的 HTML 里没有它，" +
+	"而 FlareSolverr 也不会替你点控件、提交表单。" +
+	"请让本机装上 Chrome 或 Edge（或把 M365_CHROME_PATH 指向浏览器），注册会自动改走本机浏览器完成"
 
 func extractToken(document string) string {
 	raw := strings.TrimSpace(document)

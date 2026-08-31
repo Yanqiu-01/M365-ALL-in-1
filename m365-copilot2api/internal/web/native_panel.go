@@ -152,22 +152,29 @@ type nativePanelFileConfig struct {
 		// TurnstileSite 只解码保留，本模块没有任何读者：站点 key 由注册页自己
 		// 提供，registerReady() 也不再要求它。保留字段是为了让操作员配置里已有
 		// 的这个键在 saveRegisterConfig 整体覆盖时不被丢掉，而不是它还有用。
-		TurnstileSite   string            `json:"turnstile_sitekey"`
-		FlareSolverrURL string            `json:"flaresolverr_url"`
-		EmailDomain     string            `json:"email_domain"`
-		EmailPrefix     string            `json:"email_prefix"`
-		Password        string            `json:"password"`
-		PlanID          string            `json:"plan_id"`
-		DomainID        string            `json:"domain_id"`
-		EmailStartNum   int               `json:"email_start_num"`
-		DisplayBase     int               `json:"display_base"`
-		CredentialFile  string            `json:"cred_file"`
-		PhoneSOCKS      string            `json:"phone_socks"`
-		ClashAPI        string            `json:"clash_api"`
-		ClashSecret     string            `json:"clash_secret"`
-		ClashGroup      string            `json:"clash_group"`
-		ClashProxy      string            `json:"clash_proxy"`
-		ClashNodes      []clashNodeConfig `json:"clash_nodes"`
+		TurnstileSite   string `json:"turnstile_sitekey"`
+		FlareSolverrURL string `json:"flaresolverr_url"`
+		// Solver 选谁来解 Turnstile：auto（默认）、chrome、flaresolverr。
+		//
+		// 默认 auto 会在本机装了浏览器时用浏览器 —— 这不是偏好，是能力差别：
+		// FlareSolverr 只能回一张页面快照，而 token 写在隐藏 input 的 value
+		// property 上，快照里没有它。留下这个键是为了让「我就要用 FlareSolverr」
+		// 这种意图能表达出来，而不是被代码悄悄改掉。
+		Solver         string            `json:"solver"`
+		EmailDomain    string            `json:"email_domain"`
+		EmailPrefix    string            `json:"email_prefix"`
+		Password       string            `json:"password"`
+		PlanID         string            `json:"plan_id"`
+		DomainID       string            `json:"domain_id"`
+		EmailStartNum  int               `json:"email_start_num"`
+		DisplayBase    int               `json:"display_base"`
+		CredentialFile string            `json:"cred_file"`
+		PhoneSOCKS     string            `json:"phone_socks"`
+		ClashAPI       string            `json:"clash_api"`
+		ClashSecret    string            `json:"clash_secret"`
+		ClashGroup     string            `json:"clash_group"`
+		ClashProxy     string            `json:"clash_proxy"`
+		ClashNodes     []clashNodeConfig `json:"clash_nodes"`
 	} `json:"register"`
 }
 

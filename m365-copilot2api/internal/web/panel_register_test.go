@@ -170,6 +170,10 @@ func TestRunRegisterUsesFlareSolverrWhenTokenMissing(t *testing.T) {
 	}
 	reg := cfg["register"].(map[string]any)
 	reg["flaresolverr_url"] = flare.URL
+	// 这个用例考的就是 FlareSolverr 那条路，所以要把后端钉住。默认（auto）在装了
+	// Chrome/Edge 的机器上会走浏览器 —— 那时它会真的去开 site.URL，测不到这里想测的东西，
+	// 而且结果会随机器而变。
+	reg["solver"] = "flaresolverr"
 	body, _ := json.Marshal(cfg)
 	if err := os.WriteFile(cfgPath, body, 0o600); err != nil {
 		t.Fatal(err)
@@ -202,6 +206,7 @@ func TestRunRegisterReportsFlareSolverrFailure(t *testing.T) {
 	}
 	reg := cfg["register"].(map[string]any)
 	reg["flaresolverr_url"] = "http://127.0.0.1:1/v1"
+	reg["solver"] = "flaresolverr" // 同上：这条用例考的是 FlareSolverr 不可用时如实报错。
 	body, _ := json.Marshal(cfg)
 	if err := os.WriteFile(cfgPath, body, 0o600); err != nil {
 		t.Fatal(err)

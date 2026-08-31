@@ -40,6 +40,11 @@ func TestBootstrapPasswordUsesWritablePersistentPath(t *testing.T) {
 	if err := os.WriteFile(bootstrap, []byte("bootstrap-password\n"), 0400); err != nil {
 		t.Fatal(err)
 	}
+	// M365_DATA_DIR outranks M365_ADMIN_PASSWORD_FILE in adminPasswordPath, so
+	// neutralize it: otherwise an ambient value (the test runs pin one to keep
+	// the real data directory untouched) redirects the write and this case
+	// asserts on a file nobody ever created.
+	t.Setenv("M365_DATA_DIR", "")
 	t.Setenv("M365_ADMIN_PASSWORD_FILE", persisted)
 	t.Setenv("M365_ADMIN_PASSWORD_BOOTSTRAP_FILE", bootstrap)
 	t.Setenv("M365_ADMIN_PASSWORD", "")
