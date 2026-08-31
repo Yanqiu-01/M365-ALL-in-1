@@ -207,14 +207,18 @@ func (s *Server) runOAuthBatch(ctx context.Context, manager *nativePanelManager,
 	//
 	// 池子为空时 exits 为空，attempted 恒取到 ""，行为退回 HTTPClient() 的默认选择 ——
 	// 不因为没有代理就中断整批。
+	// 计数必须跨请求累计，不能每次从 0 开始。
+	//
+	// panelOAuthBatchMax 是 64，而轮换间隔是 100：如果计数器随请求重置，
+	// processed%100==0 永远不成立，759 个账号分成 12 批就会全部走同一个出口 ——
+	// 轮换等于没实现。恢复流程恰恰是「多次请求累计几百个账号」这种形态，所以计数
+	// 归服务端所有。
 	exits := outbound.ProxyPoolRawURLs()
-	exitTurn := 0
-	processed := 0
 	currentExit := func() string {
 		if len(exits) == 0 {
 			return ""
 		}
-		return exits[exitTurn%len(exits)]
+		return exits[int(s.oauthExitTurn.Load())%len(exits)]
 	}
 	if len(exits) > 0 {
 		log.Printf("[panel-oauth] batch of %d accounts over %d pool exits, rotating every %d accounts",
@@ -230,16 +234,17 @@ func (s *Server) runOAuthBatch(ctx context.Context, manager *nativePanelManager,
 			return report, ctx.Err()
 		default:
 		}
-		// 满一批就换出口。放在循环开头而不是结尾，这样跳过的账号也计入批次，
-		// 否则大量 resume 跳过会让轮换迟迟不发生。
-		if processed > 0 && processed%oauthExitRotateEvery == 0 {
-			exitTurn++
+		// 满一批就换出口。计数在服务端累计，所以跨请求也成立 —— 恢复流程是十几次
+		// 请求凑几百个账号，计数若随请求重置就永远换不了出口。
+		//
+		// 跳过的账号也计入：否则一次 resume 跳过大量已有账号会让轮换迟迟不发生。
+		if n := s.oauthExitProcessed.Add(1); n > 1 && (n-1)%oauthExitRotateEvery == 0 {
+			s.oauthExitTurn.Add(1)
 			if len(exits) > 0 {
 				log.Printf("[panel-oauth] rotated egress after %d accounts -> %s",
-					processed, outbound.RedactProxyURL(currentExit()))
+					n-1, outbound.RedactProxyURL(currentExit()))
 			}
 		}
-		processed++
 		item := panelOAuthAccount{Email: email}
 		if request.Resume && online[strings.ToLower(email)] {
 			item.Status, item.Mode, item.Detail = "skipped", "skipped", "账号池已有该邮箱"

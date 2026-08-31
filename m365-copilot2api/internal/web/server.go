@@ -19,6 +19,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -197,6 +198,10 @@ type Server struct {
 	upstreamCooldown   *accountCooldown
 	accountConcurrency *accountConcurrency
 	resourceScheduler  *resourceScheduler
+	// 批量授权的出口轮换计数。归服务端所有，因为恢复流程是十几次请求累计几百个
+	// 账号，而单批上限只有 64：计数若随请求重置，每 100 个换一次出口就永远不会触发。
+	oauthExitProcessed atomic.Int64
+	oauthExitTurn      atomic.Int64
 	pkce               map[string]pendingPKCE
 	pkceAttempt        uint64
 	// exchangePKCECode is nil in production and falls back to auth.ExchangeCode.
