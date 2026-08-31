@@ -18,6 +18,10 @@ type toolEvidence struct {
 	Arguments string `json:"arguments"`
 	Result    string `json:"result"`
 	Failed    bool   `json:"failed"`
+	// Answered 记录「是否收到过这个 id 的 tool 消息」，与结果内容是否为空无关。
+	// 判定 Pending 必须用它而不是 Result == ""：空结果是合法的（无输出的命令、
+	// 纯写入调用、只含图片块的 content），把那些当成未应答会让下一轮报 409。
+	Answered bool `json:"answered"`
 }
 type agentLedger struct {
 	Completed           []toolEvidence `json:"completed"`
@@ -137,6 +141,14 @@ func buildAgentLedger(messages []oaiMsg) agentLedger {
 			if e, ok := calls[m.ToolCallID]; ok {
 				raw := contentToString(m.Content)
 				e.Result = compactToolResult(raw, 4000)
+				// 收到 tool 消息这件事本身就是「已应答」，与内容是否为空无关。
+				//
+				// 空结果在协议上完全合法：一条没有输出的命令、一次只做写入的调用、
+				// 或者 content 里只有非文本块（图片）都会得到空串。早先仅以
+				// Result == "" 判定 Pending，于是这些调用被当成从未返回，下一轮
+				// CanContinue 直接抛 409 "pending tool results must be returned
+				// before another turn" —— 而客户端明明已经返回了。
+				e.Answered = true
 				e.Failed = toolResultLooksFailed(e.Name, raw)
 				calls[m.ToolCallID] = e
 			}
@@ -154,7 +166,7 @@ func buildAgentLedger(messages []oaiMsg) agentLedger {
 			l.RepeatedCall = true
 			l.RepetitionSignature = sig
 		}
-		if e.Result == "" {
+		if !e.Answered {
 			l.Pending = append(l.Pending, e)
 		} else {
 			l.Completed = append(l.Completed, e)

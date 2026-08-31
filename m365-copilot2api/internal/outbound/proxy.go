@@ -350,6 +350,28 @@ func HTTPClient() *http.Client {
 	}
 	return c
 }
+
+// PickRawURL returns the pool's currently preferred exit, or "" to dial directly.
+//
+// It does not promise a live exit: pick() returns the best entry of whatever the
+// pool holds, which can be an evicted or cooling one when nothing better exists.
+// Callers that need a genuinely healthy exit must check it themselves.
+//
+// It is also deterministic for a given pool state — calling it twice in a row
+// yields the same exit. Anything that needs to *change* exits must walk
+// ProxyPoolRawURLs instead of calling this again and hoping for a different
+// answer.
+func PickRawURL() string {
+	p := CurrentPool()
+	if p == nil {
+		return ""
+	}
+	entry := p.pick()
+	if entry == nil {
+		return ""
+	}
+	return entry.raw
+}
 func WebSocketDialer() *websocket.Dialer {
 	clientsMu.RLock()
 	p, c := proxyPool, clients.WebSocket

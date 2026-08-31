@@ -1,7 +1,6 @@
 package outbound
 
 import (
-	"strings"
 	"bufio"
 	"context"
 	"crypto/rand"
@@ -13,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 )
@@ -293,10 +293,32 @@ func logProbe(raw string, result probeResult) {
 		redactProxy(raw), result.l2Code, result.wsCode, result.l2Latency)
 }
 
-// checkAllBudget is the wall clock a manual "check every exit" run may take. It
-// exists so the admin handler returns on a predictable schedule instead of being
-// bounded only by the slowest exit in the pool.
-const checkAllBudget = 30 * time.Second
+// checkAllMaxBudget 是手工检查的墙钟上限，保证管理端接口在可预期的时间内返回，
+// 而不是被池里最慢的那个出口拖住。
+const checkAllMaxBudget = 3 * time.Minute
+
+// checkAllBudget 按「需要几轮」推算这次手工检查的墙钟预算。
+//
+// 这里原本是一个写死的 30s。而单轮探测需要 probeRoundBudget(10s) = 35s —— 父预算
+// 比子预算还小，于是父超时永远先到，每一次手工检查都会把探测中途掐断。配合
+// applyProbe 当时的无条件记录，那些「网关自己超时」被记成了出口的真实失败：实测
+// 1207 条失败里有 396 条是 context deadline exceeded/canceled，占 32%。
+// consecutiveFailures 不随时间衰减，攒够 3 次就永久驱逐，于是池子单向棘轮到底。
+//
+// 预算至少要装得下一整轮，否则连一个出口都探不完。上限仍然存在，只是被截断的探测
+// 现在不再计为失败（见 CheckSelected 里的 ctx.Err() 判断）。
+func checkAllBudget(targets, concurrency int) time.Duration {
+	round := probeRoundBudget(defaultProbeTimeout)
+	if targets <= 0 || concurrency <= 0 {
+		return round
+	}
+	waves := (targets + concurrency - 1) / concurrency
+	total := round * time.Duration(waves)
+	if total > checkAllMaxBudget {
+		return checkAllMaxBudget
+	}
+	return total
+}
 
 // checkAllMaxConcurrency 是手工检查的并发上限。后台守护刻意保守（默认 6）以
 // 免持续压微软，但手工检查是一次性的前台操作，用户在等结果，所以放宽。
@@ -315,14 +337,12 @@ func (p *Pool) CheckAll(ctx context.Context) []map[string]any {
 //   - 每次加一个 IP 都把池里所有老 IP 重新探一遍（用户可见的「触发老IP重新检测」）；
 //   - 30s 总预算被老出口占满，新出口常常轮不到，列表里反而没有状态；
 //   - 池子越大越慢。
+//
 // 按 id 定向探测把这三件事一起解决：只探新加的那几个。
 func (p *Pool) CheckSelected(ctx context.Context, ids []string) []map[string]any {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	ctx, cancelAll := context.WithTimeout(ctx, checkAllBudget)
-	defer cancelAll()
-
 	wanted := make(map[string]struct{}, len(ids))
 	for _, id := range ids {
 		if id = strings.TrimSpace(id); id != "" {
@@ -353,6 +373,11 @@ func (p *Pool) CheckSelected(ctx context.Context, ids []string) []map[string]any
 		}
 		limit = n
 	}
+	// 预算要在知道目标数和并发数之后才能算，所以 ctx 在这里才建立 —— 早于此处
+	// 无法判断这次检查需要几轮。
+	ctx, cancelAll := context.WithTimeout(ctx, checkAllBudget(len(targets), limit))
+	defer cancelAll()
+
 	semaphore := make(chan struct{}, limit)
 	var wg sync.WaitGroup
 	for _, entry := range targets {
@@ -368,6 +393,15 @@ func (p *Pool) CheckSelected(ctx context.Context, ids []string) []map[string]any
 			probeCtx, cancel := context.WithTimeout(ctx, probeRoundBudget(defaultProbeTimeout))
 			defer cancel()
 			result := probeExit(probeCtx, tunnelDialer(e.clients), defaultProbeTimeout)
+			// 父预算耗尽时探测会被中途掐断，那是网关自己的超时，不是出口的失败。
+			// 记下去会让 consecutiveFailures 累加，3 次就永久驱逐一个可能完全健康
+			// 的出口 —— 而这条路径此前是无条件记录的，实测 32% 的失败都由它产生。
+			// 出口自己的 35s 单轮超时仍然照常计为失败，那确实是它太慢。
+			if !result.pass && ctx.Err() != nil {
+				log.Printf("proxy probe abandoned proxy=%s reason=%v (gateway budget, not counted as a failure)",
+					RedactProxyURL(e.raw), ctx.Err())
+				return
+			}
 			p.applyProbe(e, result, time.Now(), timing)
 			logProbe(e.raw, result)
 		}(entry)

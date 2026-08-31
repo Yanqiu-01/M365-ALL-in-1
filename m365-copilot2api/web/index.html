@@ -555,6 +555,15 @@ code,kbd,pre,samp,.mono{font-family:var(--font-mono)}
 .card-note{font-size:var(--fs-caption);color:var(--muted)}
 .card-head-actions{display:flex;align-items:center;gap:var(--sp-2);flex-wrap:wrap}
 .card-body{padding:var(--sp-5)}
+/* 可折叠卡片：标题行整体可点。折叠只隐藏 .card-body，卡片本身、内部按钮与
+   既有 JS 函数一律保留，展开后行为与折叠前完全一致。 */
+.card.is-collapsible>.card-head{cursor:pointer;user-select:none}
+.card.is-collapsed>.card-body{display:none}
+.card-collapse-btn{background:none;border:0;padding:var(--sp-1);color:var(--muted);
+  cursor:pointer;display:inline-flex;align-items:center;border-radius:var(--r-sm)}
+.card-collapse-btn:hover{color:var(--text)}
+.card-collapse-btn .ico{transition:transform .15s ease}
+.card.is-collapsed .card-collapse-btn .ico{transform:rotate(-90deg)}
 /* 卡内小节眉标 */
 .card-section-label{font-size:var(--fs-sm);font-weight:var(--fw-semi);color:var(--muted);
   margin-bottom:var(--sp-3);text-transform:uppercase;letter-spacing:var(--tr-wide)}
@@ -988,6 +997,11 @@ textarea.form-input{min-height:80px;line-height:var(--lh-normal);resize:vertical
   cursor:pointer;font-family:inherit;padding:var(--sp-1) var(--sp-2);border-radius:6px;
   transition:color var(--dur-fast) ease,background var(--dur-fast) ease}
 .term-clear:hover{color:#fff;background:rgba(255,255,255,0.08)}
+.reg-frame{height:min(70vh,640px);min-height:420px;margin-top:var(--sp-3);
+  border:1px solid var(--line);border-radius:var(--radius-sm);background:#fff;
+  overflow:hidden;position:relative}
+.reg-frame-hint{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+  color:var(--muted);font-size:var(--fs-sm);padding:var(--sp-4);text-align:center;pointer-events:none}
 .term-body{height:260px;overflow-y:auto;padding:var(--sp-3);
   font-size:var(--fs-sm);line-height:var(--lh-relaxed);color:var(--term-text)}
 .term-body div{white-space:pre-wrap;word-break:break-all}
@@ -1094,6 +1108,9 @@ textarea.form-input{min-height:80px;line-height:var(--lh-normal);resize:vertical
 /* 关键指标卡：仪表盘首屏主层级，比 .stat 更重（图标 + 大数 + 副值） */
 .kpi{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:var(--sp-3);
   margin-bottom:var(--sp-4)}
+.kpi.kpi-stack{grid-template-columns:1fr}
+details.card>summary{display:flex;align-items:center;justify-content:space-between;gap:var(--sp-2)}
+details.card>summary::-webkit-details-marker{display:none}
 .kpi-card{background:var(--surface);
   -webkit-backdrop-filter:blur(calc(var(--glass-blur) * 1.5)) saturate(180%);backdrop-filter:blur(calc(var(--glass-blur) * 1.5)) saturate(180%);
   border:1px solid var(--surface-border);border-radius:var(--radius);
@@ -1386,6 +1403,7 @@ textarea.form-input{min-height:80px;line-height:var(--lh-normal);resize:vertical
 
   /* 合并后的仪表盘 KPI 降两列 */
   .kpi{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .kpi.kpi-stack{grid-template-columns:1fr}
   /* 对话：列表铺满，详情升为全屏覆盖层，靠返回按钮回列表 */
   .conv-split{grid-template-columns:1fr}
   .conv-list-body{max-height:none}
@@ -1480,6 +1498,7 @@ textarea.form-input{min-height:80px;line-height:var(--lh-normal);resize:vertical
 
   .kpi{grid-template-columns:repeat(2,minmax(0,1fr));gap:var(--sp-2);
     margin-bottom:var(--sp-3)}
+  .kpi.kpi-stack{grid-template-columns:1fr}
   .kpi-card{padding:var(--sp-3);gap:var(--sp-2)}
   .kpi-ico{width:30px;height:30px}
   .kpi-value{font-size:calc(21px * var(--fs-scale))}
@@ -1814,7 +1833,7 @@ textarea.form-input{min-height:80px;line-height:var(--lh-normal);resize:vertical
       <button type="button" data-page="settings" onclick="showPage('settings')"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M9.671 4.136a2.34 2.34 0 0 1 4.659 0 2.34 2.34 0 0 0 3.319 1.915 2.34 2.34 0 0 1 2.33 4.033 2.34 2.34 0 0 0 0 3.831 2.34 2.34 0 0 1-2.33 4.033 2.34 2.34 0 0 0-3.319 1.915 2.34 2.34 0 0 1-4.659 0 2.34 2.34 0 0 0-3.32-1.915 2.34 2.34 0 0 1-2.33-4.033 2.34 2.34 0 0 0 0-3.831A2.34 2.34 0 0 1 6.35 6.051a2.34 2.34 0 0 0 3.319-1.915"/> <circle cx="12" cy="12" r="3"/></svg><span>设置</span></button>
     </nav>
 
-    <div class="sidebar-foot">v0.2.0</div>
+    <div class="sidebar-foot">v3.0.1</div>
   </aside>
 
   <main class="main">
@@ -1826,6 +1845,7 @@ textarea.form-input{min-height:80px;line-height:var(--lh-normal);resize:vertical
       </div>
       <div class="topbar-right">
         <span class="topbar-status"><span class="status-dot" aria-hidden="true"></span> 运行中</span>
+        <button type="button" class="btn" onclick="refreshCurrentPage()"><svg class="ico ico-sm" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/> <path d="M3 3v5h5"/></svg> 刷新</button>
         <button type="button" class="btn" onclick="logout()"><svg class="ico ico-sm" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="m16 17 5-5-5-5"/> <path d="M21 12H9"/> <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/></svg> 退出</button>
       </div>
     </header>
@@ -2021,6 +2041,7 @@ if (response.output_text) {
             <p class="page-sub">授权和管理 Microsoft 账号</p>
           </div>
           <div class="page-head-actions">
+            <button type="button" class="btn" onclick="location.href='/panel'"><svg class="ico ico-sm" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M3 3v18h18"/><path d="M7 15h3v3H7zM12 10h3v8h-3zM17 6h3v12h-3z"/></svg> 账号池与贡献账本</button>
             <button type="button" class="btn primary" id="runScriptsBtn" onclick="openRunScripts()"><svg class="ico ico-sm" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M4 14a1 1 0 0 1-.78-1.63l9.9-10.2a.5.5 0 0 1 .86.46l-1.92 6.02A1 1 0 0 0 13 10h7a1 1 0 0 1 .78 1.63l-9.9 10.2a.5.5 0 0 1-.86-.46l1.92-6.02A1 1 0 0 0 11 14z"/></svg> 账密一键回调</button>
           </div>
         </div>
@@ -2047,7 +2068,31 @@ if (response.output_text) {
                 </div>
               </div>
             </div>
+            <div class="form-group" style="margin-top:var(--sp-3)">
+              <label class="form-label" for="rsAccountList">批量账号列表</label>
+              <textarea class="form-input" id="rsAccountList" rows="6" spellcheck="false" autocomplete="off" placeholder="每行一个账号,格式:账号----密码"></textarea>
+              <div class="btn-row" style="margin-top:var(--sp-2)">
+                <label class="btn" for="rsAccountFile" role="button">选择 .txt 文件</label>
+                <input id="rsAccountFile" type="file" accept=".txt,text/plain" onchange="loadRunScriptsAccountFile(this)" hidden>
+                <span class="form-hint" id="rsAccountFileHint">也可直接粘贴多行账号；空行会自动忽略</span>
+              </div>
+            </div>
             <p class="field-err" id="rsErr" hidden></p>
+            <!-- 批量回调：一行一个 账号----密码。分隔符与 native_panel.go 的
+                 凭据清单解析（strings.Cut(line,"----")）以及 credential_sync.go
+                 的 cred_file 格式一致，因此同一份 credentials.txt 可直接粘贴或导入。 -->
+            <div class="form-group" style="margin-top:var(--sp-3)">
+              <label class="form-label" for="rsBulk">批量列表（每行 <code>账号----密码</code>）</label>
+              <textarea class="form-input" id="rsBulk" rows="4" spellcheck="false" autocomplete="off"
+                        placeholder="user1@contoso.onmicrosoft.com----Password1&#10;user2@contoso.onmicrosoft.com----Password2"
+                        oninput="renderBulkSummary()"></textarea>
+              <div class="btn-row" style="margin-top:var(--sp-2)">
+                <button type="button" class="btn" id="rsBulkPick" onclick="$('rsBulkFile').click()">导入 .txt</button>
+                <button type="button" class="btn" onclick="clearBulk()">清空列表</button>
+                <span class="form-hint" id="rsBulkSummary" aria-live="polite"></span>
+              </div>
+              <input type="file" id="rsBulkFile" accept=".txt,text/plain" hidden onchange="importBulkFile(event)">
+            </div>
             <div class="btn-row">
               <button type="button" class="btn primary" id="rsSubmit" onclick="submitRunScripts()"><svg class="ico ico-sm" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M4 14a1 1 0 0 1-.78-1.63l9.9-10.2a.5.5 0 0 1 .86.46l-1.92 6.02A1 1 0 0 0 13 10h7a1 1 0 0 1 .78 1.63l-9.9 10.2a.5.5 0 0 1-.86-.46l1.92-6.02A1 1 0 0 0 11 14z"/></svg> 运行脚本并回调</button>
               <button type="button" class="btn" id="credSyncBtn" onclick="syncCredentials()">从账密清单补齐</button>
@@ -2058,8 +2103,16 @@ if (response.output_text) {
             <div id="rsProgress" style="margin-top:var(--sp-3)" aria-live="polite"></div>
           </div>
         </div>
-        <div class="card">
-          <div class="card-head"><h3 class="card-title">添加账号</h3></div>
+        <!-- 「添加账号」默认收起（按用户要求）。手动 OAuth、回调地址提交与
+             重置授权状态全部保留，点标题行即可展开。 -->
+        <div class="card is-collapsible is-collapsed" id="addAccountCard">
+          <div class="card-head" onclick="toggleCardCollapse('addAccountCard')">
+            <h3 class="card-title">添加账号</h3>
+            <button type="button" class="card-collapse-btn" id="addAccountToggle"
+                    aria-controls="addAccountCard" aria-expanded="false" aria-label="展开添加账号">
+              <svg class="ico ico-sm" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="m6 9 6 6 6-6"/></svg>
+            </button>
+          </div>
           <div class="card-body">
             <div class="onb-steps" style="margin-bottom:var(--sp-4)">
               <div class="onb-step" style="cursor:default">
@@ -2097,75 +2150,55 @@ if (response.output_text) {
           </div>
         </div>
         
-<!-- ================= 注册与批量授权（代理到 M365 面板 8555） ================= -->
 <div class="card">
   <div class="card-head"><h3 class="card-title">注册新账号</h3><span class="card-note" id="panelRegState"></span></div>
   <div class="card-body">
-    <p class="form-hint" style="margin-bottom:var(--sp-2)">调用本地 M365 面板(127.0.0.1:8555)的注册脚本，在 office.965007.xyz 上自动创建 M365 账号。需要面板进程在运行。</p>
+    <p class="form-hint" style="margin-bottom:var(--sp-2)">点开始注册后，下面这块会嵌进注册站：自动填账密、过验证、提交。成功后写入本地账密并去微软拿 OAuth。返回键只取消当前这次。</p>
+    <div class="form-row">
+      <div class="form-group"><label class="form-label" for="regSiteUrl">注册站点</label>
+        <input class="form-input" id="regSiteUrl" type="url" placeholder="https://office.965007.xyz"></div>
+      <div class="form-group"><label class="form-label" for="regEmailDomain">邮箱域名</label>
+        <input class="form-input" id="regEmailDomain" placeholder="office.bo.edu.kg"></div>
+    </div>
+    <div class="form-row">
+      <div class="form-group"><label class="form-label" for="regFlareSolverr">FlareSolverr</label>
+        <input class="form-input" id="regFlareSolverr" type="url" placeholder="http://127.0.0.1:8191/v1"></div>
+    </div>
+    <div class="form-row">
+      <div class="form-group"><label class="form-label" for="regEmailPrefix">邮箱前缀</label>
+        <input class="form-input" id="regEmailPrefix" placeholder="24s05"></div>
+      <div class="form-group"><label class="form-label" for="regPassword">统一密码</label>
+        <input class="form-input" id="regPassword" type="password" autocomplete="new-password" placeholder="注册账号密码"></div>
+    </div>
+    <div class="btn-row" style="margin-bottom:var(--sp-3)">
+      <button type="button" class="btn" onclick="saveRegisterConfig()">保存注册配置</button>
+    </div>
     <div style="display:flex;gap:var(--sp-3);flex-wrap:wrap;align-items:flex-end">
-      <div class="form-group" style="margin:0;min-width:130px">
-        <label class="form-label" for="regMode">注册模式</label>
-        <select class="form-input" id="regMode"><option value="phone">手机流量换IP</option><option value="clash">Clash 机场轮换</option><option value="proxy">代理池并发</option></select>
-      </div>
-      <div class="form-group" style="margin:0;width:110px">
-        <label class="form-label" for="regStartNum">起始邮箱编号</label>
-        <input class="form-input" id="regStartNum" type="number" min="1" placeholder="如 5026" oninput="renderRegRange()">
-      </div>
-      <div class="form-group" style="margin:0;width:110px">
-        <label class="form-label" for="regEndNum">结束邮箱编号</label>
-        <input class="form-input" id="regEndNum" type="number" min="1" placeholder="如 5100" oninput="renderRegRange()">
-      </div>
-      <div class="form-group" style="margin:0;width:80px">
-        <label class="form-label" for="regCount">数量</label>
-        <input class="form-input" id="regCount" type="number" min="1" max="1000" value="5" oninput="renderRegRange()">
-      </div>
-      <div class="form-group" style="margin:0;width:90px" id="regConcWrap" hidden>
-        <label class="form-label" for="regConc">并发数</label>
-        <input class="form-input" id="regConc" type="number" min="1" max="16" value="3">
-      </div>
+      <div class="form-group" style="margin:0;min-width:130px"><label class="form-label" for="regMode">注册模式</label>
+        <select class="form-input" id="regMode"><option value="proxy" selected>代理池</option><option value="phone">手机换IP</option><option value="clash">Clash 节点</option></select></div>
+      <div class="form-group" style="margin:0;width:110px"><label class="form-label" for="regStartNum">起始编号</label>
+        <input class="form-input" id="regStartNum" type="number" min="1" placeholder="5026"></div>
+      <div class="form-group" style="margin:0;width:80px"><label class="form-label" for="regCount">数量</label>
+        <input class="form-input" id="regCount" type="number" min="1" max="20" value="1"></div>
       <button type="button" class="btn primary" onclick="panelStartRegister()">开始注册</button>
-      <button type="button" class="btn danger" onclick="panelStopJob()">停止</button>
     </div>
-    <p class="form-hint" id="regRangeHint" aria-live="polite" style="margin-top:var(--sp-2)">填入起始编号后这里会显示实际账号区间。</p>
-    <p class="field-err" id="regRangeErr" hidden></p>
-    <div class="term" id="panelTermBox" hidden style="margin-top:var(--sp-3)">
-      <div class="term-head"><span class="term-dot red"></span><span class="term-dot yellow"></span><span class="term-dot green"></span><span class="term-title" id="panelTermTitle">panel — m365</span><button type="button" class="term-clear" onclick="$('panelTermBody').innerHTML=''">清空</button></div>
-      <div class="term-body" id="panelTermBody" role="log" aria-live="polite"></div>
-    </div>
+    <p class="form-hint" id="regResult" aria-live="polite" style="margin-top:var(--sp-2)"></p>
+    <div class="reg-frame" id="regFrame"><div class="reg-frame-hint">开始注册后，注册站会出现在这里</div></div>
   </div>
 </div>
-
 <div class="card">
   <div class="card-head"><h3 class="card-title">批量 OAuth 授权导入</h3></div>
   <div class="card-body">
-    <p class="form-hint" style="margin-bottom:var(--sp-2)">对已注册但尚未授权的账号执行浏览器 OAuth，写入当前网关账号池。单个账号用上方「开始授权」即可。</p>
-    <div style="display:flex;gap:var(--sp-3);flex-wrap:wrap;align-items:flex-end;margin-bottom:var(--sp-3)">
-      <div class="form-group" style="margin:0;flex:1;min-width:200px">
-        <label class="form-label" for="oauthSingleEmail">单账号邮箱</label>
-        <input class="form-input" id="oauthSingleEmail" placeholder="例如 24s055001@office.bo.edu.kg">
-      </div>
-      <button type="button" class="btn primary" onclick="panelStartOauthSingle()">授权导入</button>
-    </div>
-    <div class="card-section-label">按邮箱编号批量授权</div>
+    <p class="form-hint" style="margin-bottom:var(--sp-2)">对账密清单里的账号走 Go 内置授权：先 ROPC，被拒再发设备码，仍不行才打开 PKCE 登录页。不再调用 Python / Playwright。</p>
     <div style="display:flex;gap:var(--sp-3);flex-wrap:wrap;align-items:flex-end">
-      <div class="form-group" style="margin:0;width:110px"><label class="form-label" for="oauthStartNum">起始邮箱编号</label><input class="form-input" id="oauthStartNum" type="number" min="1" placeholder="如 5026" oninput="renderOauthRange()"></div>
-      <div class="form-group" style="margin:0;width:110px"><label class="form-label" for="oauthEndNum">结束邮箱编号</label><input class="form-input" id="oauthEndNum" type="number" min="1" placeholder="如 5100" oninput="renderOauthRange()"></div>
-      <div class="form-group" style="margin:0;width:80px"><label class="form-label" for="oauthBatchConc">并发数</label><input class="form-input" id="oauthBatchConc" type="number" min="1" max="64" value="5"></div>
-      <div class="form-group" style="margin:0;width:100px"><label class="form-label" for="oauthBatchTimeout">超时(s)</label><input class="form-input" id="oauthBatchTimeout" type="number" min="60" max="900" value="300"></div>
-      <label style="display:flex;align-items:center;gap:4px;font-size:13px"><input type="checkbox" id="oauthBatchResume">续传</label>
-      <button type="button" class="btn primary" onclick="panelStartOauthBatch(true)">并发批量 OAuth</button>
-      <button type="button" class="btn" onclick="panelStartOauthBatch(false)">串行批量</button>
+      <div class="form-group" style="margin:0;width:110px"><label class="form-label" for="oauthStartNum">起始编号</label>
+        <input class="form-input" id="oauthStartNum" type="number" min="1" placeholder="5026"></div>
+      <div class="form-group" style="margin:0;width:110px"><label class="form-label" for="oauthEndNum">结束编号</label>
+        <input class="form-input" id="oauthEndNum" type="number" min="1" placeholder="5100"></div>
+      <label style="display:flex;align-items:center;gap:4px;font-size:13px"><input type="checkbox" id="oauthBatchResume" checked>跳过已在线账号</label>
+      <button type="button" class="btn primary" onclick="panelStartOauthBatch()">开始批量授权</button>
     </div>
-    <p class="form-hint" id="oauthRangeHint" aria-live="polite" style="margin-top:var(--sp-2)">填入起始编号后这里会显示实际账号区间。</p>
-    <p class="field-err" id="oauthRangeErr" hidden></p>
-    <details style="margin-top:var(--sp-2)">
-      <summary class="form-hint" style="cursor:pointer">兼容选项（按序号，旧方式）</summary>
-      <div style="display:flex;gap:var(--sp-3);flex-wrap:wrap;align-items:flex-end;margin-top:var(--sp-2)">
-        <div class="form-group" style="margin:0;width:90px"><label class="form-label" for="oauthBatchStart">起始序号</label><input class="form-input" id="oauthBatchStart" type="number" min="1" value="1"></div>
-        <div class="form-group" style="margin:0;width:120px"><label class="form-label" for="oauthBatchLimit">数量上限(0=全部)</label><input class="form-input" id="oauthBatchLimit" type="number" min="0" value="0"></div>
-      </div>
-      <p class="form-hint">序号是账密清单里的位置，不是邮箱编号；填了上面的编号区间时本节被忽略。</p>
-    </details>
+    <p class="form-hint" id="oauthBatchResult" aria-live="polite" style="margin-top:var(--sp-2)"></p>
   </div>
 </div>
 <div class="card">
@@ -2187,13 +2220,14 @@ if (response.output_text) {
                 <option value="100">每页 100 条</option>
               </select>
               <button type="button" class="btn btn-sm" id="acctRefreshAll" onclick="refreshAllAccounts()">一键刷新令牌</button>
+              <button type="button" class="btn btn-sm danger" id="acctDeleteSelected" onclick="deleteSelectedAccounts()" disabled>删除所选账号</button>
             </div>
           </div>
           <div class="table-wrap">
             <table class="table">
               <caption class="sr-only">已授权的 Microsoft 账号列表</caption>
-              <thead><tr><th scope="col">账号</th><th scope="col">状态</th><th scope="col">账密</th><th scope="col">更新时间</th><th scope="col" class="actions">操作</th></tr></thead>
-              <tbody id="accountRows"><tr aria-hidden="true"><td><span class="skel-row"><span class="skel circle"></span><span class="skel w-60"></span></span></td><td><span class="skel w-40"></span></td><td><span class="skel w-30"></span></td><td><span class="skel w-70"></span></td><td><span class="skel w-30"></span></td></tr></tbody>
+              <thead><tr><th scope="col"><input id="accountSelectAll" type="checkbox" onchange="toggleAllVisibleAccounts(this.checked)" aria-label="选择当前页全部账号"></th><th scope="col">账号</th><th scope="col">状态</th><th scope="col">账密</th><th scope="col">更新时间</th><th scope="col" class="actions">操作</th></tr></thead>
+              <tbody id="accountRows"><tr aria-hidden="true"><td><span class="skel w-30"></span></td><td><span class="skel-row"><span class="skel circle"></span><span class="skel w-60"></span></span></td><td><span class="skel w-40"></span></td><td><span class="skel w-30"></span></td><td><span class="skel w-70"></span></td><td><span class="skel w-30"></span></td><td><span class="skel w-30"></span></td></tr></tbody>
             </table>
           </div>
           <div class="pagination">
@@ -2247,8 +2281,9 @@ if (response.output_text) {
             <span class="term-dot red" aria-hidden="true"></span><span class="term-dot yellow" aria-hidden="true"></span><span class="term-dot green" aria-hidden="true"></span>
             <span class="term-title" id="termTitle">cleanup — m365-copilot2api</span>
             <button type="button" class="term-clear" onclick="termClear()">清空</button>
+            <button type="button" class="term-clear" onclick="termClose()">关闭</button>
           </div>
-          <div class="term-body" id="termBody" role="log" aria-live="polite" aria-label="清理日志" tabindex="0"></div>
+          <div class="term-body" id="termBody" role="log" aria-live="polite" aria-label="运行日志" tabindex="0"></div>
         </div>
         <!-- 左列表 / 右详情双栏；<900px 详情转为全屏覆盖，靠返回键回列表 -->
         <div class="conv-split">
@@ -2286,7 +2321,7 @@ if (response.output_text) {
         </div>
         <!-- 置顶实时指标：TPM 为尾随 60 秒窗口的真实速率，并发为当前在途请求数。
              数据来自 /api/admin/live-metrics；端点缺失时显示 --，不影响下方表格。 -->
-        <div class="kpi" aria-live="polite">
+        <div class="kpi kpi-stack" aria-live="polite">
           <div class="kpi-card">
             <span class="kpi-ico"><svg class="ico ico-lg" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M12 2v20"/> <path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg></span>
             <span class="kpi-main">
@@ -2371,29 +2406,30 @@ if (response.output_text) {
           </div>
         </div>
         <div class="card">
-          <div class="card-head"><h3 class="card-title">免费节点拉取</h3><span class="badge info">质量守护</span></div>
+          <div class="card-head"><h3 class="card-title">M365 代理猎手</h3><span class="badge info">CONNECT · TLS · ChatHub</span></div>
           <div class="card-body">
-            <label class="form-label" for="proxyFreeSourceURL">来源 URL（纯文本或 HTML 表格页均可）</label>
-            <input class="form-input" id="proxyFreeSourceURL" type="url" inputmode="url" autocomplete="off" placeholder="https://www.kuaidaili.com/free/inha/">
+            <p class="form-hint" style="margin-bottom:var(--sp-3)">内置代理猎手：抓取公开来源，识别 HTTP/HTTPS/SOCKS5，并用与独立猎手相同的质量门（登录面 + 业务域 + ChatHub Upgrade）筛选后入池。</p>
+            <label class="form-label" for="proxyHunterSources">来源网址（一行一个，可改）</label>
+            <textarea class="form-input" id="proxyHunterSources" rows="6"></textarea>
             <div class="form-row" style="margin-top:var(--sp-3)">
               <div class="form-group">
-                <label class="form-label" for="proxyFreeScheme">兜底协议（仅当某行没写协议时使用）</label>
-                <select class="form-input" id="proxyFreeScheme"><option value="http">HTTP</option><option value="https">HTTPS</option><option value="socks5">SOCKS5</option></select>
+                <label class="form-label" for="proxyHunterScheme">兜底协议</label>
+                <select class="form-input" id="proxyHunterScheme"><option value="http">HTTP</option><option value="https">HTTPS</option><option value="socks5">SOCKS5</option></select>
               </div>
               <div class="form-group">
-                <label class="form-label" for="proxyFreeLimit">本次质量筛选上限</label>
-                <input class="form-input" id="proxyFreeLimit" type="number" min="1" max="200" value="50">
+                <label class="form-label" for="proxyHunterLimit">探测上限</label>
+                <input class="form-input" id="proxyHunterLimit" type="number" min="1" max="200" value="80">
               </div>
               <div class="form-group">
-                <label class="form-label" for="proxyFreePages">抓取页数</label>
-                <input class="form-input" id="proxyFreePages" type="number" min="1" max="500" value="20">
+                <label class="form-label" for="proxyHunterPages">每源抓取页数</label>
+                <input class="form-input" id="proxyHunterPages" type="number" min="1" max="40" value="3">
               </div>
             </div>
             <div class="btn-row">
-              <button type="button" class="btn primary" id="proxyFreeImportBtn" onclick="proxyFreeImport()">拉取并质量筛选导入</button>
+              <button type="button" class="btn" onclick="saveHunterSources()">保存来源</button>
+              <button type="button" class="btn primary" id="proxyHunterBtn" onclick="proxyHunterImport()">开始猎取并导入</button>
             </div>
-            <p class="form-hint" style="margin-top:var(--sp-2)">支持三种排布：<code>HTTP 1.2.3.4 80</code>（协议/IP/端口分列，购买的 IP 与快代理等表格页即此形态）、<code>1.2.3.4:8080</code>、<code>socks5://1.2.3.4:1080</code>。HTML 表格会自动剥标签、忽略表头，每行以该行自带的协议为准。</p>
-            <p class="form-hint">仅接受公网地址；去重后逐个以 M365 登录面探测，失败节点不会入池。快代理这类站点<strong>每页只有 12 条</strong>，产量由「抓取页数」决定 —— 实测 40 页可得约 2000 条候选。这类站点按来源 IP 限流，所以抓取是串行的（约 2.5 秒/页，40 页约 4 分半），页数越多越慢；被限流的页会自动退避重试。「筛选上限」限制的是实际探测条数（最多 200），探测比抓取慢得多，建议先小后大。</p>
+            <p class="form-hint" style="margin-top:var(--sp-2)">失败节点不会入池。来源站点常按 IP 限流，页数越大越慢。</p>
           </div>
         </div>
         <div class="card">
@@ -2422,6 +2458,25 @@ if (response.output_text) {
 
       <!-- ================= 能力评测 ================= -->
       <section id="page-benchmark" hidden>
+        <div class="card"><div class="card-body">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:var(--sp-3);gap:var(--sp-3);flex-wrap:wrap">
+            <div>
+              <b style="font-size:var(--fs-base)">可用性探测</b>
+              <p class="form-hint" style="margin-top:2px">对每个模型发一条最小请求，并发验证可用性</p>
+            </div>
+            <button type="button" class="btn" id="modelTestAllBtn" onclick="modelTestAll()"><svg class="ico ico-sm" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M14 2v6a2 2 0 0 0 .245.96l5.51 10.08A2 2 0 0 1 18 22H6a2 2 0 0 1-1.755-2.96l5.51-10.08A2 2 0 0 0 10 8V2"/> <path d="M6.453 15h11.094"/> <path d="M8.5 2h7"/></svg> 探测全部</button>
+          </div>
+          <div class="table-wrap">
+            <table class="table compact">
+              <caption class="sr-only">模型可用性探测结果</caption>
+              <thead><tr><th scope="col">模型</th><th scope="col">状态</th><th scope="col" class="num">耗时</th><th scope="col">回复</th></tr></thead>
+              <tbody id="modelTestRows"><tr aria-hidden="true"><td><span class="skel w-60"></span></td><td><span class="skel w-30"></span></td><td><span class="skel w-30"></span></td><td><span class="skel w-70"></span></td></tr></tbody>
+            </table>
+          </div>
+        </div></div>
+        <details class="card" id="benchDetails">
+        <summary class="card-head" style="cursor:pointer;list-style:none"><h3 class="card-title">能力评测（默认收起）</h3><span class="card-note">后端仍保留，点开后运行</span></summary>
+        <div class="card-body">
         <div class="page-head">
           <div>
             <h2 class="page-title">能力评测</h2>
@@ -2454,26 +2509,13 @@ if (response.output_text) {
           <p class="bench-split" id="benchSplit"></p>
           <div class="bench-tasks" id="benchTasks" aria-live="polite"></div>
         </div></div>
-        <div class="card"><div class="card-body">
-          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:var(--sp-3);gap:var(--sp-3);flex-wrap:wrap">
-            <div>
-              <b style="font-size:var(--fs-base)">可用性探测</b>
-              <p class="form-hint" style="margin-top:2px">对每个模型发一条最小请求，并发验证可用性</p>
-            </div>
-            <button type="button" class="btn" id="modelTestAllBtn" onclick="modelTestAll()"><svg class="ico ico-sm" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M14 2v6a2 2 0 0 0 .245.96l5.51 10.08A2 2 0 0 1 18 22H6a2 2 0 0 1-1.755-2.96l5.51-10.08A2 2 0 0 0 10 8V2"/> <path d="M6.453 15h11.094"/> <path d="M8.5 2h7"/></svg> 探测全部</button>
-          </div>
-          <div class="table-wrap">
-            <table class="table compact">
-              <caption class="sr-only">模型可用性探测结果</caption>
-              <thead><tr><th scope="col">模型</th><th scope="col">状态</th><th scope="col" class="num">耗时</th><th scope="col">回复</th></tr></thead>
-              <tbody id="modelTestRows"><tr aria-hidden="true"><td><span class="skel w-60"></span></td><td><span class="skel w-30"></span></td><td><span class="skel w-30"></span></td><td><span class="skel w-70"></span></td></tr></tbody>
-            </table>
-          </div>
-        </div></div>
+
         <div class="card"><div class="card-body">
           <b style="font-size:var(--fs-base)">运行日志</b>
           <pre class="log-pre" id="benchLog" tabindex="0" aria-label="评测运行日志">开始评测后显示每一步工具调用。</pre>
         </div></div>
+        </div>
+        </details>
       </section>
 
       <!-- ================= 设置 ================= -->
@@ -2482,6 +2524,17 @@ if (response.output_text) {
           <div>
             <h2 class="page-title">设置</h2>
             <p class="page-sub">运行参数与诊断开关</p>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-head"><h3 class="card-title">设备与保活</h3><span class="card-note">原顶栏按钮已移到这里，避免挡住工作台</span></div>
+          <div class="card-body">
+            <p class="form-hint" style="margin-bottom:var(--sp-3)">保活、诊断和公网入口只在 Android 客户端生效。电脑浏览器上这些按钮没有对应的系统界面。</p>
+            <div class="btn-row" style="flex-wrap:wrap">
+              <button type="button" class="btn" onclick="nativeKeepAlive()">保活（忽略电池优化）</button>
+              <button type="button" class="btn" onclick="nativeOpenDiag()">诊断</button>
+              <button type="button" class="btn" onclick="nativeOpenTunnel()">公网</button>
+            </div>
           </div>
         </div>
         <!-- 外观：把原先硬编码在 CSS 里的三个旋钮（遮罩 / 卡片不透明度 /
@@ -2599,6 +2652,18 @@ if (response.output_text) {
           </div>
         </div>
 
+        <div class="card">
+          <div class="card-head"><h3 class="card-title">保底出口</h3><span class="card-note">池子全挂时走这一条</span></div>
+          <div class="card-body">
+            <label class="form-label" for="setFallbackProxy">保底 / 直连出口</label>
+            <input class="form-input" id="setFallbackProxy" placeholder="socks5://127.0.0.1:1080 或留空直连"
+                   oninput="this.dataset.edited='1'">
+            <p class="form-hint">对应 M365_OUTBOUND_PROXY。代理池全部不可用时回落到这里；留空则本机直连。</p>
+          </div>
+        </div>
+        <details class="card" id="advancedSettings">
+        <summary class="card-head" style="cursor:pointer;list-style:none"><h3 class="card-title">高级运行参数</h3><span class="card-note">默认收起</span></summary>
+        <div class="card-body">
         <div class="set-grid">
         <div class="card"><div class="card-body">
           <p class="card-section-label">即时生效</p>
@@ -2758,6 +2823,8 @@ if (response.output_text) {
         <div class="btn-row" style="margin-top:var(--sp-4)">
           <button type="button" class="btn primary" onclick="saveSettings()">保存设置</button>
         </div>
+        </div>
+        </details>
       </section>
     </div>
   </main>
@@ -3058,9 +3125,40 @@ function showPage(p){
   // 请求明细页：拉一次明细并启动实时指标轮询；离开该页时停轮询。
   if(p==='requests'){loadUsageLogs();startLiveMetrics();}else{stopLiveMetrics();}
   if(p==='conversations')loadConversations();
-  if(p==='proxies')loadProxies();
+  if(p==='proxies'){fillHunterSources();restoreHunterPrefs();loadProxies();}
   if(p==='benchmark'){loadBenchmark();loadModelTest();}
   if(p==='settings')loadSettings();
+  const box=$('termBox');
+  if(box && !box.hidden && box.parentElement && box.parentElement.id!=='page-'+p){
+    termClose();
+  }
+}
+function refreshCurrentPage(){
+  const active=document.querySelector('.nav button.active');
+  const page=active && active.dataset.page;
+  if(page) showPage(page);
+  else location.reload();
+}
+function nativeKeepAlive(){
+  if(window.M365Native && typeof window.M365Native.keepAlive==='function'){
+    window.M365Native.keepAlive();
+    return;
+  }
+  showNotice('请在系统设置里忽略电池优化，或使用 Android 客户端的保活入口','info');
+}
+function nativeOpenDiag(){
+  if(window.M365Native && typeof window.M365Native.openDiag==='function'){
+    window.M365Native.openDiag();
+    return;
+  }
+  location.href='/debug';
+}
+function nativeOpenTunnel(){
+  if(window.M365Native && typeof window.M365Native.openTunnel==='function'){
+    window.M365Native.openTunnel();
+    return;
+  }
+  showNotice('公网入口仅 Android 客户端提供','info');
 }
 
 async function loadSettings(){
@@ -3083,7 +3181,9 @@ async function loadSettings(){
     if($('setCapture'))$('setCapture').checked=!!s.captureRouterFrames;
     if($('setProfile'))$('setProfile').value=(s.clientProfile==='cli'||s.clientProfile==='claude'||s.clientProfile==='claude-cli'||s.clientProfile==='agent')?'cli':'office';
     // 新增运行参数。空值表示沿用内置默认，因此用 || '' 而不是填一个假的默认数字。
-    const setVal=(id,v)=>{ const el=$(id); if(el)el.value=(v===undefined||v===null||v===0||v==='')?'':v; };
+    // 程序化写入不算用户编辑：清掉 edited 标记，否则重新加载设置后直接保存，
+    // 会被当成「用户要把保底出口清空」而误删一个打码的代理。
+    const setVal=(id,v)=>{ const el=$(id); if(el){ el.value=(v===undefined||v===null||v===0||v==='')?'':v; delete el.dataset.edited; } };
     const setChk=(id,v)=>{ const el=$(id); if(el)el.checked=!!v; };
     setVal('setGuardInterval',s.proxyGuardInterval);
     setVal('setGuardConcurrency',s.proxyGuardConcurrency);
@@ -3097,6 +3197,7 @@ async function loadSettings(){
     setChk('setCleanupDisabled',s.autoCleanupDisabled);
     setVal('setPersistInterval',s.persistInterval);
     setChk('setHttpTraceVerbose',s.httpTraceVerbose);
+    setVal('setFallbackProxy', s.outboundProxy && s.outboundProxy.indexOf('***')>=0 ? '' : s.outboundProxy);
   }catch(e){showNotice(e.message,'error');}
 }
 
@@ -3135,6 +3236,10 @@ async function loadOnboarding(){
 
 async function api(path,opts={}){
   opts.headers={'Content-Type':'application/json',...(opts.headers||{})};
+  if(opts.timeoutMs&&!opts.signal){
+    opts.signal=AbortSignal.timeout(opts.timeoutMs);
+    delete opts.timeoutMs;
+  }
   const r=await fetch(path,opts);
   const t=await r.text();
   let d;try{d=t?JSON.parse(t):{}}catch{d={error:{message:t}}};
@@ -3215,6 +3320,33 @@ async function loadStats(){
 }
 
 let _accountsCache=[],_accountFilter='all';
+const _selectedAccountIds=new Set();
+function updateAccountSelectionUI(){
+  const btn=$('acctDeleteSelected');
+  if(btn){
+    btn.disabled=_selectedAccountIds.size===0;
+    btn.textContent=_selectedAccountIds.size?'删除所选账号 ('+_selectedAccountIds.size+')':'删除所选账号';
+  }
+  const all=$('accountSelectAll');
+  if(all){
+    const boxes=[...document.querySelectorAll('#accountRows input[data-account-id]')];
+    const checked=boxes.filter(x=>x.checked).length;
+    all.checked=boxes.length>0&&checked===boxes.length;
+    all.indeterminate=checked>0&&checked<boxes.length;
+  }
+}
+function toggleAccountSelected(id,checked){
+  if(!id)return;
+  if(checked)_selectedAccountIds.add(id);else _selectedAccountIds.delete(id);
+  updateAccountSelectionUI();
+}
+function toggleAllVisibleAccounts(checked){
+  document.querySelectorAll('#accountRows input[data-account-id]').forEach(box=>{
+    box.checked=checked;
+    if(checked)_selectedAccountIds.add(box.dataset.accountId);else _selectedAccountIds.delete(box.dataset.accountId);
+  });
+  updateAccountSelectionUI();
+}
 /* 分页只作用在「筛选 + 搜索之后」的结果集上；每页条数持久化。
    页码是 0-based，越界一律靠 renderAccounts() 里的钳制回收。 */
 const ACCT_PAGE_SIZE_KEY='m365.accountsPageSize';
@@ -3266,6 +3398,10 @@ function accountRowNode(x){
     elx('b',{cls:'cell-trunc',text:name,title:name}),
     elx('span',{cls:'cell-trunc',text:x.email||'',title:x.email||''}),
   ]});
+  const selectBox=elx('input',{attrs:{type:'checkbox','data-account-id':x.id,'aria-label':'选择账号 '+name}});
+  selectBox.checked=_selectedAccountIds.has(x.id);
+  selectBox.addEventListener('change',()=>toggleAccountSelected(x.id,selectBox.checked));
+  const tdSelect=elx('td',{kids:[selectBox]});
   const tdAcct=elx('td',{kids:[elx('div',{cls:'account-cell',kids:[avatar,meta]})]});
 
   const dot=elx('i',{cls:'status-dot',attrs:{style:'background:currentColor'}});
@@ -3289,7 +3425,7 @@ function accountRowNode(x){
       on:{click:()=>deleteAccount(x.id)}}),
   ]});
 
-  return elx('tr',{kids:[tdAcct,tdStatus,tdCred,tdTime,tdActions]});
+  return elx('tr',{kids:[tdSelect,tdAcct,tdStatus,tdCred,tdTime,tdActions]});
 }
 function renderAccounts(){
   const list=filteredAccounts();
@@ -3307,7 +3443,7 @@ function renderAccounts(){
     page.forEach(x=>tbody.appendChild(accountRowNode(x)));
   }else{
     const tr=elx('tr',{cls:'is-empty'});
-    const td=elx('td',{cls:'empty',attrs:{colspan:'5'}});
+    const td=elx('td',{cls:'empty',attrs:{colspan:'6'}});
     td.appendChild(_accountsCache.length
       ? emptyStateNode('search','没有匹配的账号','换个关键词，或把筛选切回「全部」')
       : emptyStateNode('users','还没有授权账号','点击上方「开始授权」或「账密一键回调」添加第一个 Microsoft 账号'));
@@ -3386,7 +3522,7 @@ async function loadAccounts(){
   }catch(e){
     const tbody=$('accountRows');
     tbody.textContent='';
-    const td=elx('td',{cls:'empty',attrs:{colspan:'5'}});
+    const td=elx('td',{cls:'empty',attrs:{colspan:'6'}});
     td.appendChild(errorStateNode(e.message));
     tbody.appendChild(elx('tr',{cls:'is-empty',kids:[td]}));
   }
@@ -3421,6 +3557,133 @@ function openRunScripts(){
   setTimeout(()=>$('rsEmail').focus(),80);
 }
 function closeRunScripts(){$('runScriptsCard').hidden=true;}
+
+/* 卡片折叠：只切 class 与 aria-expanded，不动卡片内容与既有处理函数。
+   「添加账号」在 HTML 里就带 is-collapsed，因此首屏即为收起状态，无需
+   等 JS 执行，也不会出现展开后被脚本收回的闪动。 */
+function toggleCardCollapse(id){
+  const card=$(id);if(!card)return;
+  const collapsed=card.classList.toggle('is-collapsed');
+  const btn=card.querySelector('.card-collapse-btn');
+  if(btn){
+    btn.setAttribute('aria-expanded',collapsed?'false':'true');
+    btn.setAttribute('aria-label',(collapsed?'展开':'收起')+(card.querySelector('.card-title')?.textContent||''));
+  }
+}
+function expandCard(id){
+  const card=$(id);if(!card||!card.classList.contains('is-collapsed'))return;
+  toggleCardCollapse(id);
+}
+
+/* ===== 批量账密回调 =====================================================
+   每行 账号----密码，与 native_panel.go 的 strings.Cut(line,"----") 及
+   credential_sync.go 的 cred_file 同格式。列表逐项复用既有单账号端点
+   POST /api/accounts/web/run-scripts，不新增协议、不改后端契约。 */
+const CRED_SEP='----';
+function parseBulkCreds(text){
+  const rows=[],bad=[],dup=[],seen=new Set();
+  String(text||'').split(/\r?\n/).forEach((raw,i)=>{
+    const line=raw.trim();
+    if(!line||line.startsWith('#'))return;
+    const at=line.indexOf(CRED_SEP);
+    if(at<=0){bad.push({line:i+1,text:line});return;}
+    const email=line.slice(0,at).trim();
+    const password=line.slice(at+CRED_SEP.length);
+    if(!email||!password){bad.push({line:i+1,text:line});return;}
+    const key=email.toLowerCase();
+    if(seen.has(key)){dup.push(email);return;}
+    seen.add(key);rows.push({email,password});
+  });
+  return {rows,bad,dup};
+}
+function renderBulkSummary(){
+  const el=$('rsBulkSummary');if(!el)return;
+  const box=$('rsBulk');
+  const {rows,bad,dup}=parseBulkCreds(box?box.value:'');
+  if(!rows.length&&!bad.length&&!dup.length){el.textContent='';return;}
+  const parts=['有效 '+rows.length+' 个'];
+  if(dup.length)parts.push('重复 '+dup.length+' 个已跳过');
+  if(bad.length)parts.push('格式错误 '+bad.length+' 行（第 '+bad.slice(0,5).map(b=>b.line).join('/')+' 行）');
+  el.textContent=parts.join('；');
+}
+function clearBulk(){const b=$('rsBulk');if(b)b.value='';renderBulkSummary();}
+function importBulkFile(e){
+  const file=e.target.files&&e.target.files[0];
+  e.target.value='';                       // 允许连续导入同一个文件
+  if(!file)return;
+  if(file.size>2*1024*1024){showNotice('清单过大（上限 2MB）','error');return;}
+  const reader=new FileReader();
+  reader.onerror=()=>showNotice('读取文件失败','error');
+  reader.onload=()=>{
+    const box=$('rsBulk');if(!box)return;
+    const text=String(reader.result||'');
+    box.value=box.value.trim()?box.value.replace(/\s*$/,'')+'\n'+text:text;
+    renderBulkSummary();
+    const {rows}=parseBulkCreds(box.value);
+    showNotice('已导入清单，解析出 '+rows.length+' 个账号','success');
+  };
+  reader.readAsText(file,'utf-8');
+}
+
+/* 列表模式：逐个调用既有单账号端点，串行执行以免同时打多个上游授权。
+   每行结果独立展示（完成 / 需人工一步 / 失败），不因单行失败中断整批。 */
+async function submitBulkRunScripts(rows){
+  const btn=$('rsSubmit');
+  btn.disabled=true;btn.classList.add('is-busy');
+  const out=$('rsProgress');
+  out.textContent='';
+  const head=document.createElement('p');
+  head.className='form-hint';
+  head.textContent='批量回调进行中：共 '+rows.length+' 个账号，逐个执行…';
+  out.appendChild(head);
+  const list=document.createElement('div');
+  list.className='steps-list';
+  out.appendChild(list);
+  let ok=0,manual=0,failed=0;
+  for(let i=0;i<rows.length;i++){
+    const row=rows[i];
+    const item=document.createElement('div');
+    item.className='steps-item';
+    const title=document.createElement('div');
+    const b=document.createElement('b');
+    b.textContent='['+(i+1)+'/'+rows.length+'] '+row.email;
+    title.appendChild(b);
+    const tag=document.createElement('span');
+    tag.className='badge';
+    tag.style.marginLeft='6px';
+    tag.textContent='执行中';
+    title.appendChild(tag);
+    const detail=document.createElement('p');
+    detail.style.cssText='font-size:var(--fs-caption);color:var(--muted);margin-top:2px;word-break:break-word';
+    title.appendChild(detail);
+    item.appendChild(title);
+    list.appendChild(item);
+    try{
+      const r=await fetch('/api/accounts/web/run-scripts',{
+        method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({email:row.email,password:row.password,saveCredential:true})});
+      const txt=await r.text();
+      let d;try{d=txt?JSON.parse(txt):{};}catch(_){d={};}
+      if(r.ok&&(d.complete===true||d.status==='completed')){
+        ok++;item.classList.add('done');tag.className='badge ok';tag.textContent='完成';
+        detail.textContent=d.hasRefreshToken===false?'已入池，但上游未返回刷新令牌':'已入池，刷新令牌已保存';
+      }else if(r.status===202){
+        manual++;tag.className='badge';tag.textContent='需人工一步';
+        detail.textContent=(d.reason||'上游要求交互式登录')+(d.authorizationUrl?('　授权地址：'+d.authorizationUrl):'');
+      }else{
+        failed++;tag.className='badge err';tag.textContent='失败';
+        detail.textContent=(d&&d.error&&d.error.message)||txt||('HTTP '+r.status);
+      }
+    }catch(err){
+      failed++;tag.className='badge err';tag.textContent='失败';
+      detail.textContent=err.message||String(err);
+    }
+  }
+  head.textContent='批量回调结束：完成 '+ok+'，需人工 '+manual+'，失败 '+failed+'（共 '+rows.length+'）。';
+  btn.disabled=false;btn.classList.remove('is-busy');
+  showNotice('批量回调：完成 '+ok+'，需人工 '+manual+'，失败 '+failed,failed?'error':'success');
+  loadAccounts();loadCredentials();loadStats();
+}
 
 /* 分步进度用 DOM 构造：detail 来自服务端文本，一律 textContent。 */
 function renderRunSteps(steps){
@@ -3481,11 +3744,63 @@ async function syncCredentials(){
   finally{if(btn){btn.disabled=false;btn.textContent='从账密清单补齐';}}
 }
 
+function parseRunScriptsAccounts(text){
+  const accounts=[];
+  const errors=[];
+  String(text||'').split(/\r?\n/).forEach((raw,index)=>{
+    const line=raw.trim();
+    if(!line)return;
+    const separator=line.indexOf('----');
+    if(separator<=0){errors.push('第 '+(index+1)+' 行格式错误,应为:账号----密码');return;}
+    const email=line.slice(0,separator).trim();
+    const password=line.slice(separator+4);
+    if(!email||!password){errors.push('第 '+(index+1)+' 行账号或密码为空');return;}
+    accounts.push({email,password});
+  });
+  return {accounts,errors};
+}
+
+async function loadRunScriptsAccountFile(input){
+  const file=input&&input.files&&input.files[0];
+  if(!file)return;
+  setFieldErr('rsErr','');
+  if(!/\.txt$/i.test(file.name)){
+    setFieldErr('rsErr','请选择 .txt 格式的账号文件');
+    input.value='';
+    return;
+  }
+  try{
+    const text=await file.text();
+    $('rsAccountList').value=text;
+    const parsed=parseRunScriptsAccounts(text);
+    $('rsAccountFileHint').textContent='已读取 '+file.name+',识别 '+parsed.accounts.length+' 个账号'+(parsed.errors.length?',另有 '+parsed.errors.length+' 行格式错误':'');
+  }catch(e){
+    setFieldErr('rsErr','读取账号文件失败:'+(e.message||'未知错误'));
+  }
+}
+
 async function submitRunScripts(){
+  // 批量列表优先：填了列表就整批执行，单账号输入框保持原语义不变。
+  const bulkBox=$('rsBulk');
+  if(bulkBox&&bulkBox.value.trim()){
+    const {rows,bad,dup}=parseBulkCreds(bulkBox.value);
+    setFieldErr('rsErr','');
+    if(!rows.length){
+      setFieldErr('rsErr','列表里没有有效的「账号'+CRED_SEP+'密码」行');
+      return;
+    }
+    if(bad.length||dup.length){
+      setFieldErr('rsErr','已跳过 '+bad.length+' 行格式错误、'+dup.length+' 个重复账号，仍将回调 '+rows.length+' 个账号');
+    }
+    return submitBulkRunScripts(rows);
+  }
   const email=$('rsEmail').value.trim();
   const password=$('rsPassword').value;
+  const parsed=parseRunScriptsAccounts($('rsAccountList').value);
   setFieldErr('rsErr','');
-  if(!email){setFieldErr('rsErr','请输入 M365 账号');$('rsEmail').focus();return;}
+  if(parsed.errors.length){setFieldErr('rsErr',parsed.errors.slice(0,3).join('；'));$('rsAccountList').focus();return;}
+  if(parsed.accounts.length){await submitRunScriptsBatch(parsed.accounts);return;}
+  if(!email){setFieldErr('rsErr','请输入 M365 账号,或粘贴/选择账号列表');$('rsEmail').focus();return;}
   // 密码留空是合法用法：后端会取加密 vault 里已存的账密。若 vault 里也没有，
   // 后端会明确回「密码为空」，这里预先提示用户可以一键补齐。
   if(!password&&!_credCache.some(c=>c.email===email)){
@@ -3594,6 +3909,103 @@ async function submitRunScripts(){
 
 /* 半自动分支：复用既有 PKCE 弹窗流程 —— 先 logoutUrl 再 authorizationUrl，
    并把 state/attempt 写进回调输入框，让「确认添加」能校验 state。 */
+async function submitRunScriptsBatch(accounts){
+  const btn=$('rsSubmit');
+  const out=$('rsProgress');
+  btn.disabled=true;
+  btn.classList.add('is-busy');
+  out.textContent='';
+
+  const summary=document.createElement('p');
+  summary.className='form-hint';
+  summary.textContent='准备批量回调 '+accounts.length+' 个账号…';
+  out.appendChild(summary);
+
+  const results=document.createElement('div');
+  results.className='steps-list';
+  out.appendChild(results);
+
+  let completed=0;
+  let interactive=0;
+  let failed=0;
+
+  try{
+    for(const [index,account] of accounts.entries()){
+      summary.textContent='正在处理 '+(index+1)+' / '+accounts.length+':'+account.email;
+
+      const row=document.createElement('div');
+      row.className='steps-item';
+      const text=document.createElement('div');
+      const title=document.createElement('b');
+      title.textContent=account.email;
+      text.appendChild(title);
+      const status=document.createElement('span');
+      status.className='badge';
+      status.style.marginLeft='6px';
+      status.textContent='处理中';
+      text.appendChild(status);
+      row.appendChild(text);
+      results.appendChild(row);
+
+      try{
+        const response=await fetch('/api/accounts/web/run-scripts',{
+          method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({email:account.email,password:account.password,saveCredential:true})
+        });
+        const raw=await response.text();
+        let data;
+        try{data=raw?JSON.parse(raw):{};}catch(parseError){data={};}
+        if(!response.ok&&response.status!==202){
+          throw Error((data&&data.error&&data.error.message)||raw||('HTTP '+response.status));
+        }
+
+        if(data.complete===true||data.status==='completed'){
+          completed++;
+          row.classList.add('done');
+          status.className='badge ok';
+          status.textContent='完成';
+        }else{
+          interactive++;
+          status.className='badge';
+          status.textContent='需人工登录';
+          if(data.authorizationUrl){
+            const action=document.createElement('button');
+            action.type='button';
+            action.className='btn';
+            action.style.marginTop='var(--sp-2)';
+            action.textContent='打开该账号授权页面';
+            action.onclick=()=>runScriptsAuthorize(data);
+            text.appendChild(action);
+          }
+        }
+      }catch(error){
+        failed++;
+        status.className='badge err';
+        status.textContent='失败';
+        const detail=document.createElement('p');
+        detail.className='form-hint';
+        detail.textContent=error.message||'运行失败';
+        text.appendChild(detail);
+      }
+    }
+
+    summary.textContent='批量回调完成:成功 '+completed+' 个,需人工登录 '+interactive+' 个,失败 '+failed+' 个';
+    showNotice('批量回调处理完毕',failed?'info':'success');
+    if(completed){
+      $('rsAccountList').value='';
+      $('rsAccountFile').value='';
+      $('rsAccountFileHint').textContent='也可直接粘贴多行账号；空行会自动忽略';
+      loadAccounts();
+      loadCredentials();
+      loadStats();
+    }
+  }finally{
+    btn.disabled=false;
+    btn.classList.remove('is-busy');
+  }
+}
+
 function runScriptsAuthorize(d){
   const win=window.open('about:blank',PKCE_POPUP_NAME,'width=600,height=800');
   if(!win){showNotice('浏览器拦截了弹窗，请允许弹窗后重试','error');return;}
@@ -3655,9 +4067,34 @@ function renderCredentialState(){
 }
 
 async function deleteAccount(id){
-  if(!confirm('确定删除？'))return;
-  try{await api('/api/accounts/delete',{method:'POST',body:JSON.stringify({id})});showNotice('已删除','success');loadAccounts();showPage('dashboard');}
-  catch(e){showNotice(e.message,'error');}
+  if(!confirm('确定删除这个账号？'))return;
+  try{
+    await api('/api/accounts/delete',{method:'POST',body:JSON.stringify({id})});
+    _selectedAccountIds.delete(id);
+    updateAccountSelectionUI();
+    showNotice('已删除','success');
+    await loadAccounts();
+    showPage('dashboard');
+  }catch(e){showNotice(e.message,'error');}
+}
+async function deleteSelectedAccounts(){
+  const ids=[..._selectedAccountIds];
+  if(!ids.length){showNotice('请先勾选要删除的账号','info');return;}
+  if(!confirm('确定删除已勾选的 '+ids.length+' 个账号？此操作不可撤销。'))return;
+  const btn=$('acctDeleteSelected');
+  if(btn){btn.disabled=true;btn.classList.add('is-busy');}
+  let deleted=0,failed=0;
+  for(const id of ids){
+    try{
+      await api('/api/accounts/delete',{method:'POST',body:JSON.stringify({id})});
+      _selectedAccountIds.delete(id);
+      deleted++;
+    }catch(e){failed++;}
+  }
+  if(btn)btn.classList.remove('is-busy');
+  updateAccountSelectionUI();
+  await loadAccounts();
+  showNotice('已删除 '+deleted+' 个账号'+(failed?',失败 '+failed+' 个':''),failed?'warning':'success');
 }
 
 // 每次授权都创建独立的本地 attempt。旧的轮询、回调输入和由页面打开的
@@ -4688,160 +5125,6 @@ async function openConvDetail(id){
 // 重新分配账号：把当前对话从它粘住的账号上挪走，并同时释放
 // 账号→出口的粘连。只放开前者的话，新账号会继续沿用同一个抖动的
 // 出口，等于按钮没起作用（这正是 502 的常见成因）。
-// ===== 注册与批量 OAuth（代理到本地面板 8555） =====
-/* 邮箱编号区间的读取、校验与预览。
-   账号命名规则 <prefix><num>@<domain> 来自 /api/admin/panel/state，
-   所以「5026-5100」能在启动前就显示成真实邮箱，避免用户猜。 */
-let _panelMeta={prefix:'',domain:'',min:0,max:0};
-
-/* 拉一次面板状态：填充邮箱命名规则、现有号段，并把注册就绪状态显示出来
-   （panelRegState 之前一直是空的，因为没有任何代码调用这个接口）。 */
-async function loadPanelState(){
-  try{
-    const d=await api('/api/admin/panel/state');
-    _panelMeta={
-      prefix:d.email_prefix||'',
-      domain:d.email_domain||'',
-      min:d.cred_num_min||0,
-      max:d.cred_num_max||0,
-    };
-    const note=$('panelRegState');
-    if(note){
-      const bits=[];
-      bits.push(d.register_ready?'注册已就绪':'注册配置不完整');
-      if(d.cred_total)bits.push('账密 '+d.cred_total+' 条');
-      if(_panelMeta.min&&_panelMeta.max)bits.push('编号 '+_panelMeta.min+'-'+_panelMeta.max);
-      note.textContent=bits.join(' · ');
-    }
-    // 用现有号段给出一个合理的默认起点，省去用户手查。
-    const rs=$('regStartNum'),os=$('oauthStartNum');
-    if(rs&&!rs.value&&_panelMeta.max)rs.value=_panelMeta.max+1;
-    if(os&&!os.value&&_panelMeta.min)os.value=_panelMeta.min;
-    renderRegRange();renderOauthRange();
-  }catch(e){/* 面板不可用时保持静默，注册区仍可手填 */}
-}
-
-function readRange(startId,endId,fallbackCount){
-  const rawStart=($(startId)?.value||'').trim();
-  const rawEnd=($(endId)?.value||'').trim();
-  if(!rawStart&&!rawEnd)return {startNum:0,endNum:0,error:''};
-  const startNum=parseInt(rawStart,10);
-  if(!rawStart||!(startNum>0))return {error:'请填写起始邮箱编号'};
-  let endNum=rawEnd?parseInt(rawEnd,10):0;
-  if(rawEnd&&!(endNum>0))return {error:'结束邮箱编号无效'};
-  if(!endNum){
-    const n=fallbackCount>0?fallbackCount:1;
-    endNum=startNum+n-1;
-  }
-  if(endNum<startNum)return {error:'结束编号不能小于起始编号'};
-  if(endNum-startNum+1>1000)return {error:'单次区间最多 1000 个账号'};
-  return {startNum,endNum,error:''};
-}
-
-function mailFor(num){
-  if(!_panelMeta.prefix&&!_panelMeta.domain)return String(num);
-  return (_panelMeta.prefix||'')+num+(_panelMeta.domain?('@'+_panelMeta.domain):'');
-}
-
-function renderRangePreview(startId,endId,countId,hintId,errId){
-  const count=countId?(parseInt($(countId)?.value,10)||0):0;
-  const r=readRange(startId,endId,count);
-  const hint=$(hintId);
-  if(r.error){setFieldErr(errId,r.error);if(hint)hint.textContent='';return;}
-  setFieldErr(errId,'');
-  if(!hint)return;
-  if(!r.startNum){hint.textContent='填入起始编号后这里会显示实际账号区间。';return;}
-  const total=r.endNum-r.startNum+1;
-  let text=mailFor(r.startNum)+' → '+mailFor(r.endNum)+'，共 '+total+' 个';
-  if(_panelMeta.min&&_panelMeta.max){
-    text+='（账密清单现有编号 '+_panelMeta.min+'-'+_panelMeta.max+'）';
-    if(r.startNum<_panelMeta.min||r.endNum>_panelMeta.max)text+=' ⚠ 区间部分超出现有清单';
-  }
-  hint.textContent=text;
-}
-function renderRegRange(){renderRangePreview('regStartNum','regEndNum','regCount','regRangeHint','regRangeErr');}
-function renderOauthRange(){renderRangePreview('oauthStartNum','oauthEndNum',null,'oauthRangeHint','oauthRangeErr');}
-
-async function panelStartRegister(){
-  const mode=$('regMode')?.value||'phone';
-  const count=parseInt($('regCount')?.value)||1;
-  const conc=parseInt($('regConc')?.value)||3;
-  const concurrent=(mode==='proxy')&&!!$('regConcWrap')&&!$('regConcWrap').hidden;
-  const body={mode,count,concurrent,concurrency:conc};
-  // 邮箱编号区间：这是用户可理解的判据。旧版从不发送起始点，后端只能默认从 1 开始。
-  const r=readRange('regStartNum','regEndNum',count);
-  if(r.error){setFieldErr('regRangeErr',r.error);showNotice(r.error,'error');return;}
-  setFieldErr('regRangeErr','');
-  if(r.startNum){body.startNum=r.startNum;body.endNum=r.endNum;}
-  panelTermOpen('register '+mode+(concurrent?' ×'+conc:''));
-  panelTermLine('提交注册请求…');
-  try{
-    const d=await api('/api/admin/panel/register',{method:'POST',body:JSON.stringify(body)});
-    panelTermLine('已启动: '+(d.kind||d.ok),'ok');
-    panelPollJob();
-  }catch(e){panelTermLine('启动失败: '+(e.message||e),'err');showNotice(e.message,'error');}
-}
-async function panelStartOauthSingle(){
-  const email=($('oauthSingleEmail')?.value||'').trim();
-  if(!email){showNotice('请输入邮箱','error');return;}
-  panelTermOpen('oauth single');
-  panelTermLine('授权 '+email+'…');
-  try{
-    const d=await api('/api/admin/panel/oauth',{method:'POST',body:JSON.stringify({email})});
-    panelTermLine('完成: '+(d.ok?'成功':'失败')+(d.error?' — '+d.error:''),d.ok?'ok':'err');
-    if(d.ok)loadAccounts();
-  }catch(e){panelTermLine('失败: '+(e.message||e),'err');showNotice(e.message,'error');}
-}
-async function panelStartOauthBatch(concurrent){
-  const body={
-    concurrent:!!concurrent,
-    concurrency:parseInt($('oauthBatchConc')?.value)||3,
-    timeout:parseInt($('oauthBatchTimeout')?.value)||300,
-    start:parseInt($('oauthBatchStart')?.value)||1,
-    limit:parseInt($('oauthBatchLimit')?.value)||0,
-    resume:$('oauthBatchResume')?.checked||false,
-  };
-  // 编号区间优先于序号：后端据此在账密清单里定位，避免 482 被当成下标。
-  const r=readRange('oauthStartNum','oauthEndNum',0);
-  if(r.error){setFieldErr('oauthRangeErr',r.error);showNotice(r.error,'error');return;}
-  setFieldErr('oauthRangeErr','');
-  if(r.startNum){body.startNum=r.startNum;body.endNum=r.endNum;}
-  panelTermOpen('oauth batch '+(concurrent?('×'+body.concurrency):'serial'));
-  panelTermLine('提交批量 OAuth 请求…');
-  try{
-    const d=await api('/api/admin/panel/oauth/batch',{method:'POST',body:JSON.stringify(body)});
-    panelTermLine('已启动','ok');
-    panelPollJob();
-  }catch(e){panelTermLine('启动失败: '+(e.message||e),'err');showNotice(e.message,'error');}
-}
-async function panelStopJob(){
-  try{
-    await api('/api/admin/panel/job/stop',{method:'POST',body:'{}'});
-    panelTermLine('已请求停止','warn');
-  }catch(e){panelTermLine('停止失败: '+(e.message||e),'err');}
-}
-let _panelPollTimer=null;
-async function panelPollJob(){
-  if(_panelPollTimer)clearTimeout(_panelPollTimer);
-  try{
-    const d=await api('/api/admin/panel/job/poll');
-    if(d&&d.lines){
-      const body=$('panelTermBody');
-      if(body){const wasAtBottom=body.scrollHeight-body.scrollTop-body.clientHeight<50;body.textContent=d.lines.join('\n');if(wasAtBottom)body.scrollTop=body.scrollHeight;}
-    }
-    if(d&&d.running!==false){_panelPollTimer=setTimeout(panelPollJob,2000);}
-    else{panelTermLine('任务结束','ok');loadAccounts();}
-  }catch(e){_panelPollTimer=setTimeout(panelPollJob,5000);}
-}
-function panelTermOpen(title){const box=$('panelTermBox');if(box)box.hidden=false;const t=$('panelTermTitle');if(t)t.textContent=title;const body=$('panelTermBody');if(body)body.innerHTML='';}
-function panelTermLine(msg,cls){const body=$('panelTermBody');if(!body)return;const div=document.createElement('div');if(cls)div.className=cls;div.textContent='> '+msg;body.appendChild(div);body.scrollTop=body.scrollHeight;}
-// 注册模式切换时显示/隐藏并发数输入
-document.addEventListener('DOMContentLoaded',function(){
-  const sel=$('regMode');if(!sel)return;
-  sel.addEventListener('change',function(){
-    const wrap=$('regConcWrap');if(wrap)wrap.hidden=(sel.value!=='proxy');
-  });
-});
 /* 池级「热重新分配」：一次性把所有会话改派到健康账号，并释放账号→出口的
    粘滞，让它们重新选节点。入口在代理池页 —— 出口质量问题是在那里发现的，
    逐个对话点按钮解决不了整池的 502。
@@ -4881,7 +5164,34 @@ async function deleteCurrentConv(){
   }catch(e){showNotice(e.message,'error');}
 }
 
-function termOpen(title){$('termTitle').textContent=title;$('termBody').innerHTML='';$('termBox').style.display='block';}
+function termHostPage(){
+  const pages=['dashboard','accounts','apikeys','requests','conversations','proxies','benchmark','settings'];
+  for(const k of pages){
+    const sec=$('page-'+k);
+    if(sec && !sec.hidden) return sec;
+  }
+  return $('page-conversations');
+}
+function termOpen(title){
+  const box=$('termBox');
+  if(!box)return;
+  const host=termHostPage();
+  if(host && box.parentElement!==host){
+    const head=host.querySelector('.page-head');
+    if(head&&head.nextSibling) host.insertBefore(box, head.nextSibling);
+    else host.insertBefore(box, host.firstChild);
+  }
+  $('termTitle').textContent=title;
+  $('termBody').innerHTML='';
+  box.hidden=false;
+  box.style.display='block';
+}
+function termClose(){
+  const box=$('termBox');
+  if(!box)return;
+  box.hidden=true;
+  box.style.display='none';
+}
 function termLine(msg,cls){const d=document.createElement('div');if(cls)d.className=cls;d.textContent='> '+msg;$('termBody').appendChild(d);$('termBody').scrollTop=$('termBody').scrollHeight;}
 function termClear(){$('termBody').innerHTML='';}
 
@@ -5102,31 +5412,81 @@ function normalizeExternalHTTPURL(raw,label){
   if(target.username||target.password)throw Error(label+'不能包含用户名或密码');
   return target;
 }
-async function proxyFreeImport(){
-  let source;
-  try{source=normalizeExternalHTTPURL($('proxyFreeSourceURL').value,'公开文本来源 URL').href;}
-  catch(e){showNotice(e.message,'error');return;}
-  const rawLimit=Number.parseInt($('proxyFreeLimit').value,10);
-  const limit=Number.isFinite(rawLimit)?Math.min(200,Math.max(1,rawLimit)):50;
-  $('proxyFreeLimit').value=limit;
-  // 页数才是产量的决定因素：每页只有十几条，只抓一页最多就十几个候选。
-  const rawPages=Number.parseInt($('proxyFreePages').value,10);
-  const pages=Number.isFinite(rawPages)?Math.min(500,Math.max(1,rawPages)):20;
-  $('proxyFreePages').value=pages;
-  const button=$('proxyFreeImportBtn');
-  if(button)button.disabled=true;
-  termOpen('free proxy import — quality gate');
-  termLine('正在拉取 '+pages+' 页公开来源并执行 M365 质量筛选…');
+const PROXY_HUNTER_SOURCES=[
+  'https://www.zdaye.com/free/',
+  'https://www.proxy-list.download/api/v1/get?type=http',
+  'https://www.proxy-list.download/api/v1/get?type=https',
+  'https://www.proxy-list.download/api/v1/get?type=socks5',
+  'https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/all/data.txt',
+  'https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt',
+  'https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt'
+];
+function fillHunterSources(){
+  const el=$('proxyHunterSources');
+  if(!el)return;
+  if(el.value.trim())return;
   try{
-    const d=await api('/api/admin/proxy-pool?action=free-import',{method:'POST',body:JSON.stringify({sourceUrl:source,scheme:$('proxyFreeScheme').value,limit,pages})});
-    const r=d.report||{};
-    termLine('实际抓取 '+(r.pages||1)+' 页；发现 '+(r.discovered||0)+' 条；格式无效 '+(r.invalid||0)+'；重复 '+(r.duplicates||0)+'；上限跳过 '+(r.limited||0)+'。','warn');
-    termLine('质量探测 '+(r.checked||0)+' 条；通过 '+(r.passed||0)+'；拒绝 '+(r.rejected||0)+'；导入 '+(r.imported||0)+'。',(r.imported||0)?'ok':'warn');
-    showNotice('质量筛选完成：导入 '+(r.imported||0)+' 个代理',(r.imported||0)?'success':'error');
-    loadProxies();
-  }catch(e){termLine('拉取失败：'+e.message,'err');showNotice(e.message,'error');}
-  finally{if(button)button.disabled=false;}
+    const saved=localStorage.getItem('m365_hunter_sources');
+    if(saved && saved.trim()){el.value=saved;return;}
+  }catch(e){}
+  el.value=PROXY_HUNTER_SOURCES.join('\n');
 }
+function restoreHunterPrefs(){
+  const apply=(id,key)=>{ const el=$(id); if(!el)return; try{ const v=localStorage.getItem(key); if(v) el.value=v; }catch(e){} };
+  apply('proxyHunterLimit','m365_hunter_limit');
+  apply('proxyHunterPages','m365_hunter_pages');
+  apply('proxyHunterScheme','m365_hunter_scheme');
+}
+function saveHunterSources(){
+  const el=$('proxyHunterSources');
+  const value=(el?.value||'').trim();
+  if(!value){showNotice('来源不能为空','error');return;}
+  try{localStorage.setItem('m365_hunter_sources', value);}catch(e){}
+  try{localStorage.setItem('m365_hunter_limit', $('proxyHunterLimit')?.value||'');}catch(e){}
+  try{localStorage.setItem('m365_hunter_pages', $('proxyHunterPages')?.value||'');}catch(e){}
+  try{localStorage.setItem('m365_hunter_scheme', $('proxyHunterScheme')?.value||'');}catch(e){}
+  showNotice('猎手来源已保存到本机','success');
+}
+async function proxyHunterImport(){
+  fillHunterSources();
+  const sources=($('proxyHunterSources').value||'').split(/\n+/).map(s=>s.trim()).filter(Boolean);
+  if(!sources.length){showNotice('请填写至少一个来源网址','error');return;}
+  const rawLimit=Number.parseInt($('proxyHunterLimit').value,10);
+  const limit=Number.isFinite(rawLimit)?Math.min(200,Math.max(1,rawLimit)):80;
+  $('proxyHunterLimit').value=limit;
+  const rawPages=Number.parseInt($('proxyHunterPages').value,10);
+  const pages=Number.isFinite(rawPages)?Math.min(40,Math.max(1,rawPages)):3;
+  $('proxyHunterPages').value=pages;
+  const scheme=$('proxyHunterScheme').value||'http';
+  const button=$('proxyHunterBtn');
+  if(button)button.disabled=true;
+  termOpen('proxy hunter — m365');
+  termLine('开始猎取 '+sources.length+' 个来源…');
+  let imported=0, passed=0, checked=0, discovered=0;
+  try{
+    for(let i=0;i<sources.length;i++){
+      const source=sources[i];
+      termLine('['+(i+1)+'/'+sources.length+'] '+source);
+      try{
+        const d=await api('/api/admin/proxy-pool?action=free-import',{method:'POST',body:JSON.stringify({sourceUrl:source,scheme,limit,pages})});
+        const r=d.report||{};
+        discovered+=(r.discovered||0);
+        checked+=(r.checked||0);
+        passed+=(r.passed||0);
+        imported+=(r.imported||0);
+        termLine('  抓取 '+(r.pages||1)+' 页 · 发现 '+(r.discovered||0)+' · 通过 '+(r.passed||0)+' · 导入 '+(r.imported||0),(r.imported||0)?'ok':'warn');
+      }catch(e){
+        termLine('  失败：'+(e.message||e),'err');
+      }
+    }
+    termLine('合计：发现 '+discovered+' · 探测 '+checked+' · 通过 '+passed+' · 导入 '+imported, imported?'ok':'warn');
+    showNotice('猎手完成：导入 '+imported+' 个代理', imported?'success':'error');
+    loadProxies();
+  }finally{
+    if(button)button.disabled=false;
+  }
+}
+
 async function proxyCheckOne(url,id){
   try{
     // 只探测这一个出口。过去这里走全量检查，点一个出口会把整池重新探一遍，
@@ -5470,6 +5830,16 @@ async function saveSettings(){  try{
     put('autoCleanupDisabled',chk('setCleanupDisabled'));
     put('persistInterval',str('setPersistInterval'));
     put('httpTraceVerbose',chk('setHttpTraceVerbose'));
+    const fallback=str('setFallbackProxy');
+    const currentProxy=loadedSettings.outboundProxy||'';
+    const wasRedacted=String(currentProxy).indexOf('***')>=0;
+    // 出口被打码时输入框会被清空，所以「空」有两种含义：没动过，或用户确实要
+    // 改回直连。只有 oninput 标记过 edited 才把空值当成显式清空，否则保存设置
+    // 会把一个用户根本没碰过的代理误删。
+    const fbEl=$('setFallbackProxy');
+    const fallbackEdited=!!(fbEl&&fbEl.dataset.edited==='1');
+    if(wasRedacted){ if(fallback||fallbackEdited) put('outboundProxy', fallback); }
+    else if(fallback!==undefined && fallback!==currentProxy) put('outboundProxy', fallback);
     if(!Object.keys(body).length){showNotice('没有需要保存的改动','info');return;}
     const touched=Object.keys(body).filter(k=>restartFields.includes(k));
     if(touched.length&&!confirm('修改 '+touched.join('、')+' 需要重启服务，重启后需要重新登录。继续？'))return;
@@ -6008,6 +6378,81 @@ function showLogin(){
   $('loginPassword')?.focus();
 }
 
+
+async function loadPanelState(){
+  try{
+    const d=await api('/api/admin/panel/state');
+    const note=$('panelRegState');
+    if(note){
+      const bits=[];
+      bits.push(d.register_ready?'注册配置已就绪':'注册配置不完整');
+      if(d.cred_total)bits.push('账密 '+d.cred_total+' 条');
+      if(d.cred_num_min&&d.cred_num_max)bits.push('编号 '+d.cred_num_min+'-'+d.cred_num_max);
+      note.textContent=bits.join(' · ');
+    }
+    const fill=(id,val)=>{ const el=$(id); if(el && val && !el.value) el.value=val; };
+    fill('regSiteUrl', d.site_url);
+    fill('regEmailDomain', d.email_domain);
+    fill('regEmailPrefix', d.email_prefix);
+    fill('regPassword', d.register_password);
+    fill('regFlareSolverr', d.flaresolverr_url);
+    const rs=$('regStartNum'),os=$('oauthStartNum');
+    if(rs&&!rs.value&&d.cred_num_max)rs.value=d.cred_num_max+1;
+    else if(rs&&!rs.value&&d.email_start_num)rs.value=d.email_start_num;
+    if(os&&!os.value&&d.cred_num_min)os.value=d.cred_num_min;
+  }catch(e){}
+}
+async function saveRegisterConfig(){
+  const body={
+    siteUrl:($('regSiteUrl')?.value||'').trim(),
+    emailDomain:($('regEmailDomain')?.value||'').trim(),
+    emailPrefix:($('regEmailPrefix')?.value||'').trim(),
+    password:($('regPassword')?.value||'').trim(),
+    emailStartNum:parseInt($('regStartNum')?.value)||0,
+    flaresolverrUrl:($('regFlareSolverr')?.value||'').trim()
+  };
+  try{
+    const d=await api('/api/admin/panel/config',{method:'POST',body:JSON.stringify(body)});
+    showNotice(d.register_ready?'注册配置已保存':'已保存，但仍缺必填项','success');
+    loadPanelState();
+  }catch(e){showNotice(e.message||String(e),'error');}
+}
+function placeRegisterFrame(){
+  const el=$('regFrame');
+  if(!el||!window.M365Native||typeof M365Native.placeRegister!=='function') return;
+  const r=el.getBoundingClientRect();
+  if(r.width<80||r.height<80) return;
+  M365Native.placeRegister(r.left,r.top,r.width,r.height);
+}
+async function panelStartRegister(){
+  const body={mode:$('regMode')?.value||'proxy',count:parseInt($('regCount')?.value)||1,startNum:parseInt($('regStartNum')?.value)||0};
+  const out=$('regResult');
+  if(out)out.textContent='正在内嵌注册页填账密并提交，请保持 App 在前台…';
+  placeRegisterFrame();
+  const timer=setInterval(placeRegisterFrame,400);
+  try{
+    const d=await api('/api/admin/panel/register',{method:'POST',body:JSON.stringify(body),timeoutMs:180000});
+    const acc=d.accounts&&d.accounts[0];
+    const ok=d.success||0, fail=d.failed||0;
+    let extra=acc&&acc.detail?(' · '+acc.detail):'';
+    if(acc&&acc.oauthStatus) extra+=' · OAuth '+acc.oauthStatus+(acc.oauthDetail?(' '+acc.oauthDetail):'');
+    if(out)out.textContent='成功 '+ok+' · 失败 '+fail+extra;
+    loadAccounts();loadPanelState();
+  }catch(e){if(out)out.textContent=e.message||String(e);showNotice(e.message,'error');}
+  finally{clearInterval(timer);}
+}
+async function panelStartOauthBatch(){
+  const body={startNum:parseInt($('oauthStartNum')?.value)||0,endNum:parseInt($('oauthEndNum')?.value)||0,resume:!!$('oauthBatchResume')?.checked};
+  const out=$('oauthBatchResult');
+  if(out)out.textContent='提交批量授权…';
+  try{
+    const d=await api('/api/admin/panel/oauth/batch',{method:'POST',body:JSON.stringify(body)});
+    if(out)out.textContent='导入 '+ (d.imported||0) +' · 待确认 '+(d.pending||0)+' · 跳过 '+(d.skipped||0)+' · 失败 '+(d.failed||0);
+    const pending=(d.accounts||[]).find(a=>a.authorizationUrl);
+    if(pending&&pending.authorizationUrl) window.open(pending.authorizationUrl,'_blank','noopener,noreferrer');
+    loadAccounts();
+  }catch(e){if(out)out.textContent=e.message||String(e);showNotice(e.message,'error');}
+}
 </script>
 </body>
 </html>

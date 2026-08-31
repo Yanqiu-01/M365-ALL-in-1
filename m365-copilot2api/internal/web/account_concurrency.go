@@ -91,14 +91,25 @@ func (c *accountConcurrency) Snapshot() map[string]any {
 }
 
 func (s *Server) accountAvailable(accountID string) bool {
+	if s == nil || s.tokens == nil || strings.TrimSpace(accountID) == "" {
+		return false
+	}
+	account, ok := s.tokens.Get(accountID)
+	if !ok || strings.TrimSpace(account.AccessToken) == "" {
+		return false
+	}
+	// 只挡需要人工介入的终态。写成「Status != online 即不可用」会把 expired 一并
+	// 挡死：expired 本该由刷新令牌自动救活，而刷新必须先选中这个账号，选不中就
+	// 永远刷不了，账号再也回不来。未知状态一律放行，交给下面的冷却与并发判断，
+	// 不要在这里造成不可恢复的死锁。
+	switch account.Status {
+	case "auth_failed", "disabled", "revoked":
+		return false
+	}
 	if !s.accountPool.Available(accountID) || !s.accountConcurrency.Available(accountID) {
 		return false
 	}
-	if s.upstreamCooldown == nil || s.tokens == nil {
-		return true
-	}
-	account, ok := s.tokens.Get(accountID)
-	return !ok || !s.upstreamCooldown.blocked(account.Email)
+	return s.upstreamCooldown == nil || !s.upstreamCooldown.blocked(account.Email)
 }
 
 // recordUpstreamCooldown applies the APK's email-keyed backoff only to an

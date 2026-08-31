@@ -26,6 +26,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -87,7 +88,7 @@ const (
 
 	// guardMaxConcurrency caps in-flight probes. Microsoft is the target, so this
 	// is a politeness limit as much as a resource limit.
-	guardMaxConcurrency     = 20
+	guardMaxConcurrency = 20
 	// guardDefaultConcurrency was 20, equal to the ceiling, so a 15-exit pool probed
 	// every exit in the same instant. Short-lived exits (21-minute 51daili leases)
 	// flap, and a fully synchronous round made them all fail in the same second,
@@ -271,6 +272,14 @@ func guardSweep(ctx context.Context, p *Pool, timing guardTiming) {
 	if len(due) == 0 {
 		return
 	}
+	// 每轮记一条摘要。
+	//
+	// 逐条成功不记（一个健康的池子每 15 分钟刷几十行日志没有价值），但整轮完全静音
+	// 会让池子的健康状态变得不可观测：guardSweep 此前只在失败时 logProbe，于是
+	// 「巡检正常且大部分出口通过」与「巡检把所有出口都判失败」在日志里长得一模一样。
+	// 这不是假设 —— 我据此得出过「整个日志从未成功过一次」的错误结论，而实际上
+	// CheckSelected 记下的 302 条 pass 就在同一个文件里。摘要让每一轮都留下痕迹。
+	var passed, failed, abandoned int64
 	semaphore := make(chan struct{}, guardConcurrency())
 	var wg sync.WaitGroup
 	for _, entry := range due {
@@ -286,13 +295,28 @@ func guardSweep(ctx context.Context, p *Pool, timing guardTiming) {
 			probeCtx, cancel := context.WithTimeout(ctx, probeRoundBudget(defaultProbeTimeout))
 			defer cancel()
 			result := probeRound(probeCtx, tunnelDialer(e.clients), defaultProbeTimeout)
+			// 与 CheckSelected 同一道判断：进程 ctx 被取消（也就是网关正在关闭）时
+			// 中断的探测，不是出口的失败。巡检的父 ctx 是进程生命周期，所以平时不
+			// 会触发，但每次重启都会让当时正在探测的出口白记一次失败 ——
+			// consecutiveFailures 不衰减，攒够 3 次就永久驱逐。
+			if !result.pass && ctx.Err() != nil {
+				atomic.AddInt64(&abandoned, 1)
+				log.Printf("proxy probe abandoned proxy=%s reason=%v (gateway shutting down, not counted as a failure)",
+					RedactProxyURL(e.raw), ctx.Err())
+				return
+			}
 			p.applyProbe(e, result, time.Now(), timing)
 			if result.err != nil || !result.pass {
+				atomic.AddInt64(&failed, 1)
 				logProbe(e.raw, result)
+				return
 			}
+			atomic.AddInt64(&passed, 1)
 		}(entry)
 	}
 	wg.Wait()
+	log.Printf("proxy guard sweep due=%d pass=%d fail=%d abandoned=%d",
+		len(due), atomic.LoadInt64(&passed), atomic.LoadInt64(&failed), atomic.LoadInt64(&abandoned))
 }
 
 // admissionTimeout bounds the pre-admission probe. The admin handler runs it

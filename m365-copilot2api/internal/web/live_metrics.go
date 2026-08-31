@@ -58,7 +58,9 @@ func (s *Server) handleLiveMetrics(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusMethodNotAllowed, "invalid_request_error", "method not allowed")
 		return
 	}
-	rate := globalUsage.tokenRateWithin(time.Now(), liveRateWindow)
+	// 请求处理器把用量写入当前 Server 的 usageLog。此前错误地读取 globalUsage,
+	// Android 实例因此长期显示 TPM/RPM 为 0。
+	rate := s.usage.tokenRateWithin(time.Now(), liveRateWindow)
 	chat := chatSlotStats()
 	payload := map[string]any{
 		"rate": rate,

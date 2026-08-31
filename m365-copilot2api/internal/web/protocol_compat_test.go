@@ -14,6 +14,44 @@ func TestResponsesToOpenAI(t *testing.T) {
 	}
 }
 
+// 名字曾叫 ...PropagatesToGateway，但它只覆盖 responsesRequest -> oaiReq 的结构体
+// 转换，并不验证到网关或上游的传递。真正落实这个字段语义的是
+// enforceParallelToolCalls，见 toolloop_parallel_test.go。
+func TestResponsesParallelToolCallsReachesOAIRequest(t *testing.T) {
+	enabled := true
+	r := responsesRequest{
+		Model:             "gpt-5.6-reasoning",
+		Input:             "inspect both files",
+		ParallelToolCalls: &enabled,
+		Tools: []map[string]any{
+			{"type": "function", "name": "read_file", "parameters": map[string]any{"type": "object"}},
+			{"type": "function", "name": "list_files", "parameters": map[string]any{"type": "object"}},
+		},
+	}
+	o, err := r.openAI()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if o.ParallelToolCalls == nil || !*o.ParallelToolCalls {
+		t.Fatalf("parallel_tool_calls was lost during Responses conversion: %#v", o.ParallelToolCalls)
+	}
+	if len(o.Tools) != 2 {
+		t.Fatalf("tools=%d, want 2", len(o.Tools))
+	}
+}
+
+func TestResponsesParallelToolCallsFalseIsPreserved(t *testing.T) {
+	disabled := false
+	r := responsesRequest{Input: "run sequentially", ParallelToolCalls: &disabled}
+	o, err := r.openAI()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if o.ParallelToolCalls == nil || *o.ParallelToolCalls {
+		t.Fatalf("parallel_tool_calls=false was not preserved: %#v", o.ParallelToolCalls)
+	}
+}
+
 func TestResponsesCustomExecToOpenAI(t *testing.T) {
 	r := responsesRequest{Model: "m", Input: "inspect", Tools: []map[string]any{{"type": "custom", "name": "exec", "description": "run a command", "format": map[string]any{"type": "grammar"}}}}
 	o, err := r.openAI()
