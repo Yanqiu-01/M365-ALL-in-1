@@ -32,6 +32,13 @@ const (
 	defaultOutboundMaxConnsPerHost     = 128
 	defaultOutboundHTTPTimeoutSeconds  = 45
 	defaultOutboundMaxWebSockets       = 64
+
+	// connectExchangeTimeout 约束 HTTPS 代理的 CONNECT 请求/响应交换。
+	//
+	// 这一段是裸阻塞 I/O，ctx 管不到（见 httpsProxyDialer.DialContext）。没有它，
+	// 一个接受 TLS 后装死的代理就能让健康巡检永久停摆。取 15s 是因为 TLS 已经握完，
+	// 剩下只是一次写和一次读；探测自己的单轮预算是 35s，留足余量仍能先于它触发。
+	connectExchangeTimeout = 15 * time.Second
 )
 
 func outboundIntEnv(name string, fallback, min, max int) int {
@@ -526,6 +533,25 @@ func (d httpsProxyDialer) DialContext(ctx context.Context, network, address stri
 		raw.Close()
 		return nil, e
 	}
+	// CONNECT 交换必须有 deadline。
+	//
+	// 上面的 DialContext 和 HandshakeContext 都尊重 ctx，但 q.Write 和
+	// http.ReadResponse 是裸的阻塞 I/O —— ctx 到这里就失效了。一个接受了 TLS 之后
+	// 装死的代理会让 ReadResponse 永久阻塞，而 ctx 超时打不断阻塞的 syscall。
+	//
+	// 后果不止于这一次探测失败：probeExit 卡住 → guardSweep 的 wg.Wait() 永不返回
+	// → runProxyGuard 的循环到不了 ticker → 后台巡检永久停摆，直到进程重启。
+	// CheckSelected 同样以 wg.Wait() 收尾，所以手工检查会把管理接口一起挂死。
+	// 一个坏代理足以让整个健康巡检静默死亡，这正是最难被发现的那类故障。
+	deadline := time.Now().Add(connectExchangeTimeout)
+	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+		deadline = ctxDeadline
+	}
+	if e = conn.SetDeadline(deadline); e != nil {
+		conn.Close()
+		return nil, e
+	}
+
 	q := &http.Request{Method: http.MethodConnect, URL: &url.URL{Opaque: address}, Host: address, Header: make(http.Header)}
 	setProxyAuthorization(q.Header, d.proxyURL)
 	if e = q.Write(conn); e != nil {
@@ -535,6 +561,13 @@ func (d httpsProxyDialer) DialContext(ctx context.Context, network, address stri
 	rd := bufio.NewReader(conn)
 	resp, e := http.ReadResponse(rd, q)
 	if e != nil {
+		conn.Close()
+		return nil, e
+	}
+	// 隧道建立后清掉 deadline：它只用于约束 CONNECT 握手本身，留着会让后续的正常
+	// 流量在同一时刻被切断。
+	if e = conn.SetDeadline(time.Time{}); e != nil {
+		resp.Body.Close()
 		conn.Close()
 		return nil, e
 	}

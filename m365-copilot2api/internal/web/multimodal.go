@@ -10,6 +10,13 @@ import (
 func parseContent(c any) (string, []chathub.Attachment) {
 	var text strings.Builder
 	var files []chathub.Attachment
+	if c == nil {
+		// nil 是「没有内容」，不是内容。走下面的 fmt.Sprint 兜底会得到字符串
+		// "<nil>"，那五个字符会被当成正文写进 prompt —— 一条只带 tool_calls 的
+		// assistant 消息（Content 本就是 nil）于是渲染成 "[assistant]\n<nil>"。
+		// contentToString 里有同一处缺陷，两个函数各写了一遍。
+		return "", nil
+	}
 	if s, ok := c.(string); ok {
 		return s, nil
 	}
@@ -82,7 +89,6 @@ func parseContent(c any) (string, []chathub.Attachment) {
 	}
 	return text.String(), files
 }
-
 
 // imageTypeHandledInSwitch 标出下面 switch 已经会消费 image_url 的类型，
 // 避免前置兜底分支与 case 重复追加同一个附件。

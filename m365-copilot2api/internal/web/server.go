@@ -1491,6 +1491,15 @@ func contentToString(c any) string {
 			}
 		}
 		return b.String()
+	case nil:
+		// nil 是「没有内容」，不是内容。
+		//
+		// 早先它走下面的 fmt.Sprint 兜底，得到字符串 "<nil>" —— Go 的调试格式冒充
+		// 成了正文。那五个字符会一路进到 prompt 里让模型当结果读（实测模型收到
+		// "<nil>" 后既无法确认成功也无法确认失败，只能含糊其辞），还会虚增 token
+		// 估算、污染会话相似度哈希、在对话界面上显示出来。tool_state.go 那个
+		// 「有没有内容」的判断更会因此对 nil 答「有」。
+		return ""
 	default:
 		return fmt.Sprint(v)
 	}
