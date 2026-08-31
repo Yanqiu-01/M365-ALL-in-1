@@ -182,6 +182,32 @@ func (v *CredentialVault) saveLocked() error {
 	return atomicWrite(v.path, out, 0o600)
 }
 
+// findCredentialLocked returns the index of the entry addressed by key, or -1.
+//
+// Get has always accepted either the account ID or the account's email address,
+// because callers hold whichever one the surrounding code happened to carry.
+// Put and Delete matched on the account ID alone, so the three operations
+// disagreed about which entry a key names: storing a password under an address
+// that Get resolves by email appended a second entry instead of replacing the
+// first, and Get kept returning the older one — the update was silently
+// invisible, and Delete for the same address reported nothing to remove.
+// Resolving all three through this one function is what keeps them consistent.
+//
+// An exact account-ID match wins over an email alias so the result does not
+// depend on slice order.
+func (v *CredentialVault) findCredentialLocked(key string) int {
+	alias := -1
+	for i := range v.body.Credentials {
+		if v.body.Credentials[i].AccountID == key {
+			return i
+		}
+		if alias < 0 && v.body.Credentials[i].Email != "" && v.body.Credentials[i].Email == key {
+			alias = i
+		}
+	}
+	return alias
+}
+
 // Put stores or replaces the password for an account.
 func (v *CredentialVault) Put(accountID, email, password string) error {
 	accountID = strings.TrimSpace(accountID)
@@ -194,15 +220,13 @@ func (v *CredentialVault) Put(accountID, email, password string) error {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	now := time.Now().UTC()
-	for i := range v.body.Credentials {
-		if v.body.Credentials[i].AccountID == accountID {
-			v.body.Credentials[i].Password = password
-			v.body.Credentials[i].UpdatedAt = now
-			if email != "" {
-				v.body.Credentials[i].Email = email
-			}
-			return v.saveLocked()
+	if i := v.findCredentialLocked(accountID); i >= 0 {
+		v.body.Credentials[i].Password = password
+		v.body.Credentials[i].UpdatedAt = now
+		if email != "" {
+			v.body.Credentials[i].Email = email
 		}
+		return v.saveLocked()
 	}
 	v.body.Credentials = append(v.body.Credentials, credentialEntry{
 		AccountID: accountID, Email: email, Password: password, UpdatedAt: now,
@@ -215,10 +239,8 @@ func (v *CredentialVault) Get(accountID string) (string, error) {
 	accountID = strings.TrimSpace(accountID)
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	for _, entry := range v.body.Credentials {
-		if entry.AccountID == accountID || (entry.Email != "" && entry.Email == accountID) {
-			return entry.Password, nil
-		}
+	if i := v.findCredentialLocked(accountID); i >= 0 {
+		return v.body.Credentials[i].Password, nil
 	}
 	return "", ErrCredentialNotFound
 }
@@ -228,14 +250,12 @@ func (v *CredentialVault) Delete(accountID string) (bool, error) {
 	accountID = strings.TrimSpace(accountID)
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	for i := range v.body.Credentials {
-		if v.body.Credentials[i].AccountID != accountID {
-			continue
-		}
-		v.body.Credentials = append(v.body.Credentials[:i], v.body.Credentials[i+1:]...)
-		return true, v.saveLocked()
+	i := v.findCredentialLocked(accountID)
+	if i < 0 {
+		return false, nil
 	}
-	return false, nil
+	v.body.Credentials = append(v.body.Credentials[:i], v.body.Credentials[i+1:]...)
+	return true, v.saveLocked()
 }
 
 // CredentialMeta describes a stored credential without exposing the secret.

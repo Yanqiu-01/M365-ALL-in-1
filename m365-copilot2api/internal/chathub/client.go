@@ -166,6 +166,46 @@ func (c *Client) OutboundHTTPClient() *http.Client {
 	return outbound.HTTPClient()
 }
 
+// wsWriteTimeout bounds a single SignalR write. It is a var only so tests can
+// compress it; production never reassigns it.
+var wsWriteTimeout = 15 * time.Second
+
+// writeFrame refreshes the write deadline and then writes one SignalR frame.
+//
+// A WebSocket write deadline is an absolute instant, not a per-call duration.
+// It used to be set exactly once, during the handshake, so every later write on
+// that connection raced an instant that had already passed. The type=6
+// keepalive pong is the write that matters: after the handshake deadline
+// elapsed every pong failed with i/o timeout, gorilla latched the failure as
+// fatal so nothing could be written again, and the error was discarded at the
+// call site. A long conversation lost its keepalives silently.
+func writeFrame(conn *websocket.Conn, payload string) error {
+	if err := conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout)); err != nil {
+		return err
+	}
+	return conn.WriteMessage(websocket.TextMessage, []byte(payload))
+}
+
+// chatResponseFallbackTimeout bounds one chat response only when the caller
+// supplied no deadline of its own. It matches the shipped ChatTimeoutSeconds
+// default (600s) so a context-less caller behaves like the documented
+// configuration. A var only so tests can compress it.
+var chatResponseFallbackTimeout = 10 * time.Minute
+
+// chatResponseDeadline resolves the wall-clock limit for one chat response.
+//
+// The operator-facing ChatTimeoutSeconds reaches chathub as a context deadline,
+// and that setting is authoritative. This used to be a hard-coded 5 minutes, so
+// the shorter hidden cap always won: an operator who raised the documented
+// setting above 5 minutes got no more time, and the request failed with
+// "response deadline exceeded before completion" instead.
+func chatResponseDeadline(ctx context.Context, now time.Time) time.Time {
+	if deadline, ok := ctx.Deadline(); ok {
+		return deadline
+	}
+	return now.Add(chatResponseFallbackTimeout)
+}
+
 // dialAndInitialize retries one alternate WebSocket setup path before any chat
 // payload is sent. It intentionally stops before chatPayload / WriteMessage, so
 // a retry cannot duplicate a user prompt or tool invocation.
@@ -200,8 +240,13 @@ func (c *Client) dialAndInitialize(ctx context.Context, wsURL string) (*websocke
 		}
 
 		_ = conn.SetReadDeadline(time.Now().Add(45 * time.Second))
-		_ = conn.SetWriteDeadline(time.Now().Add(15 * time.Second))
-		if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"protocol":"json","version":1}`+rs)); err == nil {
+		// err is deliberately the loop-scoped variable: the handshake write and
+		// read must be able to fail this attempt. Declaring a fresh err with :=
+		// here shadowed it, so the check below always read the nil left by the
+		// successful dial and a failed handshake was reported as a live
+		// connection.
+		err = writeFrame(conn, `{"protocol":"json","version":1}`+rs)
+		if err == nil {
 			_, _, err = conn.ReadMessage()
 		}
 		if err == nil {
@@ -338,7 +383,7 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 	// APK wire_capture.go records the sanitized outbound chat payload before it
 	// is written to the SignalR socket.
 	recordWire("chat_send", wsURL, payload)
-	if err := conn.WriteMessage(websocket.TextMessage, []byte(payload)); err != nil {
+	if err := writeFrame(conn, payload); err != nil {
 		return Result{}, fmt.Errorf("chat send: %w", err)
 	}
 
@@ -366,7 +411,6 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 	var rawResult string
 	var events []json.RawMessage
 	seenStreamTools := map[string]bool{}
-	var reasoningBuf strings.Builder
 	// 思考内容改由 reasoningPump 逐帧即时推送，取材范围与完成帧兜底一致。
 	reasoningPump := newReasoningPump(func(ev StreamEvent) error {
 		if onEvent == nil {
@@ -375,7 +419,9 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 		return onEvent(ev)
 	})
 
-	deadline := time.Now().Add(5 * time.Minute)
+	// 整轮响应的时限由调用方的 context 决定（web 层用 ChatTimeoutSeconds 包装），
+	// 只有在完全没有 deadline 时才退回默认值。详见 chatResponseDeadline。
+	deadline := chatResponseDeadline(ctx, time.Now())
 	type wsRead struct {
 		msg []byte
 		err error
@@ -423,9 +469,12 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 			t, _ := obj["type"].(float64)
 			target, _ := obj["target"].(string)
 
-			// SignalR ping
+			// SignalR ping。写失败说明连接已经不可用：上游收不到 keepalive 会
+			// 主动断开，继续读只是等一个必然到来的 read error，所以立刻报错。
 			if int(t) == 6 {
-				_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":6}`+rs))
+				if err := writeFrame(conn, `{"type":6}`+rs); err != nil {
+					return Result{}, fmt.Errorf("signalr keepalive: %w", err)
+				}
 				continue
 			}
 
@@ -507,12 +556,13 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 				// ws read before completion / completion error 覆盖。
 				// pump 已按帧推送并累计全部思考内容，直接采用即可；
 				// 不再从原始帧重算，避免与已发送的增量重复。
+				//
+				// 这里曾有第二级兜底 reasoningBuf：它只被声明和读取，从来没有
+				// 任何一处写入，所以三级链的中间一级永远取不到内容。已删除，
+				// 现在是「pump 累计 → 全量扫描」两级。
 				pumpedReasoning := reasoningPump.text()
 				reasoning := pumpedReasoning
-				if reasoning == "" {
-					reasoning = reasoningBuf.String()
-				}
-				// 极端兜底：pump 与实时累积都为空时才回退到全量扫描。
+				// 极端兜底：pump 为空时才回退到全量扫描。
 				// 此时必须把兜底内容也作为一个 reasoning 事件发出去；
 				// 只填 Result.Reasoning 会让非流式有思考内容，而流式客户端
 				// 看不到任何 reasoning_content。

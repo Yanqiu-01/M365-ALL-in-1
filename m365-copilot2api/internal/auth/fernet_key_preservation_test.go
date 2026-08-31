@@ -13,22 +13,50 @@ import (
 // 损坏、长度不对，都会用一把新密钥覆盖旧的。凡是用旧密钥加密过的凭据从那一刻起永久
 // 不可解，而且过程是静默的 —— 调用方只看到「成功拿到密钥」。
 
-// isolateStoreKey 把密钥文件钉在临时目录里。
+// isolateStoreKey 把密钥文件、账号库和凭据库一起钉在临时目录里，并返回账号库路径。
 //
 // 必须显式设置 M365_STORE_KEY_FILE：storeKeyPath 在 os.UserHomeDir() 成功时会完全
 // 忽略传入的 storePath，固定返回 ~/.config/m365-store.key。只传 t.TempDir() 的
 // storePath 看着像隔离，其实不是 —— 我就是这样用测试覆写了真实机器上的密钥文件，
 // 让一份 5.4 MB 的加密账号库失去了唯一的钥匙。参数只是兜底，环境变量才是判据。
+//
+// 密钥路径和数据目录是一对，缺一不可。只钉密钥路径不够：CachePath() 在
+// M365_DATA_DIR 未设置时同样落在真实家目录，而真实的 accounts.json 是用真实密钥
+// 加密的，配上一把临时新密钥就解不开 —— 测试会以「读不到密钥」失败，而它其实正在
+// 读用户的真实数据。CredentialVaultPath() 同理。
 func isolateStoreKey(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
 	t.Setenv("M365_STORE_KEY_FILE", filepath.Join(dir, "m365-store.key"))
+	t.Setenv("M365_DATA_DIR", dir)
+	t.Setenv("M365_CREDENTIAL_VAULT", filepath.Join(dir, "credential-vault.json"))
 	store := filepath.Join(dir, "accounts.json")
-	// 自证隔离生效：解析出的路径必须落在这个临时目录里。
-	if got := storeKeyPath(store); !strings.HasPrefix(got, dir) {
-		t.Fatalf("key path %q escaped the temp dir %q — the test would write to a real key file", got, dir)
+	// 自证隔离生效：三条路径都必须落在这个临时目录里，而不是假定它们会。
+	for name, got := range map[string]string{
+		"storeKeyPath":        storeKeyPath(store),
+		"CachePath":           CachePath(),
+		"CredentialVaultPath": CredentialVaultPath(),
+	} {
+		if !strings.HasPrefix(got, dir) {
+			t.Fatalf("%s 解析为 %q，逃出了临时目录 %q —— 测试会写到真实文件上", name, got, dir)
+		}
 	}
 	return store
+}
+
+// 隔离助手自身的自检。它是本包每个碰到密钥的测试的唯一防线，必须自己也被测到。
+func TestIsolateStoreKeyKeepsEveryPathInTempDir(t *testing.T) {
+	store := isolateStoreKey(t)
+	dir := filepath.Dir(store)
+	for name, got := range map[string]string{
+		"storeKeyPath":        storeKeyPath(store),
+		"CachePath":           CachePath(),
+		"CredentialVaultPath": CredentialVaultPath(),
+	} {
+		if !strings.HasPrefix(got, dir) {
+			t.Errorf("%s=%q 不在 %q 内", name, got, dir)
+		}
+	}
 }
 
 func TestFirstRunCreatesAKey(t *testing.T) {

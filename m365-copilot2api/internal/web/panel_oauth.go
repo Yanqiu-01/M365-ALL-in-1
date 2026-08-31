@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"sort"
 	"strings"
 	"time"
 
 	"m365-copilot2api/internal/auth"
+	"m365-copilot2api/internal/outbound"
 )
 
 // panelOAuthAccount 是批量授权的一条结果。Mode 取值：
@@ -50,7 +52,25 @@ type panelOAuthBatchReport struct {
 
 const panelOAuthBatchMax = 64
 
+// oauthExitRotateEvery 是批量授权切换出口的间隔：每这么多个账号换一个代理。
+//
+// 为什么需要它：auth.ROPC 经由 outbound.HTTPClient()，而池子的 pick() 是确定性的，连续
+// 调用返回同一个出口。不轮换就意味着整批账号的 ROPC 全部来自同一个 IP。
+//
+// 取 100 是用户按实际经验给的值。它大于 panelOAuthBatchMax(64)，所以单次请求内通常不会
+// 触发轮换 —— 轮换真正生效在跨请求的恢复流程里（759 个账号需要多次调用），以及日后有人
+// 放宽单批上限时。这个关系是有意的，不是遗漏。
+const oauthExitRotateEvery = 100
+
 func (s *Server) authorizeAccountWithPassword(email, password string) (panelOAuthAccount, error) {
+	return s.authorizeAccountWithPasswordVia("", email, password)
+}
+
+// authorizeAccountWithPasswordVia 与上面相同，但把 ROPC 请求钉在指定出口上。
+//
+// exitRawURL 为空时行为完全一致（走池子的默认选择），所以单账号路径不受影响；批量授权
+// 用它来实现「每 N 个账号换一个代理」。
+func (s *Server) authorizeAccountWithPasswordVia(exitRawURL, email, password string) (panelOAuthAccount, error) {
 	email = strings.TrimSpace(email)
 	out := panelOAuthAccount{Email: email}
 	// 与 attachPKCE 保持同一道守卫。两者是同一功能的两个入口，一个能容忍 nil
@@ -68,7 +88,7 @@ func (s *Server) authorizeAccountWithPassword(email, password string) (panelOAut
 		return s.attachPKCE(out)
 	}
 
-	set, err := auth.ROPC(email, password)
+	set, err := auth.ROPCVia(exitRawURL, email, password)
 	if err == nil {
 		if strings.TrimSpace(set.Email) == "" {
 			set.Email = email
@@ -109,7 +129,12 @@ func (s *Server) attachPKCE(out panelOAuthAccount) (panelOAuthAccount, error) {
 		}
 		return out, errors.New(out.Detail)
 	}
-	state, url, _, redirectURI, err := s.beginPKCEAuthorization("login")
+	// keepOthers=true：attachPKCE 只在批量路径上被调用（runOAuthBatch 逐个账号、
+	// runRegister 注册完一个就顺手授权一个），每个账号的 state 都要活到它自己
+	// 回调为止。写死 false 时上一号的 state 会被下一号抹掉，报告里带回的
+	// authorizationUrl 除最后一个以外全部作废，回调只会得到
+	// "invalid or expired state"。
+	state, url, _, redirectURI, err := s.beginPKCEAuthorization("login", true)
 	if err != nil {
 		out.Status, out.Mode, out.Detail = "failed", "pkce", err.Error()
 		return out, err
@@ -174,12 +199,47 @@ func (s *Server) runOAuthBatch(ctx context.Context, manager *nativePanelManager,
 		}
 	}
 
+	// 出口轮换：每 oauthExitRotateEvery 个账号换一个代理。
+	//
+	// auth.ROPC 走的是 outbound.HTTPClient()，而 pick() 是确定性的 —— 连续调用返回同一
+	// 个出口。不轮换的话几百个账号会全部从同一个 IP 发起 ROPC，那是最容易被上游判成异常
+	// 的形态。这里按池子里的顺序推进，每满一个批次换下一个。
+	//
+	// 池子为空时 exits 为空，attempted 恒取到 ""，行为退回 HTTPClient() 的默认选择 ——
+	// 不因为没有代理就中断整批。
+	exits := outbound.ProxyPoolRawURLs()
+	exitTurn := 0
+	processed := 0
+	currentExit := func() string {
+		if len(exits) == 0 {
+			return ""
+		}
+		return exits[exitTurn%len(exits)]
+	}
+	if len(exits) > 0 {
+		log.Printf("[panel-oauth] batch of %d accounts over %d pool exits, rotating every %d accounts",
+			len(emails), len(exits), oauthExitRotateEvery)
+	} else {
+		log.Printf("[panel-oauth] batch of %d accounts with an empty proxy pool: every request will use "+
+			"the default egress", len(emails))
+	}
+
 	for _, email := range emails {
 		select {
 		case <-ctx.Done():
 			return report, ctx.Err()
 		default:
 		}
+		// 满一批就换出口。放在循环开头而不是结尾，这样跳过的账号也计入批次，
+		// 否则大量 resume 跳过会让轮换迟迟不发生。
+		if processed > 0 && processed%oauthExitRotateEvery == 0 {
+			exitTurn++
+			if len(exits) > 0 {
+				log.Printf("[panel-oauth] rotated egress after %d accounts -> %s",
+					processed, outbound.RedactProxyURL(currentExit()))
+			}
+		}
+		processed++
 		item := panelOAuthAccount{Email: email}
 		if request.Resume && online[strings.ToLower(email)] {
 			item.Status, item.Mode, item.Detail = "skipped", "skipped", "账号池已有该邮箱"
@@ -196,7 +256,7 @@ func (s *Server) runOAuthBatch(ctx context.Context, manager *nativePanelManager,
 				}
 			}
 		}
-		item, _ = s.authorizeAccountWithPassword(email, password)
+		item, _ = s.authorizeAccountWithPasswordVia(currentExit(), email, password)
 		switch item.Status {
 		case "imported":
 			report.Imported++

@@ -54,7 +54,15 @@ func imageURLs(raw []json.RawMessage) []string {
 
 func isImageURL(s string) bool {
 	if strings.HasPrefix(s, "data:image/") {
-		_, err := base64.StdEncoding.DecodeString(strings.SplitN(s, ",", 2)[1])
+		// SplitN 只在存在分隔符时才返回两段。少了这个检查，一个没有逗号的
+		// "data:image/png;base64" 会让索引 [1] 越界 panic —— 而这段代码跑在
+		// imageURLs 里，扫的是上游 SignalR 帧中任何 url/src/value/data 字段，
+		// 输入完全由上游决定。
+		parts := strings.SplitN(s, ",", 2)
+		if len(parts) < 2 || parts[1] == "" {
+			return false
+		}
+		_, err := base64.StdEncoding.DecodeString(parts[1])
 		return err == nil
 	}
 	u, err := url.Parse(s)

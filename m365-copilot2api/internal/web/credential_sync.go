@@ -35,6 +35,16 @@ type credentialSyncReport struct {
 	Missing   int      `json:"missing"`
 	Failed    int      `json:"failed"`
 	Examples  []string `json:"missingExamples,omitempty"`
+	// Conflicts 是「vault 与清单对同一个账号给出不同密码」的条数。
+	//
+	// 之前这种情况被算进 AlreadyOK：vault 不声不响地赢了，报告说该账号已同步。
+	// 可这两个值里至多一个能登录，而报告恰好把「有分歧」显示成「已就绪」——
+	// 于是一键回调对着一个过期密码反复失败，操作员在报告里找不到任何线索。
+	//
+	// 保留 vault 的值（用户手工改过的更权威）这个决定不变，改变的只是它不再
+	// 被隐瞒：分歧单独计数并给出邮箱样例，操作员据此决定删哪一边。
+	Conflicts        int      `json:"conflicts"`
+	ConflictExamples []string `json:"conflictExamples,omitempty"`
 }
 
 // syncCredentialsFromPanel 把面板账密清单补进 vault，返回补齐报告。
@@ -82,7 +92,16 @@ func (s *Server) syncCredentialsFromPanel() (credentialSyncReport, error) {
 			continue
 		}
 		// 已有账密就不动：vault 里的值可能是用户手工改过的，更权威。
-		if _, err := vault.Get(account.ID); err == nil {
+		// 但「不动」不等于「无话可说」：清单对同一个账号给出不同密码时，两个值
+		// 里至多一个能登录，这必须报出来，而不是并入 AlreadyOK 当成已就绪。
+		if stored, err := vault.Get(account.ID); err == nil {
+			if listed, ok := byEmail[strings.ToLower(email)]; ok && listed != stored {
+				report.Conflicts++
+				if len(report.ConflictExamples) < 5 {
+					report.ConflictExamples = append(report.ConflictExamples, email)
+				}
+				continue
+			}
 			report.AlreadyOK++
 			continue
 		} else if !errors.Is(err, auth.ErrCredentialNotFound) {
@@ -133,7 +152,13 @@ func (s *Server) SyncCredentialsAtStartup() {
 			log.Printf("[credential-sync] skipped: %v", err)
 			return
 		}
-		log.Printf("[credential-sync] accounts=%d source_entries=%d added=%d already=%d missing=%d failed=%d",
-			report.Accounts, report.Total, report.Added, report.AlreadyOK, report.Missing, report.Failed)
+		log.Printf("[credential-sync] accounts=%d source_entries=%d added=%d already=%d conflicts=%d missing=%d failed=%d",
+			report.Accounts, report.Total, report.Added, report.AlreadyOK, report.Conflicts, report.Missing, report.Failed)
+		if report.Conflicts > 0 {
+			// 分歧不该只躺在 JSON 报告里：启动期没人看那个接口。
+			log.Printf("[credential-sync] %d 个账号的 vault 密码与清单不一致，已保留 vault 的值；"+
+				"若一键回调持续失败请核对这些账号：%s",
+				report.Conflicts, strings.Join(report.ConflictExamples, ", "))
+		}
 	})
 }

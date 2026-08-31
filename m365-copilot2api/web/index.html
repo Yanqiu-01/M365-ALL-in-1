@@ -2170,6 +2170,30 @@ if (response.output_text) {
       <div class="form-group"><label class="form-label" for="regPassword">统一密码</label>
         <input class="form-input" id="regPassword" type="password" autocomplete="new-password" placeholder="注册账号密码"></div>
     </div>
+    <!-- Clash 换出口配置。注册模式里一直有「Clash 节点」这个选项，但这几个值以前
+         没有任何入口能填：clash_nodes 连请求结构里都没有对应字段，只能手工改
+         config.json。缺了它 exitrotate.rotateClash 必然以 "clash api, group and
+         node are required" 失败，界面上却只显示「上一号已写入本地，但换 IP 失败」。 -->
+    <details style="margin-bottom:var(--sp-3)">
+      <summary style="cursor:pointer;font-size:13px;color:var(--fg-muted)">Clash 换出口配置（仅「Clash 节点」模式需要）</summary>
+      <div class="form-row" style="margin-top:var(--sp-2)">
+        <div class="form-group"><label class="form-label" for="regClashApi">Clash 外部控制地址</label>
+          <input class="form-input" id="regClashApi" type="url" placeholder="http://127.0.0.1:9090"></div>
+        <div class="form-group"><label class="form-label" for="regClashSecret">Clash 密钥</label>
+          <input class="form-input" id="regClashSecret" type="password" autocomplete="off" placeholder="留空表示不需要"></div>
+      </div>
+      <div class="form-row">
+        <div class="form-group"><label class="form-label" for="regClashGroup">策略组</label>
+          <input class="form-input" id="regClashGroup" placeholder="Proxy"></div>
+        <div class="form-group"><label class="form-label" for="regClashProxy">Clash 本地代理</label>
+          <input class="form-input" id="regClashProxy" placeholder="http://127.0.0.1:7890"></div>
+      </div>
+      <div class="form-row">
+        <div class="form-group"><label class="form-label" for="regClashNodes">节点清单</label>
+          <textarea class="form-input" id="regClashNodes" rows="4" placeholder="每行一个节点，可选预期出口 IP：&#10;香港01&#10;日本02 = 203.0.113.7"></textarea>
+          <p class="form-hint">每行一个节点名，注册时按顺序轮换出口。<code>节点名 = 预期IP</code> 可选，填了就在实际出口与预期不符时告警。</p></div>
+      </div>
+    </details>
     <div class="btn-row" style="margin-bottom:var(--sp-3)">
       <button type="button" class="btn" onclick="saveRegisterConfig()">保存注册配置</button>
     </div>
@@ -2781,8 +2805,12 @@ if (response.output_text) {
             </div>
             <div class="form-group">
               <label class="form-label" for="setAccountConc">单账号并发</label>
-              <input class="form-input" id="setAccountConc" type="number" min="1" max="64" placeholder="4">
-              <p class="form-hint">同一账号同时在途的请求上限。</p>
+              <!-- 范围与占位值必须跟 account_concurrency.go 的 maxAccountConcurrency=128 /
+                   defaultAccountConcurrency=64 一致。此处原为 max=64 placeholder=4：上限
+                   比后端允许的低一半，占位值又把默认说成 4。后端对越界值是「静默退回
+                   默认 64」，所以填 100 既不报错也不生效，界面上完全看不出发生了什么。 -->
+              <input class="form-input" id="setAccountConc" type="number" min="1" max="128" placeholder="64">
+              <p class="form-hint">1–128，默认 64。同一账号同时在途的请求上限；超出该范围的值会被后端退回默认值。</p>
             </div>
           </div>
           <div class="form-row">
@@ -6394,8 +6422,20 @@ async function loadPanelState(){
     fill('regSiteUrl', d.site_url);
     fill('regEmailDomain', d.email_domain);
     fill('regEmailPrefix', d.email_prefix);
-    fill('regPassword', d.register_password);
+    // 密码不预填真值：后端只回 register_password_set，不再回显明文。留空提交等于
+    // 保持不变（saveRegisterConfig 对空字符串跳过赋值），所以占位符足够说明状态。
+    (()=>{ const el=$('regPassword'); if(!el) return;
+      el.placeholder = d.register_password_set ? '已设置，留空则保持不变' : '尚未设置'; })();
     fill('regFlareSolverr', d.flaresolverr_url);
+    // Clash 配置往返。密钥同密码处理：只显示是否已设置，不回显原值。
+    fill('regClashApi', d.clash_api);
+    fill('regClashGroup', d.clash_group);
+    fill('regClashProxy', d.clash_proxy);
+    (()=>{ const el=$('regClashSecret'); if(!el) return;
+      el.placeholder = d.clash_secret_set ? '已设置，留空则保持不变' : '留空表示不需要'; })();
+    (()=>{ const el=$('regClashNodes'); if(!el||el.value) return;
+      const nodes=Array.isArray(d.clash_nodes)?d.clash_nodes:[];
+      el.value=nodes.map(n=>n.expect_ip?(n.name+' = '+n.expect_ip):n.name).join('\n'); })();
     const rs=$('regStartNum'),os=$('oauthStartNum');
     if(rs&&!rs.value&&d.cred_num_max)rs.value=d.cred_num_max+1;
     else if(rs&&!rs.value&&d.email_start_num)rs.value=d.email_start_num;
@@ -6409,8 +6449,25 @@ async function saveRegisterConfig(){
     emailPrefix:($('regEmailPrefix')?.value||'').trim(),
     password:($('regPassword')?.value||'').trim(),
     emailStartNum:parseInt($('regStartNum')?.value)||0,
-    flaresolverrUrl:($('regFlareSolverr')?.value||'').trim()
+    flaresolverrUrl:($('regFlareSolverr')?.value||'').trim(),
+    clashApi:($('regClashApi')?.value||'').trim(),
+    clashSecret:($('regClashSecret')?.value||'').trim(),
+    clashGroup:($('regClashGroup')?.value||'').trim(),
+    clashProxy:($('regClashProxy')?.value||'').trim()
   };
+  // 节点清单是列表，没有「非空即覆盖」可言：只有文本框真的被渲染过才提交，
+  // 否则一次不相关的保存会把已存的节点表清空。空文本框提交空数组是有意的 ——
+  // 那就是「清空节点表」这个操作本身。
+  const nodesEl=$('regClashNodes');
+  if(nodesEl){
+    body.clashNodes=(nodesEl.value||'').split('\n').map(line=>{
+      const raw=line.trim();
+      if(!raw) return null;
+      const at=raw.indexOf('=');
+      if(at<0) return {name:raw,expectIp:''};
+      return {name:raw.slice(0,at).trim(),expectIp:raw.slice(at+1).trim()};
+    }).filter(n=>n&&n.name);
+  }
   try{
     const d=await api('/api/admin/panel/config',{method:'POST',body:JSON.stringify(body)});
     showNotice(d.register_ready?'注册配置已保存':'已保存，但仍缺必填项','success');

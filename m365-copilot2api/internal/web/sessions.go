@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -27,11 +28,41 @@ type sessionStore struct {
 	persist *persistStore
 }
 
-func openSessionStore() *sessionStore {
-	path := os.Getenv("M365_SESSION_CACHE")
-	if path == "" {
-		path = filepath.Join(os.TempDir(), "m365-copilot2api-sessions.json")
+// conversationIndexPath 决定 sessionStore 的落盘位置。
+//
+// 这里以前直接用 M365_SESSION_CACHE，和 openSessionResolver 是同一个变量 ——
+// 而两者的 JSON 形状不兼容：sessionStore 写 map[string]conversation（对象），
+// sessionResolver 写 []sessionBinding（数组）。一旦运维设了这个变量，两个 store
+// 就指向同一个文件，各自 flush 时整文件覆写对方的内容，重启后 Unmarshal 失败
+// 且错误被忽略，于是至少有一方静默地读出空数据。docker-compose.yml 里
+// M365_SESSION_CACHE=/data/sessions.json 正好命中这条路径。
+//
+// README 把 M365_SESSION_CACHE 记作「会话绑定缓存（默认 sessions.json）」，
+// 也就是 sessionResolver 的语义，所以那个变量归 resolver。sessionStore 改为
+// 在同一目录下另取一个文件名：仍然只需要配一个变量就能把两份状态一起挪走
+// （测试里也就仍然一起落在 t.TempDir() 内），但两者永不共用同一个文件。
+// 需要单独指定时用 M365_CONVERSATION_INDEX_CACHE 显式覆盖。
+func conversationIndexPath() string {
+	if explicit := strings.TrimSpace(os.Getenv("M365_CONVERSATION_INDEX_CACHE")); explicit != "" {
+		return explicit
 	}
+	if shared := strings.TrimSpace(os.Getenv("M365_SESSION_CACHE")); shared != "" {
+		dir, file := filepath.Split(shared)
+		ext := filepath.Ext(file)
+		stem := strings.TrimSuffix(file, ext)
+		if stem == "" {
+			stem = "sessions"
+		}
+		if ext == "" {
+			ext = ".json"
+		}
+		return filepath.Join(dir, stem+"-conversations"+ext)
+	}
+	return filepath.Join(os.TempDir(), "m365-copilot2api-sessions.json")
+}
+
+func openSessionStore() *sessionStore {
+	path := conversationIndexPath()
 	s := &sessionStore{path: path, data: map[string]conversation{}}
 	s.persist = &persistStore{flush: s.flush}
 	if b, err := os.ReadFile(path); err == nil {

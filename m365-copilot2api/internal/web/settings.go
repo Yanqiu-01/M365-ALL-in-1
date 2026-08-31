@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"m365-copilot2api/internal/chathub"
 	"m365-copilot2api/internal/outbound"
@@ -184,6 +185,9 @@ func validateSettings(v runtimeSettings) error {
 			return err
 		}
 	}
+	if err := validateOperationalSettings(v); err != nil {
+		return err
+	}
 	seen := make(map[string]struct{}, len(v.ModelMappings))
 	for _, mapping := range v.ModelMappings {
 		model := strings.TrimSpace(mapping.PublicModel)
@@ -207,6 +211,92 @@ func validateSettings(v runtimeSettings) error {
 	}
 	return nil
 }
+
+// validateOperationalSettings 校验为管理台补的那批运行参数。
+//
+// validateSettings 原来只覆盖最早的那几个字段，这批后加的一个都没查。它们经
+// ApplyStartupSettingsEnv 变成环境变量，而每个消费方对越界值的处理是「忽略并
+// 用默认」—— 于是保存 proxyGuardConcurrency=9999 会返回成功、写进 settings.json、
+// 在界面上显示为 9999，实际跑的却是默认 6。也就是说界面显示的配置和进程真正
+// 使用的配置可以长期不一致，而运维手上没有任何提示。
+//
+// 校验区间与各消费方的接受区间一一对应：
+//
+//	proxyGuardInterval         outbound.guardTimingFromEnv  [5s, 1h]，也接受裸秒数
+//	proxyGuardConcurrency      outbound.guardConcurrency    [1, guardMaxConcurrency]
+//	maxConcurrentChats         diag.maxConcurrentChats      [1, maxConfiguredChats]
+//	accountConcurrency         newAccountConcurrency        [1, maxAccountConcurrency]
+//	autoCleanupIntervalMinutes StartAutoCleanup             > 0，上限一天
+//	autoCleanupMaxAgeHours     StartAutoCleanup             > 0，上限一年
+//	autoCleanupKeepN           StartAutoCleanup             > 0，上限 maxCleanupKeepN
+//	persistInterval            persistLoop                  >= 100ms，上限一小时
+//
+// 零值/空串一律放行：settingsEnvOverrides 只注入非零值，「零值 = 沿用内置默认」
+// 是这批字段既有的语义，不能因为加了校验就把它变成非法。
+// 布尔开关（proxyGuardDisabled、allowFakeIpSource、autoCleanupDisabled、
+// httpTraceVerbose）没有取值范围可言，不在此列。
+func validateOperationalSettings(v runtimeSettings) error {
+	if raw := strings.TrimSpace(v.ProxyGuardInterval); raw != "" {
+		interval, err := time.ParseDuration(raw)
+		if err != nil {
+			seconds, convErr := strconv.Atoi(raw)
+			if convErr != nil {
+				return fmt.Errorf("代理巡检间隔必须是时长（如 45s、2m）或纯秒数")
+			}
+			interval = time.Duration(seconds) * time.Second
+		}
+		if interval < 5*time.Second || interval > time.Hour {
+			return fmt.Errorf("代理巡检间隔必须为 5s-1h")
+		}
+	}
+	if err := validateSettingRange("代理巡检并发", v.ProxyGuardConcurrency, 1, maxProxyGuardConcurrency); err != nil {
+		return err
+	}
+	if err := validateSettingRange("全局聊天并发", v.MaxConcurrentChats, 1, maxConfiguredChats); err != nil {
+		return err
+	}
+	if err := validateSettingRange("单账号并发", v.AccountConcurrency, 1, maxAccountConcurrency); err != nil {
+		return err
+	}
+	if err := validateSettingRange("自动清理间隔（分钟）", v.AutoCleanupIntervalMinutes, 1, 1440); err != nil {
+		return err
+	}
+	if err := validateSettingRange("自动清理过期时长（小时）", v.AutoCleanupMaxAgeHours, 1, 8760); err != nil {
+		return err
+	}
+	if err := validateSettingRange("云端对话保留条数", v.AutoCleanupKeepN, 1, maxCleanupKeepN); err != nil {
+		return err
+	}
+	if raw := strings.TrimSpace(v.PersistInterval); raw != "" {
+		interval, err := time.ParseDuration(raw)
+		if err != nil {
+			return fmt.Errorf("落盘间隔必须是时长（如 5s、500ms）")
+		}
+		// persistLoop 低于 100ms 直接忽略并沿用 5s，界面上却会显示已保存的值。
+		if interval < 100*time.Millisecond || interval > time.Hour {
+			return fmt.Errorf("落盘间隔必须为 100ms-1h")
+		}
+	}
+	return nil
+}
+
+// maxProxyGuardConcurrency 镜像 internal/outbound 未导出的 guardMaxConcurrency
+// （=20，见 internal/outbound/guard.go 的 guardConcurrency）。那个包不导出它，
+// 无法在这里直接引用。若两者哪天不一致，后果是保存时被拒而不是「保存成功但实际
+// 不生效」—— 也就是本函数要消除的那种沉默偏差，方向上是安全的。
+const maxProxyGuardConcurrency = 20
+
+// validateSettingRange 放行零值（沿用默认），拒绝负数与越界值。
+func validateSettingRange(label string, value, min, max int) error {
+	if value == 0 {
+		return nil
+	}
+	if value < min || value > max {
+		return fmt.Errorf("%s必须为 %d-%d", label, min, max)
+	}
+	return nil
+}
+
 func (s *settingsStore) get() runtimeSettings { s.mu.RLock(); defer s.mu.RUnlock(); return s.v }
 func (s *settingsStore) save(v runtimeSettings) error {
 	if e := validateSettings(v); e != nil {

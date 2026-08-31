@@ -78,26 +78,48 @@ func RefreshWithScope(refreshToken, clientID, scope string) (TokenSet, error) {
 }
 
 func ROPC(username, password string) (TokenSet, error) {
+	return ROPCVia("", username, password)
+}
+
+// ROPCVia 与 ROPC 相同，但把请求钉在指定出口上。
+//
+// 批量授权需要按自己的节奏轮换出口：outbound.HTTPClient() 每次返回池子当前偏好的同一个
+// 出口，几百个账号会全部从同一个 IP 发出 —— 那正是最容易被上游判成异常的形态。
+// exitRawURL 为空时行为与 ROPC 完全一致。
+func ROPCVia(exitRawURL, username, password string) (TokenSet, error) {
+	form := ropcForm(username, password)
+	return requestTokenTenantVia(exitRawURL, form, ropcEndpoint())
+}
+
+func ropcForm(username, password string) url.Values {
 	form := url.Values{}
 	form.Set("client_id", FOCIClientID)
 	form.Set("grant_type", "password")
 	form.Set("username", username)
 	form.Set("password", password)
 	form.Set("scope", Scope())
-	auth := Authority();
+	return form
+}
+
+func ropcEndpoint() string {
+	auth := Authority()
 	if strings.HasSuffix(auth, "/common") || strings.HasSuffix(auth, "/consumers") {
 		auth = auth[:strings.LastIndex(auth, "/")]
 	}
-	return requestTokenTenant(form, auth+"/organizations/oauth2/v2.0/token")
+	return auth + "/organizations/oauth2/v2.0/token"
 }
 
 func requestTokenTenant(form url.Values, endpoint string) (TokenSet, error) {
+	return requestTokenTenantVia("", form, endpoint)
+}
+
+func requestTokenTenantVia(exitRawURL string, form url.Values, endpoint string) (TokenSet, error) {
 	req, err := http.NewRequest(http.MethodPost, endpoint, strings.NewReader(form.Encode()))
 	if err != nil {
 		return TokenSet{}, err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	resp, err := outbound.HTTPClient().Do(req)
+	resp, err := outbound.HTTPClientForExit(exitRawURL).Do(req)
 	if err != nil {
 		return TokenSet{}, err
 	}

@@ -472,12 +472,30 @@ const refreshAllConcurrency = 4
 // 而汇总结果是给管理台看的，不需要完整堆栈。
 const refreshAllErrorMaxLen = 200
 
+// refreshAllEntry 是单个账号的刷新结果。
+//
+// Status 区分四种结局，OK 保留给前端做布尔判断：
+//
+//	refreshed     — 真的刷新成功
+//	failed        — 真的发起了刷新，上游拒绝
+//	timeout       — 真的发起了刷新，总预算用尽时还没回来
+//	not_attempted — 排在信号量后面，预算用尽前根本没轮到它
+//
+// 前三种是账号/上游的状态，最后一种是网关自己的调度结果，与账号无关。
 type refreshAllEntry struct {
-	ID    string `json:"id"`
-	Email string `json:"email"`
-	OK    bool   `json:"ok"`
-	Error string `json:"error,omitempty"`
+	ID     string `json:"id"`
+	Email  string `json:"email"`
+	OK     bool   `json:"ok"`
+	Status string `json:"status"`
+	Error  string `json:"error,omitempty"`
 }
+
+const (
+	refreshStatusRefreshed    = "refreshed"
+	refreshStatusFailed       = "failed"
+	refreshStatusTimeout      = "timeout"
+	refreshStatusNotAttempted = "not_attempted"
+)
 
 // refreshAllBudget 给整体刷新一个上限：基准 90s，账号多时按每账号 2s 放大，
 // 最多 10 分钟。超时后返回已完成的部分结果，未完成的标记为 timeout。
@@ -536,12 +554,15 @@ func (s *Server) refreshAllAccounts(w http.ResponseWriter, r *http.Request) {
 	list := s.tokens.List()
 	entries := make([]refreshAllEntry, len(list))
 	filled := make([]bool, len(list))
+	// attempted[i] 表示该账号真的拿到了信号量并调用了 ForceRefresh。
+	// 没拿到就意味着网关自己的预算先到期了，这不是账号的失败。
+	attempted := make([]bool, len(list))
 	var mu sync.Mutex
 
 	ctx, cancel := context.WithTimeout(r.Context(), refreshAllBudget(len(list)))
 	defer cancel()
 
-	record := func(i int, ok bool, message string) {
+	record := func(i int, ok bool, status, message string) {
 		mu.Lock()
 		defer mu.Unlock()
 		if filled[i] {
@@ -549,7 +570,13 @@ func (s *Server) refreshAllAccounts(w http.ResponseWriter, r *http.Request) {
 		}
 		filled[i] = true
 		entries[i].OK = ok
+		entries[i].Status = status
 		entries[i].Error = message
+	}
+	markAttempted := func(i int) {
+		mu.Lock()
+		attempted[i] = true
+		mu.Unlock()
 	}
 
 	for i := range list {
@@ -568,16 +595,19 @@ func (s *Server) refreshAllAccounts(w http.ResponseWriter, r *http.Request) {
 			case sem <- struct{}{}:
 				defer func() { <-sem }()
 			case <-ctx.Done():
-				// 预算已用尽，排队中的账号不再发起刷新。
+				// 预算已用尽，排队中的账号不再发起刷新。汇总阶段据 attempted
+				// 把它记成 not_attempted，而不是替这个账号背一次失败。
 				return
 			}
+			markAttempted(index)
 			if _, err := s.tokens.ForceRefresh(acc.ID); err != nil {
-				record(index, false, sanitizeRefreshError(err, acc.RefreshToken))
+				record(index, false, refreshStatusFailed, sanitizeRefreshError(err, acc.RefreshToken))
 				return
 			}
-			record(index, true, "")
+			record(index, true, refreshStatusRefreshed, "")
 		}, func(any) {
-			record(index, false, "internal error")
+			markAttempted(index)
+			record(index, false, refreshStatusFailed, "internal error")
 		})
 	}
 
@@ -593,16 +623,28 @@ func (s *Server) refreshAllAccounts(w http.ResponseWriter, r *http.Request) {
 
 	mu.Lock()
 	out := make([]refreshAllEntry, 0, len(entries))
-	refreshed, failed := 0, 0
+	refreshed, failed, notAttempted := 0, 0, 0
 	for i := range entries {
 		entry := entries[i]
 		if !filled[i] {
 			entry.OK = false
-			entry.Error = "timeout"
+			// 已发起但预算耗尽时仍未返回 → timeout（账号确实被试过了）。
+			// 连信号量都没拿到 → not_attempted，不计入 failed：把网关自己的
+			// 排队上限算成账号的错，会让管理台把一批健康账号报成刷新失败。
+			if attempted[i] {
+				entry.Status = refreshStatusTimeout
+				entry.Error = "timeout"
+			} else {
+				entry.Status = refreshStatusNotAttempted
+				entry.Error = "not attempted: refresh budget expired while queued"
+			}
 		}
-		if entry.OK {
+		switch {
+		case entry.OK:
 			refreshed++
-		} else {
+		case entry.Status == refreshStatusNotAttempted:
+			notAttempted++
+		default:
 			failed++
 		}
 		out = append(out, entry)
@@ -613,6 +655,8 @@ func (s *Server) refreshAllAccounts(w http.ResponseWriter, r *http.Request) {
 		"total":     len(out),
 		"refreshed": refreshed,
 		"failed":    failed,
-		"results":   out,
+		// 未尝试的账号单独计数：total 仍是 refreshed+failed+not_attempted。
+		"not_attempted": notAttempted,
+		"results":       out,
 	})
 }

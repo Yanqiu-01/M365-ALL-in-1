@@ -830,12 +830,20 @@ func (s *Server) provisionAccount(w http.ResponseWriter, r *http.Request) {
 	}})
 }
 
-// beginPKCEAuthorization 生成一次新的 PKCE 授权，返回 state、授权 URL、
-// 代数与 redirect URI。startPKCE 与「账密一键回调」的交互式回退路径共用
-// 它，因此仓库里只有一套 PKCE 实现。
 // maxPendingPKCE 限制并发进行中的授权数，避免这张表无界增长。
-// 批量授权的并发上限是 16，留出余量。
-const maxPendingPKCE = 64
+//
+// 它必须严格大于单批授权的账号数上限，否则一批还没走完就开始淘汰自己的
+// state，被淘汰的那些账号回调时拿到 "invalid or expired state"，正是
+// fix/concurrent-pkce-batch-oauth 要消灭的现象。
+//
+// 因此这里从 panelOAuthBatchMax 推导，而不是各写一个字面量。原先的注释说
+// 「批量授权的并发上限是 16，留出余量」，两个数都对不上代码：批量上限是
+// panelOAuthBatchMax = 64（那条注释写的 16 是被删掉的 Python worker 时代的值），
+// 而表上限也正好是 64 —— 等于一点余量都没有，满批 64 个账号时第 64 次登记就会
+// 淘汰第 1 个。
+// 留 2 倍余量：一批占满之后，交互式授权和另一批仍有位置。
+// TestPendingPKCETableLeavesHeadroomOverBatchCap 守着这个不变量。
+const maxPendingPKCE = 2 * panelOAuthBatchMax
 
 // registerPKCEState 登记一个进行中的授权，并返回它的 generation。
 //
@@ -883,7 +891,18 @@ func (s *Server) registerPKCEState(state, verifier string, keepOthers bool) uint
 	return attempt
 }
 
-func (s *Server) beginPKCEAuthorization(prompt string) (string, string, uint64, string, error) {
+// beginPKCEAuthorization 生成一次新的 PKCE 授权，返回 state、授权 URL、
+// 代数与 redirect URI。startPKCE 与「账密一键回调」的交互式回退路径共用
+// 它，因此仓库里只有一套 PKCE 实现。
+//
+// keepOthers 的含义与 registerPKCEState 完全一致，而且必须由调用方给出：
+// 这里原先写死 false，于是每个走这条路的调用者都拿到「整表覆盖」语义。
+// 对交互式单账号授权那是对的，对批量授权则是灾难 —— runOAuthBatch 与
+// runRegister 都在循环里逐个账号调它，前 N-1 个 state 被后来者抹掉，那些账号
+// 回调时只会得到 "invalid or expired state"。这正是
+// fix/concurrent-pkce-batch-oauth 修过的缺陷，它当时只修到 /api/auth/start
+// 那条 HTTP 路径，Go 内置的批量路径走的是这个函数，所以又原样复现了一遍。
+func (s *Server) beginPKCEAuthorization(prompt string, keepOthers bool) (string, string, uint64, string, error) {
 	v, err := auth.Verifier()
 	if err != nil {
 		return "", "", 0, "", err
@@ -895,7 +914,7 @@ func (s *Server) beginPKCEAuthorization(prompt string) (string, string, uint64, 
 	state := hex.EncodeToString(b)
 	redirectURI := auth.RedirectURI()
 
-	attempt := s.registerPKCEState(state, v, false)
+	attempt := s.registerPKCEState(state, v, keepOthers)
 
 	url := auth.AuthorizationURLWithPrompt(
 		auth.AuthorizeEndpoint(),

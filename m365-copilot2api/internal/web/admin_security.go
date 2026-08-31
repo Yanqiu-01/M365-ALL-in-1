@@ -155,6 +155,18 @@ const maxLoginAttemptEntries = 4096
 // brute-force guard became a permanent denial of service for every legitimate
 // administrator sharing that address. The window now always expires on its own
 // schedule and one successful login clears the counter outright.
+//
+// Table saturation fails closed. When the table is full of live entries and the
+// sweep frees nothing, a source with no entry cannot be tracked, and the old
+// code answered "not locked" for it: the lockout simply stopped applying to
+// every new source. That is deliberately reachable - an attacker sends one
+// failed login from each of maxLoginAttemptEntries addresses (or spoofed
+// X-Forwarded-For values behind a loopback reverse proxy), then brute-forces
+// from address 4097 with no budget at all. An untrackable source is therefore
+// treated as locked for the policy window instead. It costs a valid
+// administrator nothing: adminLogin verifies the password before it ever calls
+// this, so a correct credential still gets in while the table is saturated -
+// only failing attempts are turned away.
 func (s *Server) recordLoginFailure(ip string, now time.Time, p loginPolicy) (bool, time.Duration) {
 	if p.Threshold <= 0 || p.Window <= 0 {
 		p = loginPolicyFor(false)
@@ -168,7 +180,7 @@ func (s *Server) recordLoginFailure(ip string, now time.Time, p loginPolicy) (bo
 			}
 		}
 		if len(s.loginAttempts) >= maxLoginAttemptEntries {
-			return false, 0
+			return true, p.Window
 		}
 	}
 	a := s.loginAttempts[ip]

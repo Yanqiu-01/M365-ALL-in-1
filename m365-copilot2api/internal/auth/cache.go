@@ -47,6 +47,38 @@ type inflightRefresh struct {
 	err  error
 }
 
+// refreshFunc is the AAD refresh call used by the store. It is a var only so
+// tests can drive the failure path without reaching the token endpoint;
+// production never reassigns it.
+var refreshFunc = Refresh
+
+// markStatusLocked writes only the Status field of the stored entry and returns
+// the merged current entry.
+//
+// The caller works from a snapshot taken outside the lock. Writing that whole
+// snapshot back is what lost concurrent updates: a refresh that failed would
+// restore the access token, refresh token and expiry that were current when it
+// started, silently discarding a token another goroutine had already stored.
+// Status is the only field a failed refresh actually knows something about.
+func (s *Store) markStatusLocked(id, status string) (AccountToken, bool) {
+	for i := range s.data.Accounts {
+		if s.data.Accounts[i].ID != id {
+			continue
+		}
+		s.data.Accounts[i].Status = status
+		_ = s.saveLocked()
+		return s.data.Accounts[i], true
+	}
+	return AccountToken{}, false
+}
+
+// markStatus is markStatusLocked with the store lock taken.
+func (s *Store) markStatus(id, status string) (AccountToken, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.markStatusLocked(id, status)
+}
+
 func CachePath() string {
 	if dir := os.Getenv("M365_DATA_DIR"); dir != "" {
 		return filepath.Join(dir, "accounts.json")
@@ -270,16 +302,11 @@ func (s *Store) ensureValid(id string, force bool) (AccountToken, error) {
 		return acc, nil
 	}
 	if acc.RefreshToken == "" {
-		acc.Status = "expired"
-		s.mu.Lock()
-		for i, a := range s.data.Accounts {
-			if a.ID == acc.ID {
-				s.data.Accounts[i] = acc
-				_ = s.saveLocked()
-				break
-			}
+		if current, ok := s.markStatus(acc.ID, "expired"); ok {
+			acc = current
+		} else {
+			acc.Status = "expired"
 		}
-		s.mu.Unlock()
 		return acc, fmtExpired()
 	}
 	return s.refreshInflight(acc)
@@ -302,18 +329,16 @@ func (s *Store) refreshInflight(acc AccountToken) (AccountToken, error) {
 	s.inflight[acc.ID] = f
 	s.mu.Unlock()
 
-	tok, err := Refresh(acc.RefreshToken)
+	tok, err := refreshFunc(acc.RefreshToken)
 	if err != nil {
-		acc.Status = "expired"
-		s.mu.Lock()
-		for i, a := range s.data.Accounts {
-			if a.ID == acc.ID {
-				s.data.Accounts[i] = acc
-				_ = s.saveLocked()
-				break
-			}
+		// Only the status is ours to write. acc is a snapshot from before the
+		// network call; a concurrent Upsert may have stored a fresh token in the
+		// meantime and writing the snapshot back would throw it away.
+		if current, ok := s.markStatus(acc.ID, "expired"); ok {
+			acc = current
+		} else {
+			acc.Status = "expired"
 		}
-		s.mu.Unlock()
 		f.acc, f.err = acc, err
 	} else {
 		if tok.Email == "" {

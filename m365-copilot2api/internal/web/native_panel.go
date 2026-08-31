@@ -152,26 +152,31 @@ type nativePanelFileConfig struct {
 		// TurnstileSite 只解码保留，本模块没有任何读者：站点 key 由注册页自己
 		// 提供，registerReady() 也不再要求它。保留字段是为了让操作员配置里已有
 		// 的这个键在 saveRegisterConfig 整体覆盖时不被丢掉，而不是它还有用。
-		TurnstileSite   string `json:"turnstile_sitekey"`
-		FlareSolverrURL string `json:"flaresolverr_url"`
-		EmailDomain     string `json:"email_domain"`
-		EmailPrefix     string `json:"email_prefix"`
-		Password        string `json:"password"`
-		PlanID          string `json:"plan_id"`
-		DomainID        string `json:"domain_id"`
-		EmailStartNum   int    `json:"email_start_num"`
-		DisplayBase     int    `json:"display_base"`
-		CredentialFile  string `json:"cred_file"`
-		PhoneSOCKS      string `json:"phone_socks"`
-		ClashAPI        string `json:"clash_api"`
-		ClashSecret     string `json:"clash_secret"`
-		ClashGroup      string `json:"clash_group"`
-		ClashProxy      string `json:"clash_proxy"`
-		ClashNodes      []struct {
-			Name     string `json:"name"`
-			ExpectIP string `json:"expect_ip"`
-		} `json:"clash_nodes"`
+		TurnstileSite   string            `json:"turnstile_sitekey"`
+		FlareSolverrURL string            `json:"flaresolverr_url"`
+		EmailDomain     string            `json:"email_domain"`
+		EmailPrefix     string            `json:"email_prefix"`
+		Password        string            `json:"password"`
+		PlanID          string            `json:"plan_id"`
+		DomainID        string            `json:"domain_id"`
+		EmailStartNum   int               `json:"email_start_num"`
+		DisplayBase     int               `json:"display_base"`
+		CredentialFile  string            `json:"cred_file"`
+		PhoneSOCKS      string            `json:"phone_socks"`
+		ClashAPI        string            `json:"clash_api"`
+		ClashSecret     string            `json:"clash_secret"`
+		ClashGroup      string            `json:"clash_group"`
+		ClashProxy      string            `json:"clash_proxy"`
+		ClashNodes      []clashNodeConfig `json:"clash_nodes"`
 	} `json:"register"`
+}
+
+// clashNodeConfig 是配置文件里的一个 Clash 节点。原先它是匿名结构体，
+// 于是 saveRegisterConfig 无法为它构造值，节点表只能靠手工改 config.json ——
+// 这就是 clash 模式在界面上无法配置的直接原因。
+type clashNodeConfig struct {
+	Name     string `json:"name"`
+	ExpectIP string `json:"expect_ip"`
 }
 
 func defaultNativePanelFileConfig() nativePanelFileConfig {
@@ -209,6 +214,13 @@ func (p nativePanelPaths) saveConfig(cfg nativePanelFileConfig) error {
 	return nil
 }
 
+// nativePanelClashNodeRequest 是一个 Clash 节点。ExpectIP 可空：填了就由
+// exitrotate 在实际出口 IP 与预期不符时给出告警。
+type nativePanelClashNodeRequest struct {
+	Name     string `json:"name"`
+	ExpectIP string `json:"expectIp"`
+}
+
 type nativePanelRegisterConfigRequest struct {
 	SiteURL         string `json:"siteUrl"`
 	EmailDomain     string `json:"emailDomain"`
@@ -221,6 +233,17 @@ type nativePanelRegisterConfigRequest struct {
 	ClashSecret     string `json:"clashSecret"`
 	ClashGroup      string `json:"clashGroup"`
 	ClashProxy      string `json:"clashProxy"`
+	// ClashNodes 之前根本不存在，而 clash 模式注册离了它就跑不起来：
+	// exitrotate.rotateClash 要求 api/group/node 三者齐备，节点名只能来自
+	// cfg.Register.ClashNodes（panel_register.go 的 clashNodes()）。配置结构里
+	// 有 clash_nodes 这个键、状态接口回报 clash_node_total、界面上也能选「Clash
+	// 节点」模式，唯独没有任何入口能把它写进去 —— 于是选了这个模式必然以
+	// 「clash api, group and node are required」失败。
+	//
+	// 指针语义区分「没提这个字段」（保持不变，与其余字段一致）和「显式传了空
+	// 数组」（清空节点表）。节点表是个列表，没有「非空即覆盖」可言，所以不能
+	// 沿用其它字段的 TrimSpace 判断。
+	ClashNodes *[]nativePanelClashNodeRequest `json:"clashNodes,omitempty"`
 }
 
 func (m *nativePanelManager) saveRegisterConfig(req nativePanelRegisterConfigRequest) (nativePanelFileConfig, error) {
@@ -260,6 +283,22 @@ func (m *nativePanelManager) saveRegisterConfig(req nativePanelRegisterConfigReq
 	}
 	if v := strings.TrimSpace(req.ClashProxy); v != "" {
 		cfg.Register.ClashProxy = v
+	}
+	if req.ClashNodes != nil {
+		// 整表替换而不是追加：界面上编辑的就是一份完整清单，追加语义会让删掉
+		// 一个节点变成做不到的事。名字为空的行直接丢掉 —— rotateClash 对空节点
+		// 名一律报错，留着它只会让整批注册在某一轮突然失败。
+		nodes := make([]clashNodeConfig, 0, len(*req.ClashNodes))
+		seen := make(map[string]bool, len(*req.ClashNodes))
+		for _, node := range *req.ClashNodes {
+			name := strings.TrimSpace(node.Name)
+			if name == "" || seen[name] {
+				continue
+			}
+			seen[name] = true
+			nodes = append(nodes, clashNodeConfig{Name: name, ExpectIP: strings.TrimSpace(node.ExpectIP)})
+		}
+		cfg.Register.ClashNodes = nodes
 	}
 	if err := paths.saveConfig(cfg); err != nil {
 		return nativePanelFileConfig{}, err
@@ -498,6 +537,13 @@ func (m *nativePanelManager) state(server *Server) map[string]any {
 	// 密钥只回传是否已设置，不回传原值。
 	state["clash_secret_set"] = strings.TrimSpace(cfg.Register.ClashSecret) != ""
 	state["clash_node_total"] = len(cfg.Register.ClashNodes)
+	// 节点清单本身也要回传，否则界面只知道「有几个」而无法显示或编辑它们，
+	// 配置往返仍然是单向的。节点名与预期 IP 都不是机密，回显是安全的。
+	nodes := make([]map[string]string, 0, len(cfg.Register.ClashNodes))
+	for _, node := range clashNodes(cfg) {
+		nodes = append(nodes, map[string]string{"name": node.Name, "expect_ip": node.ExpectIP})
+	}
+	state["clash_nodes"] = nodes
 	return state
 }
 
@@ -653,7 +699,8 @@ func (c *nativePanelController) ServeHTTP(w http.ResponseWriter, r *http.Request
 			writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "email 格式无效")
 			return
 		}
-		state, authorizationURL, attempt, redirectURI, err := c.server.beginPKCEAuthorization("login")
+		// 单账号端点，语义与 /api/auth/start 的默认一致：独占。
+		state, authorizationURL, attempt, redirectURI, err := c.server.beginPKCEAuthorization("login", false)
 		if err != nil {
 			writeOpenAIError(w, http.StatusInternalServerError, "pkce_error", err.Error())
 			return

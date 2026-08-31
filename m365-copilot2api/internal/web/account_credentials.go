@@ -256,7 +256,9 @@ func (s *Server) accountRunScripts(w http.ResponseWriter, r *http.Request) {
 
 	// 第 2 级：ROPC 不可用，交回交互式 PKCE。
 	steps = append(steps, runScriptStep{Name: "authorize_ropc", Status: "failed", Detail: ropcErr.Error()})
-	state, url, attempt, redirectURI, err := s.beginPKCEAuthorization("login")
+	// 单账号的交互式回退：保持独占语义，旧的终态条目残留会让 UI 反复进入
+	// 上一次的回调。
+	state, url, attempt, redirectURI, err := s.beginPKCEAuthorization("login", false)
 	if err != nil {
 		steps = append(steps, runScriptStep{Name: "prepare_interactive_authorization", Status: "failed", Detail: err.Error()})
 		writeOpenAIError(w, http.StatusInternalServerError, "pkce_error", err.Error())

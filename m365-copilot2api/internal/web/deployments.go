@@ -221,7 +221,22 @@ func (s *Server) deploymentCheck(w http.ResponseWriter, r *http.Request) {
 	}
 	st.mu.Unlock()
 	start := time.Now()
-	req, _ := http.NewRequestWithContext(r.Context(), http.MethodGet, strings.TrimRight(target, "/")+"/health", nil)
+	// target 来自运维通过 PUT customUrl 存进来的字符串，未经校验。
+	// NewRequestWithContext 对无法解析的 URL 返回 (nil, err)，之前这个错误被
+	// 丢掉，nil 请求直接交给 Do —— Client.do 立刻解引用 req.URL，整个 handler
+	// 以 nil 指针 panic 收场，而不是回一条「这个地址不合法」。
+	req, reqErr := http.NewRequestWithContext(r.Context(), http.MethodGet, strings.TrimRight(target, "/")+"/health", nil)
+	if reqErr != nil {
+		st.mu.Lock()
+		d.Status = "unhealthy"
+		d.LastError = "invalid deployment URL: " + reqErr.Error()
+		d.LastCheckedAt = time.Now()
+		out := *d
+		st.mu.Unlock()
+		_ = st.save()
+		jsonOut(w, map[string]any{"ok": false, "deployment": out})
+		return
+	}
 	resp, e := deploymentHTTPClient.Do(req)
 	lat := time.Since(start).Milliseconds()
 	st.mu.Lock()

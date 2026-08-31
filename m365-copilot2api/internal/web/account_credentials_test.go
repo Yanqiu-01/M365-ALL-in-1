@@ -291,7 +291,7 @@ func TestAccountCredentialRoutesAreRegistered(t *testing.T) {
 // beginPKCEAuthorization 是 startPKCE 与一键回调共用的那一套 PKCE。
 func TestBeginPKCEAuthorizationSharesPKCEState(t *testing.T) {
 	s := &Server{pkce: map[string]pendingPKCE{}}
-	state, url, attempt, redirect, err := s.beginPKCEAuthorization("login")
+	state, url, attempt, redirect, err := s.beginPKCEAuthorization("login", false)
 	if err != nil {
 		t.Fatal(err)
 	}

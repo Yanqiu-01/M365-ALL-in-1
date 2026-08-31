@@ -45,13 +45,48 @@ func openDebugStore() *debugStore {
 	return &debugStore{path: p}
 }
 
-var sensitiveKeys = map[string]bool{
-	"api_key": true, "apikey": true, "apiKey": true, "authorization": true,
-	"access_token": true, "accessToken": true, "refresh_token": true, "refreshToken": true,
-	"client_secret": true, "clientSecret": true, "password": true, "current_password": true,
-	"new_password": true, "token": true, "bearer": true, "session_key": true,
-	"secret": true, "next_token": true, "pkce_verifier": true, "code_verifier": true,
+// sensitiveKeyNames 是需要在调试记录里打码的字段名。
+//
+// 匹配一律走 sensitiveKey()，它把两侧都归一化（去掉分隔符并转小写），所以
+// 这里写 camelCase 还是 snake_case 都等价，新增条目也不会因为大小写写法而
+// 静默失效 —— 之前查表用的是 strings.ToLower(k)，而表里 "accessToken"、
+// "refreshToken"、"clientSecret" 三条是 camelCase，永远不可能命中，
+// 于是上游返回体里的这三个字段原样写进了 debug-logs.jsonl。
+// （"apiKey" 也是 camelCase，但同表已有 "apikey" 兜住，实际未泄漏。）
+var sensitiveKeyNames = []string{
+	"api_key", "apiKey", "authorization",
+	"access_token", "accessToken", "refresh_token", "refreshToken",
+	"client_secret", "clientSecret", "password", "current_password",
+	"new_password", "token", "bearer", "session_key",
+	"secret", "next_token", "pkce_verifier", "code_verifier",
 }
+
+// sensitiveKeys 以归一化后的键为索引，由 sensitiveKeyNames 构建。
+var sensitiveKeys = func() map[string]bool {
+	out := make(map[string]bool, len(sensitiveKeyNames))
+	for _, name := range sensitiveKeyNames {
+		out[normalizeSensitiveKey(name)] = true
+	}
+	return out
+}()
+
+// normalizeSensitiveKey 去掉下划线、连字符与空格并转小写，让 accessToken、
+// access_token、Access-Token、"Access Token" 归到同一个键上。
+func normalizeSensitiveKey(key string) string {
+	var b strings.Builder
+	b.Grow(len(key))
+	for _, r := range strings.ToLower(strings.TrimSpace(key)) {
+		switch r {
+		case '_', '-', ' ', '.':
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
+// sensitiveKey 判定一个 JSON 字段名是否需要打码。
+func sensitiveKey(key string) bool { return sensitiveKeys[normalizeSensitiveKey(key)] }
 
 func redactBody(b []byte) any {
 	var v any
@@ -66,7 +101,7 @@ func redactValue(v any) {
 	switch x := v.(type) {
 	case map[string]any:
 		for k, val := range x {
-			if sensitiveKeys[strings.ToLower(k)] {
+			if sensitiveKey(k) {
 				if _, isNested := val.(map[string]any); isNested {
 					redactValue(val)
 				} else {

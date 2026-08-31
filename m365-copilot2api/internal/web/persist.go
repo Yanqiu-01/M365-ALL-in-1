@@ -4,6 +4,7 @@ import (
 	"log"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -13,7 +14,9 @@ type persistStore struct {
 	writeMu sync.Mutex
 	dirtyMu sync.Mutex
 	dirty   bool
-	flush   func() error // 自行管理数据快照锁，锁外写盘
+	// registered 保证一个 store 只进 persistList 一次。见 ensurePersistLoop。
+	registered atomic.Bool
+	flush      func() error // 自行管理数据快照锁，锁外写盘
 }
 
 func (p *persistStore) markDirty() {
@@ -64,10 +67,20 @@ var (
 	persistStopped chan struct{}
 )
 
+// ensurePersistLoop 注册一个 store 并保证后台循环已启动。
+//
+// 注册必须幂等：每次 markDirty 都无条件 append 时，persistList 会随写入次数
+// 线性增长且永不回收 —— 一个长跑的网关每次会话/对话变更都往里塞一份同一个
+// 指针，内存只增不减，且每轮 FlushAllPersist 都要复制并遍历这条越来越长的
+// 列表（其中除一份之外全是重复项，进 flushPending 后因 dirty 已被清掉而空转）。
+// 表现就是常驻内存和每 5 秒的 CPU 开销随运行时长一起爬升。
+// 现在每个 store 只入列一次，列表长度等于 store 的个数。
 func ensurePersistLoop(p *persistStore) {
-	persistMu.Lock()
-	persistList = append(persistList, p)
-	persistMu.Unlock()
+	if p.registered.CompareAndSwap(false, true) {
+		persistMu.Lock()
+		persistList = append(persistList, p)
+		persistMu.Unlock()
+	}
 	persistOnce.Do(func() {
 		persistStop = make(chan struct{})
 		persistStopped = make(chan struct{})

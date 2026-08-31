@@ -19,15 +19,15 @@ import (
 )
 
 const (
-	freeProxySourceMaxBytes      int64 = 256 << 10
-	freeProxySourceTimeout             = 12 * time.Second
-	freeProxyImportTimeout             = 45 * time.Second
+	freeProxySourceMaxBytes int64 = 256 << 10
+	freeProxySourceTimeout        = 12 * time.Second
+	freeProxyImportTimeout        = 45 * time.Second
 	// 200 个候选按 4 并发 x 10s 超时，最坏要 8 分钟才探完，直接顶穿预算。
 	// 探测是纯网络等待，几乎不吃 CPU，提到 16 后最坏约 2 分钟。
-	freeProxyProbeConcurrency = 16
-	freeProxyDefaultImportLimit        = 10
-	freeProxyMaxImportLimit            = 200
-	freeProxySourceRedirectLimit       = 3
+	freeProxyProbeConcurrency    = 16
+	freeProxyDefaultImportLimit  = 10
+	freeProxyMaxImportLimit      = 200
+	freeProxySourceRedirectLimit = 3
 	// 翻页抓取。快代理这类站点每页只有 12 行，只抓第一页最多就 12 条 ——
 	// 想凑够成百上千个候选必须翻页。
 	//
@@ -106,11 +106,25 @@ func (s *Server) importFreeProxySource(w http.ResponseWriter, r *http.Request) {
 	if pages > 1 {
 		timeout = freeProxyPageFetchTimeout
 	}
+	// 来源本身不受支持要在联网之前就答复，而且要用 400 —— 那是请求的问题，
+	// 不是上游的问题。原先无论哪种原因都回同一句 502「获取失败；仅支持公开可
+	// 访问的 http/https 文本列表」，两件完全不同的事被揉在一起：操作员看不出该
+	// 去修网络还是该换来源。实测连续三次 502、每次 45s，全都是抓取超时，而那句
+	// 话却在指向「格式不支持」。
+	if err := validateFreeProxySourceURL(body.SourceURL); err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error",
+			"免费代理来源不受支持："+err.Error()+"；只接受公开可访问的 http/https 地址")
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(r.Context(), timeout)
 	defer cancel()
 	payload, fetchedPages, err := fetchFreeProxyPages(ctx, body.SourceURL, pages)
 	if err != nil {
-		writeOpenAIError(w, http.StatusBadGateway, "proxy_source_error", "免费代理来源获取失败；仅支持公开可访问的 http/https 文本列表")
+		// 抓取失败：说清是哪一类网络故障、等了多久，操作员据此判断是重试、
+		// 换网络还是换来源。来源 URL 本身不回显（常带短时效令牌）。
+		writeOpenAIError(w, http.StatusBadGateway, "proxy_source_error",
+			"免费代理来源抓取失败（"+describeFreeProxyFetchFailure(ctx, err, timeout)+"）；地址格式是合法的，请检查网络连通性或稍后重试")
 		return
 	}
 
@@ -347,10 +361,20 @@ func parseFreeProxyCandidates(payload []byte, defaultScheme string) ([]string, i
 	invalid := 0
 
 	// 第一遍：自带 scheme:// 或 ip:port 的紧凑写法，语义明确，优先采信。
-	// compactSeen 记录本遍已产出的端点，供第二遍跳过 —— 同一条记录被两种
-	// 形态同时命中属于解析器的自我重复，不应冒充来源里的重复。
+	// compactSeen 记录本遍已产出的端点（带协议前缀），供第二遍跳过 —— 同一条
+	// 记录被两种形态同时命中属于解析器的自我重复，不应冒充来源里的重复。
+	//
+	// compactEndpoints 记录本遍**处理过**的裸 host:port，无论成功还是被拒。
+	// 第二遍的「无效」计数要靠它去重：compactSeen 的键带 scheme://前缀，而
+	// proxyEndpointKeyOf 给出的是裸 host:port，两者永远不相等，所以原先那道
+	// 「只在第一遍没见过时才计入无效」的判断从来没有生效过。socks4 现在也走这
+	// 条路，紧凑写法 socks4://ip:port 会在两遍里各命中一次，去重必须真的管用。
 	compactSeen := map[string]bool{}
+	compactEndpoints := map[string]bool{}
 	for _, token := range compactProxyTokens(text) {
+		if endpoint := compactTokenEndpoint(token); endpoint != "" {
+			compactEndpoints[endpoint] = true
+		}
 		candidate, key, err := normalizeFreeProxyCandidate(token, defaultScheme)
 		if err != nil {
 			invalid++
@@ -362,15 +386,25 @@ func parseFreeProxyCandidates(payload []byte, defaultScheme string) ([]string, i
 
 	// 第二遍：以 IPv4 为锚点做窗口扫描，覆盖「IP 与端口分列」的表格形态。
 	for _, hit := range scanIPPortWindows(text) {
+		if hit.unsupported {
+			// 这一行写明了不受支持的协议（socks4）。它必须计入 Invalid：
+			// 原先扫描阶段直接丢掉，于是它既不在 Discovered 也不在 Invalid，
+			// 报告里的数字加不起来。与下面的私网地址走同一道去重判断，
+			// 避免第一遍已经处理过的同一端点被数两次。
+			if !compactEndpoints[proxyEndpointKeyOf(hit.host, hit.port)] {
+				invalid++
+			}
+			continue
+		}
 		scheme := hit.scheme
 		if scheme == "" {
 			scheme = defaultScheme
 		}
 		candidate, key, err := normalizeFreeProxyCandidate(hit.host+":"+hit.port, scheme)
 		if err != nil {
-			// 私网/保留地址在此被拒；只在第一遍没见过时才计入无效，
+			// 私网/保留地址在此被拒；只在第一遍没处理过时才计入无效，
 			// 否则同一条坏记录会被数两次。
-			if !compactSeen[proxyEndpointKeyOf(hit.host, hit.port)] {
+			if !compactEndpoints[proxyEndpointKeyOf(hit.host, hit.port)] {
 				invalid++
 			}
 			continue
@@ -384,10 +418,29 @@ func parseFreeProxyCandidates(payload []byte, defaultScheme string) ([]string, i
 	return out, invalid
 }
 
-// proxyEndpointKeyOf 构造与 normalizeFreeProxyCandidate 一致的端点键，
-// 用于在候选被拒时也能判断第一遍是否已经处理过同一端点。
+// proxyEndpointKeyOf 构造裸 host:port 端点键，用于在候选被拒时判断第一遍是否
+// 已经处理过同一端点。注意它与 normalizeFreeProxyCandidate 返回的键**不同**：
+// 后者带 scheme:// 前缀。两者混用是原先那道去重判断失效的原因。
 func proxyEndpointKeyOf(host, port string) string {
 	return strings.ToLower(host) + ":" + port
+}
+
+// compactTokenEndpoint 从紧凑 token 里取出裸 host:port，不做任何合法性判断。
+// 只服务于「第一遍是否处理过这个端点」的去重，因此对拿不准的 token 返回空串，
+// 宁可少去重也不要错去重。
+func compactTokenEndpoint(token string) string {
+	token = strings.TrimSpace(token)
+	if at := strings.Index(token, "://"); at >= 0 {
+		token = token[at+3:]
+	}
+	if slash := strings.IndexAny(token, "/?#"); slash >= 0 {
+		token = token[:slash]
+	}
+	host, port, err := net.SplitHostPort(token)
+	if err != nil || host == "" || port == "" {
+		return ""
+	}
+	return proxyEndpointKeyOf(host, port)
 }
 
 // htmlToText 把 HTML 压成纯文本：标签变空白、实体还原。不保留行结构，
@@ -448,10 +501,16 @@ func compactProxyTokens(text string) []string {
 }
 
 // ipPortHit 是一次窗口扫描的结果。
+//
+// unsupported 表示这一行确实写明了协议，但那是 socks4 之类不受支持的类型。
+// 它必须作为一条命中被回报出去，而不是在扫描里直接丢掉：丢掉的行既不在
+// Discovered 也不在 Invalid，操作员看到的两个数加起来对不上页面上的行数，
+// 只能怀疑解析器漏读了。
 type ipPortHit struct {
-	host   string
-	port   string
-	scheme string
+	host        string
+	port        string
+	scheme      string
+	unsupported bool
 }
 
 // ipPortWindow 是 IP 之后允许跨越的字符数。表格里 IP 与端口之间会夹进
@@ -525,11 +584,10 @@ func scanIPPortWindows(text string) []ipPortHit {
 		case tailFound:
 			scheme, unsupported = tailScheme, tailUnsupported
 		}
-		if unsupported {
-			i = next + portEnd
-			continue
-		}
-		out = append(out, ipPortHit{host: host, port: port, scheme: scheme})
+		// 不受支持的协议行照样回报，由 parseFreeProxyCandidates 计入 Invalid。
+		// 它不会被当成候选（scheme 为空且 unsupported 为真），所以不存在被误
+		// 当成 socks5 送进池子的风险。
+		out = append(out, ipPortHit{host: host, port: port, scheme: scheme, unsupported: unsupported})
 		i = next + portEnd
 	}
 	return out
@@ -823,6 +881,33 @@ func fetchFreeProxySource(ctx context.Context, rawURL string) ([]byte, error) {
 		return nil, err
 	}
 	return readFreeProxySource(ctx, newFreeProxySourceHTTPClient(), target)
+}
+
+// validateFreeProxySourceURL 只判断「这个来源地址本身是否可用」，不联网。
+// 它让「格式/协议不受支持」在抓取之前就以 400 答复，与抓取失败的 502 分开。
+func validateFreeProxySourceURL(rawURL string) error {
+	_, err := parseFreeProxySourceURL(rawURL)
+	return err
+}
+
+// describeFreeProxyFetchFailure 把抓取失败归类成操作员能据此行动的一句话。
+//
+// 超时要单独说，并带上实际预算：45s 三连 502 的现场里，唯一有用的信息就是
+// 「等满了 45 秒还没拿到」——它把问题指向网络或来源站点的限流，而不是格式。
+func describeFreeProxyFetchFailure(ctx context.Context, err error, budget time.Duration) string {
+	switch {
+	case ctx != nil && errors.Is(ctx.Err(), context.DeadlineExceeded):
+		return "抓取超时，已等待 " + budget.String()
+	case ctx != nil && errors.Is(ctx.Err(), context.Canceled):
+		return "请求已被取消"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "抓取超时，已等待 " + budget.String()
+	case err == nil:
+		return "原因未知"
+	}
+	// readFreeProxySource 的错误串已经是「不含来源 URL」的固定措辞
+	// （source request failed / source returned HTTP 403 / ...），可以直接带出。
+	return err.Error()
 }
 
 func parseFreeProxySourceURL(rawURL string) (*url.URL, error) {

@@ -38,6 +38,9 @@ type inflightRequest struct {
 	Method  string    `json:"method"`
 	Started time.Time `json:"started"`
 	Stage   string    `json:"stage,omitempty"`
+	// ctx 是该请求的上下文，仅供 endRequest 读取终止原因，不参与序列化
+	// （inflightSnapshot 的结果会进 /api/live 的响应）。
+	ctx context.Context `json:"-"`
 }
 
 // diagPath is recovered from the APK's fixed path components.
@@ -136,20 +139,44 @@ func beginRequest(requestID string, request *http.Request) {
 	if requestID == "" || request == nil {
 		return
 	}
-	inflight.Store(requestID, inflightRequest{ID: requestID, Path: request.URL.Path, Method: request.Method, Started: time.Now().UTC(), Stage: "http_start"})
+	inflight.Store(requestID, inflightRequest{ID: requestID, Path: request.URL.Path, Method: request.Method, Started: time.Now().UTC(), Stage: "http_start", ctx: request.Context()})
 	stage(requestID, "http_start", map[string]any{"path": request.URL.Path, "method": request.Method})
 }
 
+// endRequest 关闭一次请求的 stage 记录。
+//
+// err 为 nil 时回退到请求上下文的终止原因。这一步是必要的：唯一的生产调用方
+// （server.openaiChat 的 defer）永远传 nil，所以 error 字段以前根本无法出现，
+// 「客户端中途断开」「上游预算到期」这类请求级失败在 http_end 里看不出任何痕迹，
+// 只能靠前一条 stage 猜。请求正常结束时 ctx.Err() 为 nil（net/http 在
+// ServeHTTP 返回之后才取消上下文，handler 自己的 defer 早于此执行），因此成功
+// 路径不会凭空多出一个 error 字段。
 func endRequest(requestID string, err error) {
 	if requestID == "" {
 		return
 	}
 	fields := map[string]any{}
+	if err == nil {
+		err = inflightContextError(requestID)
+	}
 	if err != nil {
 		fields["error"] = sanitizeDiagnosticError(err.Error())
 	}
 	stage(requestID, "http_end", fields)
 	inflight.Delete(requestID)
+}
+
+// inflightContextError 返回该请求上下文的终止原因，没有则为 nil。
+func inflightContextError(requestID string) error {
+	value, ok := inflight.Load(requestID)
+	if !ok {
+		return nil
+	}
+	request, ok := value.(inflightRequest)
+	if !ok || request.ctx == nil {
+		return nil
+	}
+	return request.ctx.Err()
 }
 
 func sanitizeDiagnosticError(value string) string {

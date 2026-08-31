@@ -2,6 +2,9 @@ package web
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"sort"
 	"strings"
@@ -28,8 +31,17 @@ func (s *Server) deleteConversation(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad json", http.StatusBadRequest)
 		return
 	}
-	s.conversationManager.Delete(body.ID)
-	if !s.sessions.delete(body.ID) {
+	// 两个 store 各删一次，然后按「到底删掉了什么」回答。
+	//
+	// 原来的顺序是先无条件调用 Delete（它内部无条件打印 "deleted
+	// conversation <id>"），再用 s.sessions.delete 的返回值决定要不要回 404。
+	// 于是删一个不存在的 ID 会同时产生一条「已删除」日志和一个 404 —— 日志说
+	// 删了，接口说没找到，两边至多有一个是真的。反过来，ID 只存在于
+	// conversationManager 时，记录已经被移除却仍回 404，调用方会以为什么都没
+	// 发生。现在日志只在真的删掉时打印，404 只在两边都没有这个 ID 时返回。
+	removedManaged := s.conversationManager.Delete(body.ID)
+	removedSession := s.sessions.delete(body.ID)
+	if !removedManaged && !removedSession {
 		http.Error(w, "conversation not found", http.StatusNotFound)
 		return
 	}
@@ -45,15 +57,39 @@ func (s *Server) conversationCleanup(w http.ResponseWriter, r *http.Request) {
 		Mode  string `json:"mode"`
 		KeepN int    `json:"keep_n"`
 	}
-	if json.NewDecoder(r.Body).Decode(&body) == nil {
-		if body.Mode != "" {
-			s.conversationManager.SetMode(ConversationCleanupMode(body.Mode))
+	// 空请求体（完全不带参数）是合法调用，只是「按当前配置清理一次」。
+	// 其余解码错误必须拒绝：以前所有解码失败都被忽略，然后照样回
+	// "cleaned"，调用方无从知道自己的参数根本没被读到。
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "bad json")
+		return
+	}
+	if body.Mode != "" {
+		mode := ConversationCleanupMode(body.Mode)
+		if !validCleanupMode(mode) {
+			writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error",
+				"mode must be one of after_response, on_exit, keep_n, max_age")
+			return
 		}
+		s.conversationManager.SetMode(mode)
+	}
+	// keep_n 以前被解码后从未使用，接口却照样回 "cleaned"，看上去像是生效了。
+	// 现在真的写进 conversationManager（keep_n 模式下的保留条数），非法值直接
+	// 拒绝而不是默默丢掉。
+	if body.KeepN != 0 {
+		if body.KeepN < 1 || body.KeepN > maxCleanupKeepN {
+			writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error",
+				fmt.Sprintf("keep_n must be between 1 and %d", maxCleanupKeepN))
+			return
+		}
+		s.conversationManager.SetKeepN(body.KeepN)
 	}
 	cleaned := s.conversationManager.Cleanup()
 	jsonOut(w, map[string]any{
-		"status":    "cleaned",
-		"mode":      string(s.conversationManager.Mode()),
+		"status": "cleaned",
+		"mode":   string(s.conversationManager.Mode()),
+		// 回显真正生效的 keep_n，调用方据此确认参数被采纳。
+		"keep_n":    s.conversationManager.KeepN(),
 		"deleted":   cleaned,
 		"remaining": len(s.conversationManager.List()),
 	})

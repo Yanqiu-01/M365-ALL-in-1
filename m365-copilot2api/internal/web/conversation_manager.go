@@ -153,12 +153,20 @@ func (cm *conversationManager) WhitelistedIDs() []string {
 	return out
 }
 
-func (cm *conversationManager) Delete(conversationID string) {
+// Delete 移除一条对话记录，返回它是否真的存在过。
+//
+// 之前无论有没有这条记录都照样打印 "deleted conversation <id>" 并标记脏页，
+// 日志因此会记下从未发生过的删除，排查时无从分辨。
+func (cm *conversationManager) Delete(conversationID string) bool {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
+	if _, exists := cm.data[conversationID]; !exists {
+		return false
+	}
 	delete(cm.data, conversationID)
 	cm.persist.markDirty()
 	log.Printf("[conversation-manager] deleted conversation %s", conversationID)
+	return true
 }
 
 func (cm *conversationManager) List() []managedConversation {
@@ -229,11 +237,33 @@ func (cm *conversationManager) Cleanup() []string {
 	return toDelete
 }
 
+// maxCleanupKeepN 是 keep_n 的上限。云端对话总量本身就该维持在个位数量级，
+// 这个上限只是用来把明显是打错的值（负数、上百万）挡在外面。
+const maxCleanupKeepN = 1000
+
+// validCleanupMode 判定一个模式字符串是否是已实现的四种之一。
+//
+// Cleanup 的 switch 对未知模式什么也不做，所以接受任意字符串等于悄悄把自动
+// 清理关掉，而接口仍然回 "cleaned"。
+func validCleanupMode(mode ConversationCleanupMode) bool {
+	switch mode {
+	case CleanupAfterResponse, CleanupOnExit, CleanupKeepN, CleanupMaxAge:
+		return true
+	}
+	return false
+}
+
+// ShouldCleanup、Mode 都在锁内读 cm.mode：SetMode 是并发写入方（HTTP handler），
+// 无锁读取构成数据竞争。
 func (cm *conversationManager) ShouldCleanup() bool {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
 	return cm.mode != CleanupOnExit
 }
 
 func (cm *conversationManager) Mode() ConversationCleanupMode {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
 	return cm.mode
 }
 
@@ -241,4 +271,22 @@ func (cm *conversationManager) SetMode(mode ConversationCleanupMode) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 	cm.mode = mode
+}
+
+// KeepN 返回 keep_n 模式下保留的对话条数。
+func (cm *conversationManager) KeepN() int {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	return cm.keepN
+}
+
+// SetKeepN 设置保留条数。非正值被忽略：0 在 Cleanup 里意味着「全部删掉」，
+// 不能因为调用方漏传字段就落到那个语义上。
+func (cm *conversationManager) SetKeepN(n int) {
+	if n < 1 {
+		return
+	}
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	cm.keepN = n
 }

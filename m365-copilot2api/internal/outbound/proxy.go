@@ -353,6 +353,26 @@ func HTTPClient() *http.Client {
 	return c
 }
 
+// HTTPClientForExit returns an HTTP client pinned to one specific pool exit.
+//
+// HTTPClient() 返回的是池子当前偏好的那一个出口，而 pick() 是确定性的：连续调用会拿到
+// 同一个出口。批量授权几百个账号时，那意味着全部请求从同一个 IP 发出，正是最容易被上
+// 游判定为异常的形态。调用方需要按自己的节奏轮换出口，就必须能按出口取客户端。
+//
+// raw 为空时退回池子的默认选择。找不到对应出口时同样退回默认，而不是失败 —— 出口可能
+// 在轮换途中被驱逐，此时继续用默认出口完成剩余账号，比中断整批更可取。
+func HTTPClientForExit(raw string) *http.Client {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return HTTPClient()
+	}
+	c, err := New(raw)
+	if err != nil || c == nil || c.HTTP == nil {
+		return HTTPClient()
+	}
+	return c.HTTP
+}
+
 // PickRawURL returns the pool's currently preferred exit, or "" to dial directly.
 //
 // It does not promise a live exit: pick() returns the best entry of whatever the

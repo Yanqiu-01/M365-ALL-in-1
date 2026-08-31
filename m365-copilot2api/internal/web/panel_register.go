@@ -89,6 +89,24 @@ func (s *Server) runRegister(ctx context.Context, manager *nativePanelManager, r
 	if !cfg.registerReady() {
 		return report, errors.New("注册配置不完整：需要 site_url、email_domain、email_prefix、password")
 	}
+	// clash 模式的前置条件要在这里一次性说清楚，而不是让 rotateClash 在第二个
+	// 账号那里抛「clash api, group and node are required」。那条消息出现在
+	// 「上一号已写入本地，但换 IP 失败」里，既不说缺什么，也不说去哪里填。
+	if mode == "clash" {
+		var missing []string
+		if strings.TrimSpace(cfg.Register.ClashAPI) == "" {
+			missing = append(missing, "clash_api")
+		}
+		if strings.TrimSpace(cfg.Register.ClashGroup) == "" {
+			missing = append(missing, "clash_group")
+		}
+		if strings.TrimSpace(request.Node) == "" && len(clashNodes(cfg)) == 0 {
+			missing = append(missing, "clash_nodes")
+		}
+		if len(missing) > 0 {
+			return report, fmt.Errorf("clash 模式配置不完整，缺少 %s：请在面板「注册配置」里填写 Clash 外部控制地址、策略组与节点清单（POST /api/admin/panel/config 的 clashApi / clashGroup / clashNodes）", strings.Join(missing, "、"))
+		}
+	}
 	start := request.StartNum
 	if start <= 0 {
 		start = cfg.Register.EmailStartNum
