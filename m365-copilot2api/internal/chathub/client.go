@@ -620,7 +620,10 @@ func (c *Client) uploadAttachments(ctx context.Context, acc Account, conversatio
 			if err != nil {
 				continue
 			}
-			resp, err := c.OutboundHTTPClient().Do(req)
+			// 必须走 safeDownloadClient：validateRemoteDownloadURL 只校验了上面那个
+			// URL，而默认客户端会跟随重定向，一个通过校验的公网地址可以 302 到
+			// 169.254.169.254 或 127.0.0.1，首次校验被完整绕过。
+			resp, err := safeDownloadClient(c.OutboundHTTPClient()).Do(req)
 			if err != nil {
 				continue
 			}
