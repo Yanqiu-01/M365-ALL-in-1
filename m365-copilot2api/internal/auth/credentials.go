@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -122,10 +123,24 @@ func (v *CredentialVault) Path() string { return v.path }
 // permissions. Failing to obtain a key is fatal by design: the caller must
 // never degrade to storing plaintext.
 func loadOrCreateFernetKey(storePath string) ([]byte, error) {
-	if key, err := loadFernetKey(storePath); err == nil {
+	keyPath := storeKeyPath(storePath)
+	key, loadErr := loadFernetKey(storePath)
+	if loadErr == nil {
 		return key, nil
 	}
-	keyPath := storeKeyPath(storePath)
+	// 只有「密钥文件确实不存在」才生成新的。
+	//
+	// 这里原本是 if err == nil { return } 然后无条件往下走生成并覆写。于是文件存在
+	// 但一时读不出来 —— 权限被改、瞬时 I/O 错误、内容损坏、长度不对 —— 都会被当成
+	// 首次运行，用一把新密钥覆盖旧的。凡是用旧密钥加密过的凭据从那一刻起永久不可
+	// 解，而且覆写是静默的：调用方只看到「成功拿到密钥」。
+	//
+	// 首次运行（文件不存在）与「我读不到已有密钥」是两件完全不同的事，后者必须致命。
+	if !errors.Is(loadErr, fs.ErrNotExist) {
+		return nil, fmt.Errorf("refusing to overwrite the existing store key %s: %w "+
+			"(fix the key file instead; generating a new one would make every credential "+
+			"encrypted with the old key permanently unreadable)", keyPath, loadErr)
+	}
 	material := make([]byte, 32)
 	if _, err := rand.Read(material); err != nil {
 		return nil, err

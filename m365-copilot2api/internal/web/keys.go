@@ -7,6 +7,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io/fs"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -84,10 +87,15 @@ func (p apiKeyPatch) resolveRevoked() (*bool, error) {
 }
 
 type apiKeyStore struct {
-	mu      sync.Mutex
-	Path    string
+	mu sync.Mutex
+	// Path 必须排除在序列化之外。没有 tag 时它会被写进 api-keys.json，再在下次加载
+	// 时从文件里读回来 —— 于是文件内容可以指定自己的存放位置。
+	Path    string         `json:"-"`
 	Keys    []apiKeyRecord `json:"keys"`
 	persist *persistStore
+	// loadErr 记录「文件存在但没读成功」。此时存储是空的，但那不代表没有 key，
+	// 所以绝不能落盘覆写 —— 否则一次瞬时读失败就永久清空所有 API key。
+	loadErr error
 }
 
 func newAPIKeyStore(path string) *apiKeyStore {
@@ -104,7 +112,22 @@ func openAPIKeys() *apiKeyStore {
 	}
 	s := newAPIKeyStore(p)
 	b, e := os.ReadFile(p)
-	if e == nil && json.Unmarshal(b, s) == nil {
+	switch {
+	case e != nil && errors.Is(e, fs.ErrNotExist):
+		// 首次运行：文件不存在，空存储是正确的初始状态。
+	case e != nil:
+		// 文件存在但读不出来（权限、瞬时 I/O）。空存储不代表没有 key，绝不能覆写。
+		s.loadErr = e
+		log.Printf("[api-keys] cannot read %s: %v — starting empty and REFUSING to write, "+
+			"so the existing file is not destroyed. Fix the file or its permissions.", p, e)
+	default:
+		if err := json.Unmarshal(b, s); err != nil {
+			// 内容损坏。同上：宁可拒绝服务也不能把它清空。
+			s.loadErr = err
+			log.Printf("[api-keys] %s is not valid JSON: %v — starting empty and REFUSING to write. "+
+				"Repair or move the file; overwriting it would discard every configured key.", p, err)
+			return s
+		}
 		migrated := false
 		for i := range s.Keys {
 			if s.Keys[i].Raw != "" {
@@ -122,6 +145,15 @@ func openAPIKeys() *apiKeyStore {
 	return s
 }
 func (s *apiKeyStore) flush() error {
+	// 加载失败过就绝不落盘。
+	//
+	// 这是真正阻止数据丢失的那道闸：openAPIKeys 在读失败时返回一个空存储，若之后任何
+	// 路径调用 flush，磁盘上那份含全部 key 的文件就会被一个空对象覆盖，静默且不可恢复。
+	// 一次权限错误或半截写入的 JSON 足以清空所有凭据。
+	if s != nil && s.loadErr != nil {
+		return fmt.Errorf("refusing to write %s: it failed to load (%w); "+
+			"writing now would replace the existing keys with an empty set", s.Path, s.loadErr)
+	}
 	s.mu.Lock()
 	b, err := json.MarshalIndent(s, "", "  ")
 	s.mu.Unlock()

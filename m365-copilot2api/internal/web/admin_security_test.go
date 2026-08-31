@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -30,6 +31,9 @@ func postJSON(t *testing.T, c *http.Client, url, body string) *http.Response {
 }
 
 func TestDefaultPasswordForcesChangeAndRotatesSessions(t *testing.T) {
+	// New() 会打开加密账号存储，而密钥路径默认落在真实家目录里，与本测试的 TempDir
+	// 无关。不隔离就会读写机器上真实的 m365-store.key。
+	isolateStoreKey(t)
 	t.Setenv("M365_ADMIN_PASSWORD", "")
 	t.Setenv("M365_ADMIN_PASSWORD_FILE", t.TempDir()+"/admin-password")
 	s, err := New()
@@ -80,6 +84,19 @@ func TestDefaultPasswordForcesChangeAndRotatesSessions(t *testing.T) {
 }
 
 func TestAdminLoginLocksAfterFiveFailures(t *testing.T) {
+	// 同一类隔离，另一个来源：New() 打开的加密存储，其密钥路径与账号库路径默认都落在
+	// 真实家目录，与本测试的 TempDir 无关。下面对管理口令的隔离已经很细致，却漏了这
+	// 一项。
+	//
+	// 这里不能用 isolateStoreKey：它会设 M365_DATA_DIR，而本测试下面刻意把该变量清空
+	// 以验证管理口令的取值优先级。所以只钉密钥与账号库这两条路径，让 M365_DATA_DIR
+	// 保持由本测试自己支配。
+	storeDir := t.TempDir()
+	t.Setenv("M365_STORE_KEY_FILE", filepath.Join(storeDir, "m365-store.key"))
+	// CachePath 的优先级是 M365_DATA_DIR → M365_CONFIG → M365_TOKEN_CACHE →
+	// M365_TOKEN_FILE → 家目录。M365_DATA_DIR 归本测试自己支配，所以用次优先的
+	// M365_CONFIG 把账号库钉进临时目录。
+	t.Setenv("M365_CONFIG", filepath.Join(storeDir, "accounts.json"))
 	// 环境隔离。loadAdminPassword 的取值优先级是
 	// M365_DATA_DIR/admin-password → M365_ADMIN_PASSWORD_FILE →
 	// M365_ADMIN_PASSWORD_BOOTSTRAP_FILE → M365_ADMIN_PASSWORD。此前本测试只设了

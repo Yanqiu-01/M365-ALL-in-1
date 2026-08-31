@@ -478,7 +478,14 @@ func (m *nativePanelManager) state(server *Server) map[string]any {
 	state["email_start_num"] = cfg.Register.EmailStartNum
 	state["site_url"] = strings.TrimSpace(cfg.Register.SiteURL)
 	state["flaresolverr_url"] = strings.TrimSpace(cfg.Register.FlareSolverrURL)
-	state["register_password"] = cfg.Register.Password
+	// 只报告是否已设置，不回显明文。
+	//
+	// 这里原本是 state["register_password"] = cfg.Register.Password，于是
+	// GET /api/admin/panel/state 会把注册账号的密码明文返回。密码框本来就不该预填真
+	// 值：前端拿到 register_password_set 就能显示占位符，用户不改就不提交该字段，
+	// saveRegisterConfig 里 `if v := TrimSpace(req.Password); v != ""` 的写法已经支持
+	// 留空即保持不变。与 clash_secret_set 的处理保持一致。
+	state["register_password_set"] = strings.TrimSpace(cfg.Register.Password) != ""
 	// phone / clash 五个字段 saveRegisterConfig 收得下也存得住，却一直没在 state
 	// 里回传，配置往返是单向的：界面无法显示已存的值，也无法看出缺了什么。而
 	// regMode 里明明就有「Clash 节点」这个选项 —— 选了它注册，rotateClash 会以
