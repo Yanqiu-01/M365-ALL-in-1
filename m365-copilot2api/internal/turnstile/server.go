@@ -12,7 +12,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"sync"
 	"time"
 
 	"m365-copilot2api/internal/outbound"
@@ -233,7 +232,37 @@ func flareDir() string {
 	return filepath.Join(root, "flare")
 }
 
-var webviewMu sync.Mutex
+// webviewSlot 串行化 WebView 求解：同一时刻只能有一个任务在 App 里跑。
+//
+// 用容量 1 的 channel 而不是 sync.Mutex，因为 Mutex 的 Lock 无法被 ctx 打断。原先
+// 的写法是无条件阻塞：一个排在队尾的请求即使自己的 deadline 早就过了，也会在拿到
+// 锁之后照样往协作目录写一份新的 job —— 给 WebView 派了一个调用方已经放弃的任务，
+// 还会留下 job/result 残留去干扰下一次求解。
+var webviewSlot = make(chan struct{}, 1)
+
+// acquireWebView 取得求解槽位，等待期间尊重 ctx。
+func acquireWebView(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	// 已经过期就不要再排队。
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("验证请求已取消，未提交给 WebView: %w", err)
+	}
+	select {
+	case webviewSlot <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("等待上一个验证任务完成时超时，未提交新任务: %w", ctx.Err())
+	}
+}
+
+func releaseWebView() {
+	select {
+	case <-webviewSlot:
+	default:
+	}
+}
 
 func oneLine(v string) string {
 	v = strings.ReplaceAll(v, "\r", " ")
@@ -251,8 +280,16 @@ func solveViaWebView(ctx context.Context, dir, page, display, username, password
 	if p := strings.TrimSpace(proxy); p != "" {
 		log.Printf("turnstile: WebView solve ignores the requested egress proxy %s (in-app WebView uses the device network; job protocol has no proxy field)", outbound.RedactProxyURL(p))
 	}
-	webviewMu.Lock()
-	defer webviewMu.Unlock()
+	if err := acquireWebView(ctx); err != nil {
+		return localSolution{}, err
+	}
+	defer releaseWebView()
+	// 排队可能耗掉整个 deadline。拿到槽位后再确认一次，避免写下一份没人等的 job。
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return localSolution{}, fmt.Errorf("取得验证槽位时请求已结束，未提交任务: %w", err)
+		}
+	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return localSolution{}, err
 	}
