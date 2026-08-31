@@ -402,6 +402,11 @@ func (s *apiKeyStore) lookup(raw string) (apiKeyRecord, bool) {
 }
 
 func (s *apiKeyStore) valid(raw string) bool {
+	// nil store 表示「没有配置任何 API key」，那就是没有任何 key 有效 —— 而不是
+	// panic。走到这里的调用方是鉴权路径，让它因为 nil 崩掉比拒绝更糟。
+	if s == nil {
+		return false
+	}
 	s.mu.Lock()
 	h := keyHash(raw)
 	found := false

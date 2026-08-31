@@ -676,8 +676,35 @@ func (s *Server) validAPIKey(r *http.Request) bool {
 	if raw != "" && s.apiKeys.valid(raw) {
 		return true
 	}
-	if strings.HasPrefix(raw, "eyJ") {
-		return true
+	// 允许直接用网关自己持有的 M365 access token 作为凭据，但必须逐字匹配。
+	//
+	// 这里原本是 strings.HasPrefix(raw, "eyJ") —— "eyJ" 只是 `{"` 的 base64 前缀，
+	// 于是「Authorization: Bearer eyJ」这三个字符就能通过认证：不验签名、不验过期、
+	// 不验签发者。实测活网关对 `Bearer eyJ` 返回 200。任何第三方租户的合法 JWT，
+	// 甚至任何以 eyJ 开头的垃圾串，都是有效凭据。
+	//
+	// 一个网关既没签发也无法验签的 JWT 不能证明任何事，所以形状检查（三段点分）也
+	// 不够。改为与本地账号的 access token 常量时间比对：这是唯一可核实的判据。
+	return raw != "" && s.matchesKnownAccessToken(raw)
+}
+
+// matchesKnownAccessToken 报告 raw 是否等于某个已授权账号的 access token。
+//
+// 用 subtle.ConstantTimeCompare 逐个比，避免用比较耗时泄漏前缀信息。长度先比是安全
+// 的：token 长度本身不是秘密，且能避免对明显不匹配的项做无谓的全长比较。
+func (s *Server) matchesKnownAccessToken(raw string) bool {
+	if s == nil || s.tokens == nil {
+		return false
+	}
+	candidate := []byte(raw)
+	for _, account := range s.tokens.List() {
+		known := []byte(strings.TrimSpace(account.AccessToken))
+		if len(known) == 0 || len(known) != len(candidate) {
+			continue
+		}
+		if subtle.ConstantTimeCompare(known, candidate) == 1 {
+			return true
+		}
 	}
 	return false
 }
