@@ -80,7 +80,17 @@ const (
 	// meaningless: a permanently dead exit would be re-probed exactly as often as a
 	// healthy one. 60 minutes is 4x the base, so the doubling ladder keeps three
 	// real steps (15m -> 30m -> 60m) and a dead exit still gets a retry every hour.
+	//
+	// It is only the *default* ceiling. The base cadence is env-tunable up to 1 hour,
+	// which would make a tuned base meet or exceed this constant and reintroduce
+	// exactly the degeneracy above, so guardTimingFromEnv scales the ceiling with the
+	// base rather than leaving it pinned here. guardBackoffCeiling holds the ratio.
 	guardMaxBackoff = 60 * time.Minute
+
+	// guardBackoffCeiling is how many base intervals the evicted backoff may reach.
+	// 4 is the ratio the default pair already encodes (15m base, 60m ceiling) and it
+	// is what keeps three real doubling steps in the ladder.
+	guardBackoffCeiling = 4
 
 	// guardLatencyBudget is the median L2 latency that scores exactly 0.5 on the
 	// latency term.
@@ -171,6 +181,14 @@ func guardTimingFromEnv() guardTiming {
 	timing.suspect = interval / 2
 	if timing.suspect < time.Second {
 		timing.suspect = time.Second
+	}
+	// Keep the ceiling above the tuned base. With the ceiling pinned at the constant,
+	// M365_PROXY_GUARD_INTERVAL=1h (inside the accepted range) produced
+	// maxBackoff == base: an exit evicted for good would then be re-probed exactly as
+	// often as a healthy one, which is the degeneracy guardMaxBackoff exists to avoid.
+	// The default pair is unchanged - for a 15m base this is max(60m, 60m).
+	if scaled := time.Duration(guardBackoffCeiling) * timing.base; scaled > timing.maxBackoff {
+		timing.maxBackoff = scaled
 	}
 	return timing
 }
@@ -348,10 +366,28 @@ func ValidateProxyCandidate(ctx context.Context, raw string) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	// Keep the caller's context before deriving the admission budget: it is what
+	// separates "this proxy is bad" from "we never found out".
+	caller := ctx
 	ctx, cancel := context.WithTimeout(ctx, admissionTimeout)
 	defer cancel()
 	code, latency, err := admissionProbe(ctx, tunnelDialer(clients), admissionTimeout)
 	if err != nil {
+		// This is the third probe entry point and was the only one that did not
+		// discriminate ctx.Err() (guardSweep and CheckSelected both do). An admin
+		// request that was cancelled, or a gateway shutting down mid-check, produced
+		// the identical "L2 认证面不通" verdict as a genuinely dead proxy - so the
+		// operator was told a working exit is broken by an event that had nothing to
+		// do with the exit. The candidate is still refused, because it was never
+		// actually validated; only the reason changes.
+		if caller.Err() != nil {
+			return fmt.Errorf("入池校验中断：本次校验被网关取消（%v），耗时 %s —— 这不是该代理的问题，尚未得出结论，请重试",
+				caller.Err(), latency.Round(time.Millisecond))
+		}
+		if ctx.Err() != nil {
+			return fmt.Errorf("入池校验失败：L2 认证面（CONNECT+TLS+HEAD %s）在 %s 入池预算内没有完成，耗时 %s —— 该出口过慢，拒绝入池",
+				probeAuthHost, admissionTimeout, latency.Round(time.Millisecond))
+		}
 		return fmt.Errorf("入池校验失败：L2 认证面（CONNECT+TLS+HEAD %s）不通，耗时 %s：%w",
 			probeAuthHost, latency.Round(time.Millisecond), err)
 	}

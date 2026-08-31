@@ -44,13 +44,13 @@ func TestRotateClashSwitchesNodeThenProbesIP(t *testing.T) {
 	ipEndpoints = []string{ipServer.URL}
 	clashSettle = 0
 
+	// No ExpectIP: the switch is reported on its own terms.
 	result, err := rotateGo(context.Background(), Request{
 		Mode:        "clash",
 		ClashAPI:    clash.URL,
 		ClashSecret: "s3cret",
 		ClashGroup:  "PROXY",
 		ClashNode:   "jp-01",
-		ExpectIP:    "8.8.8.8",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -61,8 +61,23 @@ func TestRotateClashSwitchesNodeThenProbesIP(t *testing.T) {
 	if result.IP != "9.9.9.9" || !result.OK {
 		t.Fatalf("result = %#v", result)
 	}
-	if result.Detail == "" {
-		t.Fatal("expected a warning when IP differs from expect_ip")
+
+	// This case used to assert OK:true with the mismatch only in Detail. It now
+	// asserts the opposite, because that was the defect: see
+	// TestRotateClashFailsWhenTheExpectedExitIsNotReached.
+	result, err = rotateGo(context.Background(), Request{
+		Mode:        "clash",
+		ClashAPI:    clash.URL,
+		ClashSecret: "s3cret",
+		ClashGroup:  "PROXY",
+		ClashNode:   "jp-01",
+		ExpectIP:    "8.8.8.8",
+	})
+	if err == nil {
+		t.Fatalf("an ExpectIP mismatch must be an error, got result %#v", result)
+	}
+	if result.OK {
+		t.Fatalf("result = %#v, want OK false", result)
 	}
 }
 

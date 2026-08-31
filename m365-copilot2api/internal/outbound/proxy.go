@@ -164,11 +164,6 @@ func (p *Pool) adoptEntries(next *Pool) {
 	}
 	p.entries = entries
 	p.wsLimit = next.wsLimit
-	if len(p.entries) == 0 {
-		p.next = 0
-	} else {
-		p.next %= len(p.entries)
-	}
 	for account, raw := range p.sticky {
 		if !kept[raw] {
 			delete(p.sticky, account)

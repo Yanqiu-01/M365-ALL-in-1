@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -77,9 +78,19 @@ func Rotate(ctx context.Context, req Request) (Result, error) {
 		ctx = context.Background()
 	}
 	if bin := findCLI(); bin != "" {
-		if result, err := rotateCLI(ctx, bin, req); err == nil {
+		result, err := rotateCLI(ctx, bin, req)
+		if err == nil {
 			return result, nil
 		}
+		// The fallback used to be silent: `if ... err == nil` dropped the CLI's error
+		// on the floor with no log at all. The Rust CLI is the preferred
+		// implementation, so a build that cannot execute, a JSON contract that
+		// drifted, or a binary that crashes on every invocation degraded to the Go
+		// path and looked exactly like a deployment that simply has no CLI installed.
+		// Nobody had any way to learn the CLI was broken - the fallback works, so the
+		// symptom is only that the preferred implementation is never used.
+		log.Printf("exit-rotate cli failed, falling back to the Go implementation bin=%s mode=%s err=%v",
+			bin, strings.ToLower(strings.TrimSpace(req.Mode)), err)
 	}
 	return rotateGo(ctx, req)
 }
@@ -293,11 +304,22 @@ func rotateClash(ctx context.Context, req Request) (Result, error) {
 	if err != nil {
 		return Result{Mode: "clash", PrevIP: req.PrevIP, Detail: err.Error()}, err
 	}
-	detail := ""
+	// An ExpectIP mismatch is a failed rotation, not a warning.
+	//
+	// This used to return OK:true and Changed:true with the mismatch recorded only in
+	// Detail, and no caller reads Detail: panel_register.go gates on `rotateErr == nil
+	// && !rotated.Changed`, so both of its signals said the rotation had succeeded.
+	// Clash accepted the node switch and then egressed somewhere else - a stale
+	// selector, a node that failed over, a group that ignored the PUT - and the caller
+	// went on to register the next account through an exit it had explicitly asked not
+	// to use. If the operator named an expected exit, not reaching it is the whole
+	// failure this mode is supposed to detect.
 	if expect := strings.TrimSpace(req.ExpectIP); expect != "" && expect != ip {
-		detail = "exit IP " + ip + " differs from expected " + expect
+		detail := "exit IP " + ip + " differs from expected " + expect
+		return Result{Mode: "clash", IP: ip, PrevIP: req.PrevIP, Detail: detail},
+			fmt.Errorf("clash rotation reached %s, expected %s", ip, expect)
 	}
-	return Result{OK: true, Mode: "clash", IP: ip, PrevIP: req.PrevIP, Changed: ip != req.PrevIP, Detail: detail}, nil
+	return Result{OK: true, Mode: "clash", IP: ip, PrevIP: req.PrevIP, Changed: ip != req.PrevIP}, nil
 }
 
 func probeIP(ctx context.Context, proxyURL string) (string, error) {

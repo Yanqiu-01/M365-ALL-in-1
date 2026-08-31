@@ -36,12 +36,23 @@ func redactProxy(raw string) string {
 //
 //	L2  CONNECT + TLS + HEAD  login.microsoftonline.com   (an HTTP status is mandatory)
 //	L3a CONNECT + TLS         substrate.office.com
-//	L3b CONNECT + TLS         m365.cloud.microsoft
+//	L3b CONNECT + TLS         m365.cloud.microsoft        (signal only, see below)
 //	L3c WebSocket Upgrade     wss://substrate.office.com/m365Copilot/Chathub
 //
 // L3a is proven by the L3c tunnel rather than probed separately: the budget is one
 // request per exit per domain per round, and the Upgrade already needs CONNECT+TLS
 // to substrate.office.com.
+//
+// L3b is a diagnostic signal, not a pass requirement. No pooled traffic ever
+// reaches m365.cloud.microsoft: the chat path is the chathub WebSocket on
+// substrate.office.com, the token path is login.microsoftonline.com, and the one
+// component that does talk to m365.cloud.microsoft (web.M365CloudClient) builds its
+// own http.Client with no proxy transport, so it never routes through this pool.
+// The host appears in pooled traffic only as an Origin header value. Requiring it
+// therefore evicted exits that demonstrably carry real traffic - measured on the
+// live log, 31 rounds recorded l2=200 ws=401 (the tunnel worked and Microsoft
+// answered the Upgrade) and failed on this third plane alone. It is still probed
+// and still reported, because an exit that cannot reach it is worth seeing.
 //
 // The probe never sends a credential of ours. The proxy's own Proxy-Authorization
 // is written by the dialer, because that is what production does.
@@ -197,6 +208,19 @@ func upgradeStatusPasses(code int) bool {
 	}
 }
 
+// probePasses is the verdict rule of a probe round, kept as one named expression so
+// what does and does not gate eviction is stated in one place and can be tested
+// without reaching Microsoft.
+//
+// L2 having answered is a precondition: probeExit returns before this is ever reached
+// if it did not. What remains is the traffic the gateway actually carries - the
+// substrate tunnel and the chathub Upgrade over it. m365OK is measured and reported
+// but is not part of the verdict; see the probe target list at the top of this file
+// for the measurement that forced that change.
+func probePasses(result probeResult) bool {
+	return result.substrateOK && result.wsOK
+}
+
 // probeTLSOnly is L3b: CONNECT + TLS reachability of a business-plane host.
 func probeTLSOnly(ctx context.Context, dial dialFunc, host string, timeout time.Duration) error {
 	if dial == nil {
@@ -240,16 +264,18 @@ func probeExit(ctx context.Context, dial dialFunc, timeout time.Duration) probeR
 
 	substrateOK, wsOK, wsCode, wsErr := probeChathubUpgrade(ctx, dial, timeout)
 	result.substrateOK, result.wsOK, result.wsCode = substrateOK, wsOK, wsCode
-	if m365Err := probeTLSOnly(ctx, dial, probeM365Host, timeout); m365Err == nil {
-		result.m365OK = true
-	} else if wsErr == nil {
-		wsErr = fmt.Errorf("L3 业务面 %s 探测失败：%w", probeM365Host, m365Err)
-	}
+	// L3b is measured but does not gate the verdict; see the target list above for
+	// why. Its error is kept only to explain a round that failed for other reasons.
+	m365Err := probeTLSOnly(ctx, dial, probeM365Host, timeout)
+	result.m365OK = m365Err == nil
 
-	result.pass = result.substrateOK && result.m365OK && result.wsOK
+	result.pass = probePasses(result)
 	if result.pass {
 		result.health = "reachable"
 		return result
+	}
+	if wsErr == nil && m365Err != nil {
+		wsErr = fmt.Errorf("L3 业务面 %s 探测失败：%w", probeM365Host, m365Err)
 	}
 	// L2 answered, so the tunnel itself works; what failed is the traffic the
 	// gateway actually needs.
@@ -283,14 +309,17 @@ func (p *Pool) Check(ctx context.Context, raw string) (time.Duration, error) {
 	return result.l2Latency, result.err
 }
 
+// logProbe reports one round. m365 is logged even on a pass: it no longer gates the
+// verdict, so without it here an exit that cannot reach the host would leave no
+// trace at all and the demotion would be unobservable.
 func logProbe(raw string, result probeResult) {
 	if result.err != nil {
-		log.Printf("proxy probe fail proxy=%s l2=%d ws=%d latency=%s err=%v",
-			redactProxy(raw), result.l2Code, result.wsCode, result.l2Latency, result.err)
+		log.Printf("proxy probe fail proxy=%s l2=%d ws=%d m365=%t latency=%s err=%v",
+			redactProxy(raw), result.l2Code, result.wsCode, result.m365OK, result.l2Latency, result.err)
 		return
 	}
-	log.Printf("proxy probe pass proxy=%s l2=%d ws=%d latency=%s",
-		redactProxy(raw), result.l2Code, result.wsCode, result.l2Latency)
+	log.Printf("proxy probe pass proxy=%s l2=%d ws=%d m365=%t latency=%s",
+		redactProxy(raw), result.l2Code, result.wsCode, result.m365OK, result.l2Latency)
 }
 
 // checkAllMaxBudget 是手工检查的墙钟上限，保证管理端接口在可预期的时间内返回，

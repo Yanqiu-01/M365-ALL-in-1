@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -55,6 +56,7 @@ type poolEntry struct {
 	score                float64
 	medianLatency        time.Duration
 	wsOK                 bool
+	m365OK               bool
 	backoff              time.Duration
 	nextProbe            time.Time
 }
@@ -99,10 +101,13 @@ func proxyEntryID(raw string) string {
 	return hex.EncodeToString(sum[:])[:12]
 }
 
+// Pool holds the configured exits. There is deliberately no rotation cursor: an
+// unused `next int` survived the removal of the round-robin selector and was still
+// being maintained by adoptEntries, so it read as live state that some selector
+// consulted. Nothing did. Selection is bestLocked, by tier then score.
 type Pool struct {
 	mu        sync.Mutex
 	entries   []*poolEntry
-	next      int
 	wsLimit   int
 	wsChanged chan struct{}
 	sticky    map[string]string
@@ -262,11 +267,74 @@ func accountAffinity(ctx context.Context) string {
 	return value
 }
 
-func (p *Pool) markFor(accountID, raw string, err error) {
+// gatewayCancelled reports whether a failed operation was cut short by the context
+// the gateway handed us rather than by the exit itself.
+//
+// A dial the gateway abandoned - the client hung up, the request budget expired, the
+// process is shutting down - says nothing about the exit's health. It was recorded as
+// a real exit failure anyway: e.failures went up, the exit went into a cooldown that
+// ranks it as evicted, and markFor dropped the account's sticky binding on top. So a
+// user pressing stop mid-stream demoted a perfectly healthy egress. This is the same
+// discrimination probeExit's two callers already make (guardSweep in guard.go and
+// CheckSelected in health.go).
+//
+// A per-attempt deadline we derived ourselves is deliberately not covered: in that
+// case the caller's context stays clean and a dial that overran the budget really was
+// the exit being too slow.
+func gatewayCancelled(ctx context.Context, err error) bool {
+	return err != nil && ctx != nil && ctx.Err() != nil
+}
+
+// markFor folds the outcome of one real request into the exit's health. ctx is the
+// caller's context, not a per-attempt one: it is what distinguishes an exit that
+// failed from an operation the gateway gave up on.
+func (p *Pool) markFor(ctx context.Context, accountID, raw string, err error) {
+	if gatewayCancelled(ctx, err) {
+		log.Printf("proxy request abandoned proxy=%s reason=%v (gateway or client cancelled, not counted as an exit failure)",
+			redactProxy(raw), ctx.Err())
+		return
+	}
 	if err != nil {
 		p.unstick(accountID, raw)
 	}
 	p.mark(raw, err)
+}
+
+// failureDecayInterval is how much quiet time retires one accumulated traffic
+// failure. It is deliberately longer than the longest cooldown mark() can compute
+// (2 minutes), so an exit has to be genuinely quiet - not merely out of cooldown -
+// before its ratchet steps down.
+const failureDecayInterval = 5 * time.Minute
+
+// decayFailuresLocked steps e.failures back down for elapsed quiet time.
+//
+// e.failures was a one-way ratchet. It only ever grew in mark(err != nil) and was
+// only ever cleared by mark(err == nil) - a *successful real request*. But the
+// cooldown it computes ranks the exit as evicted (see tier), which is last in
+// selection order, so an exit that failed enough times stopped being picked and
+// could never produce the success that was its only way back. Worse, the count is
+// what sizes the next cooldown: an exit sitting at failures=60 got the 2-minute
+// ceiling from a single fresh failure forever after.
+//
+// The cooldown deadline doubles as the decay anchor, so no extra field is needed:
+// every failure rewrites it, and a success clears both together.
+func (e *poolEntry) decayFailuresLocked(now time.Time) {
+	if e.failures <= 0 || e.cooldown.IsZero() || now.Before(e.cooldown) {
+		return
+	}
+	steps := int(now.Sub(e.cooldown) / failureDecayInterval)
+	if steps <= 0 {
+		return
+	}
+	if steps >= e.failures {
+		e.failures = 0
+		e.cooldown = time.Time{}
+		return
+	}
+	e.failures -= steps
+	// Advance the anchor by exactly what was consumed, so the same quiet time is
+	// not spent twice on the next call.
+	e.cooldown = e.cooldown.Add(time.Duration(steps) * failureDecayInterval)
 }
 
 // mark records the outcome of real user traffic. It keeps the backoff behaviour it
@@ -276,18 +344,23 @@ func (p *Pool) markFor(accountID, raw string, err error) {
 func (p *Pool) mark(raw string, err error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	now := time.Now()
 	for _, e := range p.entries {
 		if e.raw == raw {
 			if err == nil {
 				e.failures = 0
 				e.cooldown = time.Time{}
 			} else {
+				// Retire whatever the exit has already sat out before adding to the
+				// count, so the cooldown reflects how it is behaving now rather than
+				// every failure it ever had.
+				e.decayFailuresLocked(now)
 				e.failures++
 				d := time.Duration(e.failures) * 2 * time.Second
 				if d > 2*time.Minute {
 					d = 2 * time.Minute
 				}
-				e.cooldown = time.Now().Add(d)
+				e.cooldown = now.Add(d)
 			}
 			return
 		}
@@ -314,6 +387,11 @@ func (p *Pool) WebSocketDialer() *websocket.Dialer {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
+		// Hold on to the caller's context before deriving a per-attempt one below.
+		// Only the caller's context can say that a failed dial was the gateway or the
+		// client giving up rather than the exit breaking; the derived deadline is our
+		// own budget for this exit and overrunning it is a genuine failure.
+		caller := ctx
 		if _, ok := ctx.Deadline(); !ok {
 			timeout := base.HandshakeTimeout
 			if timeout <= 0 {
@@ -348,7 +426,7 @@ func (p *Pool) WebSocketDialer() *websocket.Dialer {
 				dial = baseDialer.DialContext
 			}
 			conn, err := dial(ctx, network, address)
-			p.markFor(accountID, e.raw, err)
+			p.markFor(caller, accountID, e.raw, err)
 			if err == nil {
 				return &pooledConn{Conn: conn, release: release}, nil
 			}
@@ -378,11 +456,10 @@ func (p *Pool) acquireWebSocket(ctx context.Context, accountID string, excluded 
 			p.mu.Unlock()
 			return nil, nil, nil
 		}
+		// pickStickyWebSocketLocked owns the binding. Rebinding here would undo its
+		// distinction between a failover and a temporary capacity fallback.
 		entry := p.pickStickyWebSocketLocked(accountID, excluded)
 		if entry != nil {
-			if accountID != "" {
-				p.sticky[accountID] = entry.raw
-			}
 			entry.activeWebSockets++
 			p.mu.Unlock()
 			var once sync.Once
@@ -415,9 +492,24 @@ func (p *Pool) acquireWebSocket(ctx context.Context, accountID string, excluded 
 	}
 }
 
-// pickStickyWebSocketLocked selects the WebSocket exit. The per-exit concurrency
-// budget (maxWebSockets) is the only reason the best exit is skipped: it is a hard
-// capacity limit, so the next best score takes over until a slot frees up.
+// pickStickyWebSocketLocked selects the WebSocket exit and, for an account, records
+// the affinity it settled on. The per-exit concurrency budget (maxWebSockets) is the
+// only reason the best exit is skipped: it is a hard capacity limit, so the next best
+// score takes over until a slot frees up.
+//
+// The binding is written here rather than by the caller, because the reasons the bound
+// exit gets skipped need opposite treatment and only this function can tell them
+// apart:
+//
+//	gone from the pool, or no longer live   the account must fail over: forget it
+//	live but full, or already tried on this dial   transient: keep it
+//
+// Both used to fall into the same delete, and the caller then bound the account to
+// whatever came back. So a burst that filled the bound exit's slots for a moment cost
+// the account its exit affinity permanently - nothing ever re-picks the original exit
+// for that account, so the "sticky" exit was whichever one happened to have a free
+// slot during the spike. A single failed attempt earlier in the same dial did it too,
+// because an excluded entry looked identical to an unhealthy one.
 func (p *Pool) pickStickyWebSocketLocked(accountID string, excluded map[*poolEntry]struct{}) *poolEntry {
 	if len(p.entries) == 0 {
 		return nil
@@ -433,23 +525,42 @@ func (p *Pool) pickStickyWebSocketLocked(accountID string, excluded map[*poolEnt
 		}
 		return entry.activeWebSockets < limit
 	}
-	if accountID != "" {
-		if p.sticky == nil {
-			p.sticky = map[string]string{}
-		}
-		if raw, ok := p.sticky[accountID]; ok {
-			for _, entry := range p.entries {
-				if entry.raw != raw {
-					continue
-				}
-				if eligible(entry) && entry.tier(now) == tierLive {
-					return entry
-				}
-			}
+	if accountID == "" {
+		return p.bestLocked(now, eligible)
+	}
+	if p.sticky == nil {
+		p.sticky = map[string]string{}
+	}
+	if raw, ok := p.sticky[accountID]; ok {
+		switch bound := p.entryLocked(raw); {
+		case bound == nil || bound.tier(now) != tierLive:
+			// The only failover the affinity is allowed to break for.
 			delete(p.sticky, accountID)
+		case eligible(bound):
+			return bound
+		default:
+			// Live, but at capacity or excluded from this dial. Serve this one dial
+			// from the best available exit and leave the binding alone, so the account
+			// returns to its own exit as soon as a slot frees up.
+			return p.bestLocked(now, eligible)
 		}
 	}
-	return p.bestLocked(now, eligible)
+	entry := p.bestLocked(now, eligible)
+	if entry != nil {
+		p.sticky[accountID] = entry.raw
+	}
+	return entry
+}
+
+// entryLocked resolves a raw exit URL to its entry, or nil when the exit is no
+// longer configured.
+func (p *Pool) entryLocked(raw string) *poolEntry {
+	for _, entry := range p.entries {
+		if entry.raw == raw {
+			return entry
+		}
+	}
+	return nil
 }
 
 func (p *Pool) hasUntriedWebSocketLocked(excluded map[*poolEntry]struct{}) bool {
@@ -508,6 +619,10 @@ func (p *Pool) List() []map[string]any {
 			"health": e.health, "activeWebSockets": e.activeWebSockets, "maxWebSockets": p.wsLimit,
 			"id": e.id(), "state": e.stateName(), "score": roundScore(e.score),
 			"medianLatencyMs": e.medianLatency.Milliseconds(), "wsOk": e.wsOK,
+			// m365Ok 不再参与 pass 判定（见 health.go 的探测目标表），但它仍然是一个
+			// 有价值的信号。不导出的话，这个字段就会变成「探了、存了、没人读」，
+			// 运维也看不到某个出口够不着 m365.cloud.microsoft。
+			"m365Ok":        e.m365OK,
 			"lastCheckedAt": lastCheckedAt, "consecutiveFailures": e.consecutiveFailures,
 			// tier/tierName 是选路时真正用的分档，之前只存在于进程内部，
 			// 面板拿不到，只能自己按 state 猜 —— 于是 UI 的分组和实际选路口径
@@ -646,7 +761,7 @@ func (t *poolRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) {
 		return directClients().HTTP.Transport.RoundTrip(r)
 	}
 	resp, err := entry.clients.HTTP.Transport.RoundTrip(r)
-	t.pool.markFor(accountID, entry.raw, err)
+	t.pool.markFor(r.Context(), accountID, entry.raw, err)
 	if err == nil || r.Context().Err() != nil || !safeRetryMethod(r) {
 		return resp, err
 	}
@@ -668,7 +783,7 @@ func (t *poolRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) {
 		retry.Body = body
 	}
 	resp2, err2 := next.clients.HTTP.Transport.RoundTrip(retry)
-	t.pool.markFor(accountID, next.raw, err2)
+	t.pool.markFor(r.Context(), accountID, next.raw, err2)
 	if err2 == nil {
 		t.pool.bindSticky(accountID, next.raw)
 		return resp2, nil
@@ -725,6 +840,7 @@ func (p *Pool) applyProbe(e *poolEntry, result probeResult, now time.Time, timin
 	e.latency = result.l2Latency
 	e.health = result.health
 	e.wsOK = result.wsOK
+	e.m365OK = result.m365OK
 	e.lastError = ""
 	if result.err != nil {
 		e.lastError = result.err.Error()
@@ -735,12 +851,24 @@ func (p *Pool) applyProbe(e *poolEntry, result probeResult, now time.Time, timin
 		e.window = e.window[len(e.window)-timing.window:]
 	}
 
+	was := e.stateName()
+	reason := ""
 	if result.pass {
 		e.consecutiveFailures = 0
 		e.consecutiveSuccesses++
 		if e.stateName() != stateEvicted || e.consecutiveSuccesses >= timing.restoreAfter {
 			e.state = stateLive
 			e.backoff = 0
+			// A probe that passes is the authority on this exit's health, so it also
+			// clears the traffic-side ratchet mark() maintains. Without this,
+			// e.failures and the cooldown it computes were only ever reset by a
+			// successful real request - which an exit ranked last by tier stops
+			// receiving, so the recovery condition could not be met (see mark).
+			e.failures = 0
+			e.cooldown = time.Time{}
+			reason = "probe passed"
+		} else {
+			reason = "probe passed but restore threshold not met"
 		}
 	} else {
 		e.consecutiveSuccesses = 0
@@ -756,9 +884,21 @@ func (p *Pool) applyProbe(e *poolEntry, result probeResult, now time.Time, timin
 			if e.backoff > timing.maxBackoff {
 				e.backoff = timing.maxBackoff
 			}
+			reason = "probe failed, eviction threshold reached"
+		case e.stateName() == stateEvicted:
+			// A FAILURE must never be a way out of eviction. This branch used to fall
+			// into the default below and write stateSuspect unconditionally, so an
+			// evicted exit that had collected one restoring pass (consecutiveFailures
+			// reset to 0, still evicted because restoreAfter is 2) was *promoted* to
+			// suspect by its very next failing probe - and suspect is a routable tier.
+			// Failing your way back into rotation is the exact opposite of what the
+			// state machine is for. Eviction is left only by consecutive passes, so
+			// the entry stays evicted and keeps its backoff ladder.
+			reason = "probe failed while evicted, staying evicted"
 		default:
 			e.state = stateSuspect
 			e.backoff = 0
+			reason = "probe failed below eviction threshold"
 		}
 	}
 
@@ -766,6 +906,16 @@ func (p *Pool) applyProbe(e *poolEntry, result probeResult, now time.Time, timin
 	e.medianLatency = median
 	e.score = guardScore(passes, attempts, median, e.wsOK)
 	e.nextProbe = now.Add(e.probeIntervalLocked(timing))
+
+	// Log every transition. The whole live->suspect->evicted->live cycle used to
+	// happen silently inside this function: the only per-exit line was logProbe's
+	// pass/fail, so an exit leaving rotation - or coming back - left no trace, and
+	// reconstructing why a pool went dark meant guessing from probe results.
+	if now := e.stateName(); now != was {
+		log.Printf("proxy exit state %s -> %s proxy=%s reason=%q failures=%d successes=%d evictAfter=%d restoreAfter=%d backoff=%s score=%.3f",
+			was, now, redactProxy(e.raw), reason, e.consecutiveFailures, e.consecutiveSuccesses,
+			timing.evictAfter, timing.restoreAfter, e.backoff, e.score)
+	}
 }
 
 // probeIntervalLocked is the per-state probe cadence: live exits every base
@@ -818,6 +968,11 @@ func (p *Pool) dueForProbe(now time.Time, timing guardTiming) []*poolEntry {
 	defer p.mu.Unlock()
 	due := make([]*poolEntry, 0, len(p.entries))
 	for _, e := range p.entries {
+		// The patrol tick is the one clock that runs regardless of traffic, so it is
+		// where the traffic-failure ratchet is retired. Doing it only in mark() would
+		// leave an exit that stopped being selected stuck at its peak count forever,
+		// which is the whole defect decayFailuresLocked exists to fix.
+		e.decayFailuresLocked(now)
 		if !e.nextProbe.IsZero() && e.nextProbe.After(now) {
 			continue
 		}
