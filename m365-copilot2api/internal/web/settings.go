@@ -56,6 +56,7 @@ type runtimeSettings struct {
 	ConfigPath          string         `json:"configPath"`
 	TokenCachePath      string         `json:"tokenCachePath"`
 	SessionCachePath    string         `json:"sessionCachePath"`
+	SessionMax          int            `json:"sessionMax,omitempty"`
 	OutboundProxy       string         `json:"outboundProxy"`
 	ProxyPool           []string       `json:"proxyPool,omitempty"`
 	ClientID            string         `json:"clientId"`
@@ -116,7 +117,7 @@ func defaultRuntimeSettings() runtimeSettings {
 		ContextWindow: envInt("M365_CONTEXT_WINDOW", 262144), MaxOutputTokens: envInt("M365_MAX_OUTPUT_TOKENS", 16384),
 		ChatTimeoutSeconds: envInt("M365_CHAT_TIMEOUT_SECONDS", 600), ImageTimeoutSeconds: envInt("M365_IMAGE_TIMEOUT_SECONDS", 180), LogLevel: firstNonEmptySetting(os.Getenv("M365_LOG_LEVEL"), "info"),
 		DebugLogPath: os.Getenv("M365_DEBUG_LOG"), ListenAddress: os.Getenv("M365_LISTEN"), ConfigPath: os.Getenv("M365_CONFIG"),
-		TokenCachePath: os.Getenv("M365_TOKEN_CACHE"), SessionCachePath: os.Getenv("M365_SESSION_CACHE"), OutboundProxy: os.Getenv(outbound.EnvProxy), ClientID: os.Getenv("M365_CLIENT_ID"),
+		TokenCachePath: os.Getenv("M365_TOKEN_CACHE"), SessionCachePath: os.Getenv("M365_SESSION_CACHE"), SessionMax: boundedPositiveIntEnv("M365_SESSION_MAX", defaultMaxSessions, 1, 10000), OutboundProxy: os.Getenv(outbound.EnvProxy), ClientID: os.Getenv("M365_CLIENT_ID"),
 		Authority: os.Getenv("M365_AUTHORITY"), RedirectURI: os.Getenv("M365_REDIRECT_URI"), Scope: os.Getenv("M365_SCOPE"),
 		ModelMappings:    append([]modelMapping(nil), defaultModelMappings...),
 		ToolPlanningMode: toolPlanningMode(os.Getenv("M365_TOOL_PLANNING_MODE")),
@@ -139,6 +140,11 @@ var openSettingsStore = sync.OnceValue(func() *settingsStore {
 	s := &settingsStore{path: settingsPath(), v: defaultRuntimeSettings()}
 	if b, e := os.ReadFile(s.path); e == nil {
 		_ = json.Unmarshal(b, &s.v)
+	}
+	// settings.json files created before the live-session limit existed do not
+	// contain sessionMax. Keep the UI and resolver on the compiled default.
+	if s.v.SessionMax == 0 {
+		s.v.SessionMax = defaultMaxSessions
 	}
 	if e := validateSettings(s.v); e != nil {
 		log.Printf("[settings] invalid persisted settings: %v", e)
@@ -173,6 +179,9 @@ func validateSettings(v runtimeSettings) error {
 	}
 	if v.ImageTimeoutSeconds < 5 || v.ImageTimeoutSeconds > 3600 {
 		return fmt.Errorf("图片超时必须为 5-3600 秒")
+	}
+	if v.SessionMax < 1 || v.SessionMax > 10000 {
+		return fmt.Errorf("本地活跃会话上限必须为 1-10000")
 	}
 	if v.LogLevel != "silent" && v.LogLevel != "error" && v.LogLevel != "warn" && v.LogLevel != "info" && v.LogLevel != "debug" {
 		return fmt.Errorf("日志等级必须为 silent、error、warn、info 或 debug")
@@ -325,6 +334,8 @@ func (s *Server) adminSettings(w http.ResponseWriter, r *http.Request) {
 		view := s.settings.get()
 		view.ProxyPool = outbound.RedactProxyURLs(view.ProxyPool)
 		view.OutboundProxy = outbound.RedactProxyURL(view.OutboundProxy)
+		// sessionMax is a live setting and intentionally remains in the response;
+		// the legacy APK fixture only covers fields that existed before it.
 		jsonOut(w, map[string]any{"settings": view, "codexModels": configurableCodexModels, "upstreamTones": knownUpstreamTones(), "restartRequiredFields": settingsRestartRequiredFields})
 	case http.MethodPut:
 		// 前端可能只修改一个字段（如监听地址），其余字段以零值提交。
@@ -354,6 +365,10 @@ func (s *Server) adminSettings(w http.ResponseWriter, r *http.Request) {
 			writeOpenAIError(w, 400, "invalid_request_error", e.Error())
 			return
 		}
+		evicted := 0
+		if s.sessionResolver != nil {
+			evicted = s.sessionResolver.SetMaxSessions(v.SessionMax)
+		}
 		if e := outbound.ConfigurePool(v.ProxyPool); e != nil {
 			writeOpenAIError(w, 400, "invalid_request_error", e.Error())
 			return
@@ -364,7 +379,12 @@ func (s *Server) adminSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		chathub.SetClientProfile(v.ClientProfile)
 		chathub.EnableWireCapture(v.CaptureRouterFrames)
-		jsonOut(w, map[string]any{"ok": true, "settings": v})
+		response := map[string]any{"ok": true, "settings": v}
+		if s.sessionResolver != nil {
+			response["sessionsEvicted"] = evicted
+			response["activeSessions"] = len(s.sessionResolver.ListSessions())
+		}
+		jsonOut(w, response)
 	default:
 		writeOpenAIError(w, 405, "invalid_request_error", "method not allowed")
 	}
@@ -470,6 +490,7 @@ func settingsEnvOverrides(s runtimeSettings) map[string]string {
 	putBool(EnvAllowFakeIPSource, s.AllowFakeIPSource)
 
 	putInt("M365_MAX_CONCURRENT_CHATS", s.MaxConcurrentChats)
+	putInt("M365_SESSION_MAX", s.SessionMax)
 	// 变量名以 account_concurrency.go:29 的实际读取为准，不能凭直觉命名。
 	putInt("M365_ACCOUNT_DEFAULT_CONCURRENCY", s.AccountConcurrency)
 

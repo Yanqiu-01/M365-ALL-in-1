@@ -16,6 +16,11 @@ import (
 // web/conversation.html 在 APK 中均不存在（rodata 无对应字面量、
 // APK rootPage 只判 / 与 /login、conversations.go 行段亦无容身空隙）。
 func TestConversationListUsesCompleteLocalHistory(t *testing.T) {
+	// 对话管理面板默认关闭（见 conversations.go 的 envConversationPanel）。
+	// 这条测试要验的是「打开时列表确实合并了本地历史」，所以显式把开关打开，
+	// 而不是把断言改成 503 —— 后者只会验证守卫本身，真实行为就没人看了。
+	// 默认关闭的断言在 conversations_disabled_test.go。
+	t.Setenv(envConversationPanel, "1")
 	dir := t.TempDir()
 	t.Setenv("M365_SESSION_CACHE", filepath.Join(dir, "sessions.json"))
 	t.Setenv("M365_CONVERSATION_CACHE", filepath.Join(dir, "conversations.json"))

@@ -72,8 +72,8 @@ func TestMessagesEqualCachedStillComparesToolCalls(t *testing.T) {
 	a := oaiMsg{Role: "assistant", Content: "same text", ToolCalls: call("read_file")}
 	b := oaiMsg{Role: "assistant", Content: "same text", ToolCalls: call("delete_file")}
 
-	aHashes := computeContentHashes([]oaiMsg{a})
-	bHashes := computeContentHashes([]oaiMsg{b})
+	aHashes := computeContentDigests([]oaiMsg{a})
+	bHashes := computeContentDigests([]oaiMsg{b})
 	if aHashes[0] != bHashes[0] {
 		t.Fatal("precondition: the text hash is expected to collide here")
 	}

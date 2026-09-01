@@ -639,6 +639,10 @@ textarea.form-input{min-height:80px;line-height:var(--lh-normal);resize:vertical
 .switch-row input{width:18px;height:18px;flex:0 0 auto;accent-color:var(--accent);cursor:pointer;margin-top:1px}
 .copy-field{display:flex;gap:var(--sp-2);align-items:center;margin:var(--sp-2) 0}
 .copy-field .form-input{flex:1;min-width:0;font-family:var(--font-mono);font-size:var(--fs-sm)}
+.history-capture{display:flex;align-items:center;gap:var(--sp-2);flex-wrap:wrap}
+.history-capture-label{font-size:var(--fs-sm);font-weight:var(--fw-semi);color:var(--muted);white-space:nowrap}
+.history-capture .form-input{width:76px;min-width:76px;padding-inline:var(--sp-2);text-align:center}
+.history-capture-note{flex-basis:100%;font-size:var(--fs-caption);color:var(--muted);line-height:var(--lh-normal)}
 /* 卡片头里的紧凑输入控件（搜索框 / 每页条数）：字号走令牌，高度只给下限，
    字号滑块拉到 1.5 时靠内容把盒子撑高，不会裁字。 */
 .input-inline{width:auto;max-width:100%;min-height:32px;
@@ -1830,7 +1834,11 @@ details.card>summary::-webkit-details-marker{display:none}
     <nav class="nav" aria-labelledby="navGroupManage">
       <button type="button" data-page="accounts" onclick="showPage('accounts')"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/> <path d="M16 3.128a4 4 0 0 1 0 7.744"/> <path d="M22 21v-2a4 4 0 0 0-3-3.87"/> <circle cx="9" cy="7" r="4"/></svg><span>账号</span></button>
       <button type="button" data-page="apikeys" onclick="showPage('apikeys')"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M2.586 17.414A2 2 0 0 0 2 18.828V21a1 1 0 0 0 1 1h3a1 1 0 0 0 1-1v-1a1 1 0 0 1 1-1h1a1 1 0 0 0 1-1v-1a1 1 0 0 1 1-1h.172a2 2 0 0 0 1.414-.586l.814-.814a6.5 6.5 0 1 0-4-4z"/> <circle cx="16.5" cy="7.5" r=".5" fill="currentColor"/></svg><span>API Keys</span></button>
-      <button type="button" data-page="conversations" onclick="showPage('conversations')"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M22 17a2 2 0 0 1-2 2H6.828a2 2 0 0 0-1.414.586l-2.202 2.202A.71.71 0 0 1 2 21.286V5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2z"/></svg><span>对话管理</span></button>
+      <!-- 对话管理入口默认隐藏：后端 M365_CONVERSATION_PANEL 开着时，
+           probeConversationPanel() 才把它放出来。markup 保留不删，开关一翻
+           就整块回来。hidden 与 display:none 同时写：.nav button 是
+           display:flex，光靠 hidden 属性会被样式盖掉。 -->
+      <button type="button" id="navConversations" data-page="conversations" onclick="showPage('conversations')" hidden style="display:none"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M22 17a2 2 0 0 1-2 2H6.828a2 2 0 0 0-1.414.586l-2.202 2.202A.71.71 0 0 1 2 21.286V5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2z"/></svg><span>对话管理</span></button>
       <button type="button" data-page="requests" onclick="showPage('requests')"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M3 3v18h18"/> <path d="M8 17V9"/> <path d="M13 17V5"/> <path d="M18 17v-5"/></svg><span>请求明细</span></button>
     </nav>
 
@@ -2302,9 +2310,16 @@ if (response.output_text) {
         <div class="page-head">
           <div>
             <h2 class="page-title">对话管理</h2>
-            <p class="page-sub">查看和清理 M365 对话</p>
+            <p class="page-sub">默认只看本地活跃上下文；点击“捕获”时才提取最近云端对话元数据</p>
           </div>
           <div class="page-head-actions">
+            <div class="history-capture" aria-label="历史对话捕获">
+              <label class="history-capture-label" for="captureLimit">捕获最近</label>
+              <input class="form-input" id="captureLimit" type="number" min="1" max="100" value="10" inputmode="numeric" aria-label="要捕获的最近对话数">
+              <span class="history-capture-label">条</span>
+              <button type="button" class="btn primary" onclick="captureConversations()">捕获</button>
+              <span class="history-capture-note">仅点击时拉取云端元数据；消息正文只保存网关已有上下文。</span>
+            </div>
             <button type="button" class="btn danger" onclick="cleanupAll()"><svg class="ico ico-sm" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M10 11v6"/> <path d="M14 11v6"/> <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/> <path d="M3 6h18"/> <path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg> 清理全部</button>
           </div>
         </div>
@@ -2812,6 +2827,11 @@ if (response.output_text) {
               <p class="form-hint">1–128。超限的请求返回 429 而不是排队悬挂。</p>
             </div>
             <div class="form-group">
+              <label class="form-label" for="setMaxSessions">本地活跃会话上限</label>
+              <input class="form-input" id="setMaxSessions" type="number" min="1" max="10000" placeholder="100">
+              <p class="form-hint">1–10000，默认 100。降低数值会立即淘汰最久未使用的本地上下文；需要保留时请先在“对话管理”中捕获。</p>
+            </div>
+            <div class="form-group">
               <label class="form-label" for="setAccountConc">单账号并发</label>
               <!-- 范围与占位值必须跟 account_concurrency.go 的 maxAccountConcurrency=128 /
                    defaultAccountConcurrency=64 一致。此处原为 max=64 placeholder=4：上限
@@ -3085,6 +3105,15 @@ function renderIcons(root){
 
 const $=id=>document.getElementById(id);
 const pages={dashboard:'仪表盘',accounts:'账号',apikeys:'API Keys',requests:'请求明细',conversations:'对话管理',proxies:'代理池',benchmark:'能力评测',settings:'设置'};
+/* PAGE_KEYS 是分区遍历的唯一清单。原来 showPage 和 termHostPage 各自写了
+   一份一模一样的数组，改一处漏一处就会出现「页面切走了但分区还开着」这类
+   只在某一条路径上出现的怪状态。 */
+const PAGE_KEYS=['dashboard','accounts','apikeys','requests','conversations','proxies','benchmark','settings'];
+/* 对话管理面板是否可用，由后端 M365_CONVERSATION_PANEL 决定。
+   默认 false：探测回来之前入口保持隐藏、showPage 也不放行，宁可晚一拍露出
+   来，也不要出现「点了进去、请求全 503」的坏观感。
+   探测见 probeConversationPanel()。 */
+let convPanelEnabled=false;
 let pkceTimer=null,pkceAttempt=0,pkcePopup=null,loadedSettings={},restartFields=[];
 const PKCE_POPUP_NAME='m365_pkce_auth';
 const PKCE_CALLBACK_PLACEHOLDER='粘贴地址栏完整回调地址…';
@@ -3138,7 +3167,11 @@ function clearPKCELocalState(options={}){
 }
 
 function showPage(p){
-  ['dashboard','accounts','apikeys','requests','conversations','proxies','benchmark','settings'].forEach(k=>{
+  // 面板停用时对话管理不可达：入口本来就是隐藏的，这里再兜一层 —— 旧的
+  // #hash、收藏夹、控制台里手敲的 showPage('conversations') 都从这儿被挡回
+  // 仪表盘，绝不会走到下面那句 loadConversations()。
+  if(p==='conversations'&&!convPanelEnabled)p='dashboard';
+  PAGE_KEYS.forEach(k=>{
     const sec=$('page-'+k);
     const on=k===p;
     sec.style.display=on?'block':'none';
@@ -3223,10 +3256,11 @@ async function loadSettings(){
     const setChk=(id,v)=>{ const el=$(id); if(el)el.checked=!!v; };
     setVal('setGuardInterval',s.proxyGuardInterval);
     setVal('setGuardConcurrency',s.proxyGuardConcurrency);
-    setChk('setGuardDisabled',s.proxyGuardDisabled);
-    setChk('setAllowFakeIp',s.allowFakeIpSource);
-    setVal('setMaxChats',s.maxConcurrentChats);
-    setVal('setAccountConc',s.accountConcurrency);
+     setChk('setGuardDisabled',s.proxyGuardDisabled);
+     setChk('setAllowFakeIp',s.allowFakeIpSource);
+     setVal('setMaxChats',s.maxConcurrentChats);
+     setVal('setMaxSessions',s.sessionMax);
+     setVal('setAccountConc',s.accountConcurrency);
     setVal('setCleanupInterval',s.autoCleanupIntervalMinutes);
     setVal('setCleanupMaxAge',s.autoCleanupMaxAgeHours);
     setVal('setCleanupKeepN',s.autoCleanupKeepN);
@@ -4985,7 +5019,38 @@ async function copyUseKey(){
    安全：消息正文一律经 textContent 写入，不走 innerHTML。 */
 let _convCache=[],_convCurrent=null;
 
+/* probeConversationPanel —— 问后端「对话管理面板开着吗」。
+   index.html 是磁盘上的静态文件、服务端不做模板渲染，前端没有别的办法拿到
+   进程里的 M365_CONVERSATION_PANEL，只能问一次。
+   借用列表端点的 probe=1：它在 ListSessions() 之前就答，不遍历会话；而且
+   刻意不新增路由 —— 新路由要改 server.go。
+   判定只有一条规则：拿到 200 且 enabled===true 才算开。503（面板停用）、
+   其他错误、离线、旧版网关不认识 probe 参数 —— 一律按关闭处理，失败方向
+   永远是「更保守」。 */
+async function probeConversationPanel(){
+  let on=false;
+  try{
+    const d=await api('/api/m365/conversations?probe=1');
+    on=d&&d.enabled===true;
+  }catch(e){on=false;}
+  convPanelEnabled=on;
+  const btn=$('navConversations');
+  if(btn){
+    btn.hidden=!on;
+    btn.style.display=on?'':'none';
+  }
+  // 探测比 enterApp 慢一拍：万一此刻正停在对话页上（旧会话恢复、或者开关
+  // 刚被关掉后刷新页面），立刻退回仪表盘，别让空面板挂在那儿。
+  if(!on){
+    const sec=$('page-conversations');
+    if(sec&&!sec.hidden)showPage('dashboard');
+  }
+}
+
 async function loadConversations(){
+  // 面板停用时一次网络请求都不发。showPage 已经拦住了正常入口，这里守的是
+  // 各处 loadConversations() 的回调式复用（删除后刷新、捕获后刷新）。
+  if(!convPanelEnabled)return;
   const box=$('convRows');
   box.innerHTML='<div class="mselect-empty">正在加载…</div>';
   try{
@@ -5008,6 +5073,24 @@ async function loadConversations(){
   }catch(e){
     box.innerHTML='<div class="mselect-empty">'+esc(e.message||'加载失败')+'</div>';
   }
+}
+
+async function captureConversations(){
+  if(!convPanelEnabled)return;
+  const field=$('captureLimit');
+  let limit=Number.parseInt(field&&field.value,10);
+  if(!Number.isFinite(limit))limit=10;
+  limit=Math.max(1,Math.min(100,limit));
+  if(field)field.value=limit;
+  try{
+    const d=await api('/api/conversations/capture',{method:'POST',body:JSON.stringify({limit})});
+    let msg='已捕获 '+(d.captured||0)+' 条对话到本地 JSON，跳过 '+(d.skipped||0)+' 条。';
+    if(d.remoteFetched)msg+=' 已按需刷新云端对话元数据。';
+    if(d.metadataOnly)msg+=' 其中 '+d.metadataOnly+' 条仅保存云端元数据。';
+    if(d.warning)msg+=' '+d.warning;
+    showNotice(msg,d.warning?'info':'success');
+    loadConversations();
+  }catch(e){showNotice('捕获失败：'+e.message,'error');}
 }
 
 function markConvActive(id){
@@ -5114,7 +5197,8 @@ function msgNode(m){
 }
 
 async function openConvDetail(id){
-  if(!id)return;
+  // 详情是这一页最贵的一笔（整段正文过网），停用时不取。
+  if(!id||!convPanelEnabled)return;
   _convCurrent=id;
   markConvActive(id);
   $('convDetail')?.classList.add('is-open');
@@ -5189,7 +5273,7 @@ async function proxyHotReassign(){
   finally{if(btn)btn.disabled=false;}
 }
 async function deleteCurrentConv(){
-  if(!_convCurrent)return;
+  if(!_convCurrent||!convPanelEnabled)return;
   const id=_convCurrent;
   if(!confirm('删除该对话？'))return;
   try{
@@ -5201,12 +5285,14 @@ async function deleteCurrentConv(){
 }
 
 function termHostPage(){
-  const pages=['dashboard','accounts','apikeys','requests','conversations','proxies','benchmark','settings'];
+  const pages=PAGE_KEYS;
   for(const k of pages){
     const sec=$('page-'+k);
     if(sec && !sec.hidden) return sec;
   }
-  return $('page-conversations');
+  // 没有任何可见分区时的兜底。面板停用后 #page-conversations 永远是 hidden，
+  // 把终端塞进去等于把日志藏起来，所以此时退回仪表盘。
+  return convPanelEnabled?$('page-conversations'):$('page-dashboard');
 }
 function termOpen(title){
   const box=$('termBox');
@@ -5231,8 +5317,10 @@ function termClose(){
 function termLine(msg,cls){const d=document.createElement('div');if(cls)d.className=cls;d.textContent='> '+msg;$('termBody').appendChild(d);$('termBody').scrollTop=$('termBody').scrollHeight;}
 function termClear(){$('termBody').innerHTML='';}
 
-async function deleteConv(id){if(!confirm('删除？'))return;try{await api('/api/m365/conversations/delete',{method:'POST',body:JSON.stringify({conversation_id:id})});showNotice('已删除','success');closeConvDetail();loadConversations();}catch(e){showNotice(e.message,'error');}}
+async function deleteConv(id){if(!convPanelEnabled)return;if(!confirm('删除？'))return;try{await api('/api/m365/conversations/delete',{method:'POST',body:JSON.stringify({conversation_id:id})});showNotice('已删除','success');closeConvDetail();loadConversations();}catch(e){showNotice(e.message,'error');}}
 async function cleanupAll(){
+  // 破坏性且是循环删除，停用时连确认框都不弹。
+  if(!convPanelEnabled)return;
   const total=confirm('清理所有对话？\n将在终端中逐条删除并显示日志。');
   if(!total)return;
   termOpen('cleanup — m365-copilot2api');
@@ -5240,7 +5328,7 @@ async function cleanupAll(){
   let ok=0,fail=0,round=0;
   for(round=1;round<=100;round++){
     let d;
-    try{d=await api('/api/m365/conversations');}catch(e){termLine('获取对话列表失败: '+e.message,'err');break;}
+    try{d=await api('/api/m365/conversations?remote=1');}catch(e){termLine('获取对话列表失败: '+e.message,'err');break;}
     const c=d.data||[];
     if(!c.length){
       termLine('第 '+round+' 轮：列表已清空。','dim');
@@ -5856,10 +5944,11 @@ async function saveSettings(){  try{
     const chk=el=>{ const e=$(el); return e?e.checked:undefined; };
     put('proxyGuardInterval',str('setGuardInterval'));
     put('proxyGuardConcurrency',num('setGuardConcurrency'));
-    put('proxyGuardDisabled',chk('setGuardDisabled'));
-    put('allowFakeIpSource',chk('setAllowFakeIp'));
-    put('maxConcurrentChats',num('setMaxChats'));
-    put('accountConcurrency',num('setAccountConc'));
+     put('proxyGuardDisabled',chk('setGuardDisabled'));
+     put('allowFakeIpSource',chk('setAllowFakeIp'));
+     put('maxConcurrentChats',num('setMaxChats'));
+     put('sessionMax',num('setMaxSessions'));
+     put('accountConcurrency',num('setAccountConc'));
     put('autoCleanupIntervalMinutes',num('setCleanupInterval'));
     put('autoCleanupMaxAgeHours',num('setCleanupMaxAge'));
     put('autoCleanupKeepN',num('setCleanupKeepN'));
@@ -6402,6 +6491,9 @@ function enterApp(){
   $('login').hidden=true;
   $('app').style.display='flex';
   $('app').hidden=false;
+  // 静态 HTML 需要向后端探测一次运行时开关；不 await，仪表盘照常立刻出现，
+  // 只有对话管理入口会在确认已开启后才显示。
+  probeConversationPanel();
   showPage('dashboard');
   loadStats();
   loadOnboarding();

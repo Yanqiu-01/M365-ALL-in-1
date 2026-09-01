@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log"
 	"math"
 	"net"
 	"net/http"
@@ -35,33 +36,110 @@ type sessionBinding struct {
 	// ContextHistory 鎸佷箙鍖栦繚瀛樻渶杩戜竴娆″崗璁殑瀹屾暣娑堟伅锛屼緵閲嶅惎鍚庣户缁仛
 	// 鍐呭鍓嶇紑鍖归厤锛岄伩鍏嶈繘绋嬮噸鍚鑷存墍鏈変細璇濋敭鍏ㄩ儴澶辨晥銆?
 	ContextHistory []oaiMsg `json:"contextHistory,omitempty"`
-	// contentHashes caches the contentToString of every message in ContextHistory,
-	// computed once at Bind time. matchContextLocked and contextSimilarity compare
-	// hashes instead of re-running contentToString over the full history on every
-	// request. A 148-message / 578 KB session was re-materialising all of it per
-	// request; with the cache the comparison is O(messages) string equality.
+	// contentHashes caches a fixed-width SHA-256 digest of role + NUL + text for
+	// every message in ContextHistory. Equality is its only use, so retaining the
+	// original text here was a duplicate full-history copy with no semantic value.
 	contentHashes []string `json:"-"`
-	// contextTokens caches the tokenised form of ContextHistory used by the
-	// similarity fallback. Without it every strict-prefix miss re-flattened and
-	// re-tokenised each session's whole history, i.e. O(sessions x bytes) per
-	// request. Built alongside contentHashes at Bind and at load time.
+	// contextTokens caches the tokenised form of ContextHistory, but only a recent
+	// window (24 messages / 64KB by default). Before window capping it stored every
+	// distinct token over the WHOLE history, growing unbounded: 100 sessions /
+	// 14435 messages retained 108.4MB of tokens, i.e. 440605 distinct tokens, the
+	// single largest consumer in this file. contextSimilarityCached needs it, which
+	// is a FUZZY FALLBACK heuristic used when strict-prefix matching misses. Cap the
+	// window by message count AND by bytes, so the retained size is O(cap) not
+	// O(history); scores then reflect "recent turns" instead of "whole history."
 	contextTokens map[string]bool `json:"-"`
+	// ContextBytes is a cheap size estimate of ContextHistory. It is persisted
+	// so compression detection does not have to flatten a large history again
+	// after every restart.
+	ContextBytes int64 `json:"contextBytes,omitempty"`
+}
+
+// compressionEvent is returned by Bind when the same cloud conversation is
+// observed with a substantially smaller context. Archive I/O happens outside
+// the resolver mutex so a large JSON write never blocks session matching.
+type compressionEvent struct {
+	SessionID          string
+	ConversationID     string
+	AccountID          string
+	TenantKey          string
+	CreatedAt          time.Time
+	DetectedAt         time.Time
+	BeforeContextBytes int64
+	AfterContextBytes  int64
+	BeforeMessages     []oaiMsg
+	AfterMessages      []oaiMsg
+	DroppedMessages    []oaiMsg
 }
 
 type sessionResolver struct {
-	mu          sync.Mutex
-	path        string
-	sessions    map[string]sessionBinding
+	mu       sync.Mutex
+	path     string
+	sessions map[string]sessionBinding
+	// byExplicit is kept as a small secondary index for callers/tests that
+	// construct a resolver directly. The explicit session id is still the
+	// canonical key in sessions; this map only avoids a future linear scan.
+	byExplicit  map[string]string // explicit X-M365-Session-Id -> sessionID
 	byUserField map[string]string // userField -> sessionID
 	byIPFinger  map[string]string // ipFingerprint -> sessionID
 	byContext   map[string]string // contextFingerprint -> sessionID
 	ttl         time.Duration
 	contextTTL  time.Duration
 	maxSessions int
-	persist     *persistStore
+	// maxContextBytes 是单会话上下文字节上限，0 表示用编译期默认值 —— 直接构造
+	// 出来的 resolver（测试、history_capture）不必显式填这个字段就能拿到同样的
+	// 保护，与 maxSessions 的处理方式一致。
+	maxContextBytes           int64
+	compressionThresholdBytes int64
+	compressionRatio          float64
+	persist                   *persistStore
 }
 
-const defaultMaxSessions = 1000
+const (
+	defaultMaxSessions               = 100
+	defaultCompressionThresholdBytes = int64(400 * 1024)
+	defaultCompressionRatio          = 0.75
+	// 相似度兜底只需要回答「这个请求是不是在续接那个会话」，最近几轮就足以判断。
+	// 但 contextTokens 原本对整段历史建词集合，于是每个会话常驻的词表随历史线性
+	// 增长 —— 实测 100 个会话 / 14435 条消息留下 440605 个不同词、108MB，是本文件
+	// 最大的内存消费者。把取词范围压到历史尾部的一个窗口，词表大小就由窗口上限
+	// 决定，与历史长短无关。条数与字节双重设限：条数挡住"很多条小消息"，字节挡住
+	// "少数几条超大消息"，任一先到即止。
+	defaultSimilarityWindowMessages = 24
+	defaultSimilarityWindowBytes    = int64(64 << 10)
+	// 单会话上下文字节上限。原本只按会话条数封顶（defaultMaxSessions），于是
+	// 少数几个超长会话仍能把常驻字节拉到 GB 级：100 条的额度里，一条 200MB 的
+	// 会话和一条 2KB 的会话记一样多。真实样本单会话平均 286KB，所以 4MB 是
+	// 病态增长的护栏而不是日常策略 —— 正常会话永远碰不到它。
+	defaultMaxSessionContextBytes = int64(4 << 20)
+)
+
+// The history/session settings are process environment values. Keep parsing
+// deliberately strict: malformed, non-finite, or out-of-range values fall
+// back to the compiled default instead of silently weakening a bound.
+func boundedPositiveIntEnv(name string, fallback, min, max int) int {
+	v, err := strconv.Atoi(strings.TrimSpace(os.Getenv(name)))
+	if err != nil || v < min || v > max {
+		return fallback
+	}
+	return v
+}
+
+func boundedPositiveInt64Env(name string, fallback, min, max int64) int64 {
+	v, err := strconv.ParseInt(strings.TrimSpace(os.Getenv(name)), 10, 64)
+	if err != nil || v < min || v > max {
+		return fallback
+	}
+	return v
+}
+
+func boundedFloatEnv(name string, fallback, min, max float64) float64 {
+	v, err := strconv.ParseFloat(strings.TrimSpace(os.Getenv(name)), 64)
+	if err != nil || math.IsNaN(v) || math.IsInf(v, 0) || v < min || v > max {
+		return fallback
+	}
+	return v
+}
 
 func openSessionResolver() *sessionResolver {
 	// 闂茬疆 2 灏忔椂鍗宠涓鸿繃鏈燂紙鐢ㄦ埛锛? 灏忔椂涓嶆椿璺冨凡缁忕畻涔咃級銆備細璇濊繃鏈熷悗
@@ -82,15 +160,24 @@ func openSessionResolver() *sessionResolver {
 	if path == "" {
 		path = "sessions.json"
 	}
+	maxSessions := boundedPositiveIntEnv("M365_SESSION_MAX", defaultMaxSessions, 1, 10000)
+	// 下界 64KB：再低就会把正常长度的会话也赶走，那不是护栏而是功能损坏。
+	maxContextBytes := boundedPositiveInt64Env("M365_SESSION_MAX_CONTEXT_BYTES", defaultMaxSessionContextBytes, 64<<10, 512<<20)
+	compressionThreshold := boundedPositiveInt64Env("M365_HISTORY_COMPRESSION_THRESHOLD_BYTES", defaultCompressionThresholdBytes, 1024, 100<<20)
+	compressionRatio := boundedFloatEnv("M365_HISTORY_COMPRESSION_RATIO", defaultCompressionRatio, 0.05, 0.99)
 	sr := &sessionResolver{
-		path:        path,
-		sessions:    map[string]sessionBinding{},
-		byUserField: map[string]string{},
-		byIPFinger:  map[string]string{},
-		byContext:   map[string]string{},
-		ttl:         ttl,
-		contextTTL:  contextTTL,
-		maxSessions: defaultMaxSessions,
+		path:                      path,
+		sessions:                  map[string]sessionBinding{},
+		byExplicit:                map[string]string{},
+		byUserField:               map[string]string{},
+		byIPFinger:                map[string]string{},
+		byContext:                 map[string]string{},
+		ttl:                       ttl,
+		contextTTL:                contextTTL,
+		maxSessions:               maxSessions,
+		maxContextBytes:           maxContextBytes,
+		compressionThresholdBytes: compressionThreshold,
+		compressionRatio:          compressionRatio,
 	}
 	sr.persist = &persistStore{flush: sr.flush}
 	sr.loadLocked()
@@ -116,9 +203,17 @@ func (sr *sessionResolver) loadLocked() {
 				// contentToString over its whole history. That is exactly the
 				// per-request re-materialisation that saturated the CPU, and it
 				// returned on every restart. Rebuild the cache once here.
-				s.contentHashes = computeContentHashes(s.ContextHistory)
+				s.contentHashes = computeContentDigests(s.ContextHistory)
 				s.contextTokens = messageTokenSet(s.ContextHistory)
+				if s.ContextBytes <= 0 {
+					s.ContextBytes = estimateContextBytes(s.ContextHistory, computeContentHashes(s.ContextHistory))
+				}
 				sr.reindexLocked(s)
+			}
+			before := len(sr.sessions)
+			sr.evictLocked()
+			if len(sr.sessions) < before && sr.persist != nil {
+				sr.persist.markDirty()
 			}
 		}
 	}
@@ -140,7 +235,43 @@ func (sr *sessionResolver) flush() error {
 }
 
 func (sr *sessionResolver) reindexLocked(s sessionBinding) {
+	// 不能截断 ContextHistory 后继续把截断长度当 HistoryLen 返回：调用方会按
+	// body.Messages[HistoryLen:] 发增量，而截断后的尾部不是请求的前缀，必然丢失
+	// 或重复上下文。超限会话因此直接不参加后续增量复用；下一次请求走全量，而
+	// 不是猜一个不可靠的边界。ContextHistory 从未被静默裁剪。
+	maxContextBytes := sr.maxContextBytes
+	if maxContextBytes <= 0 {
+		maxContextBytes = defaultMaxSessionContextBytes
+	}
+	if s.ContextBytes > maxContextBytes {
+		if old, ok := sr.sessions[s.SessionID]; ok {
+			sr.dropLocked(s.SessionID, old)
+		}
+		return
+	}
+
+	// Bind 会在原 sessionID 上更新 IP/user/context 指纹。先删掉这个 ID 旧有的
+	// 索引项，才能保证索引是当前值的反向映射；否则每次网络变化都留下一个永不
+	// 删除的旧 key，既泄漏内存，又会让诊断索引指向已经失效的指纹。
+	if old, ok := sr.sessions[s.SessionID]; ok {
+		sr.deleteIndexesLocked(s.SessionID, old)
+	}
 	sr.sessions[s.SessionID] = s
+	if sr.byExplicit == nil {
+		sr.byExplicit = map[string]string{}
+	}
+	if sr.byUserField == nil {
+		sr.byUserField = map[string]string{}
+	}
+	if sr.byIPFinger == nil {
+		sr.byIPFinger = map[string]string{}
+	}
+	if sr.byContext == nil {
+		sr.byContext = map[string]string{}
+	}
+	if s.SessionID != "" {
+		sr.byExplicit[s.SessionID] = s.SessionID
+	}
 	if s.UserField != "" {
 		sr.byUserField[s.UserField] = s.SessionID
 	}
@@ -152,12 +283,33 @@ func (sr *sessionResolver) reindexLocked(s sessionBinding) {
 	}
 }
 
+// deleteIndexesLocked removes only entries that still point to id. Another
+// session may have since claimed the same diagnostic key, so unconditional
+// deletion would corrupt that newer reverse mapping.
+func (sr *sessionResolver) deleteIndexesLocked(id string, s sessionBinding) {
+	if sr.byExplicit[s.SessionID] == id {
+		delete(sr.byExplicit, s.SessionID)
+	}
+	if sr.byUserField[s.UserField] == id {
+		delete(sr.byUserField, s.UserField)
+	}
+	if sr.byIPFinger[s.IPFingerprint] == id {
+		delete(sr.byIPFinger, s.IPFingerprint)
+	}
+	if sr.byContext[s.ContextFinger] == id {
+		delete(sr.byContext, s.ContextFinger)
+	}
+}
+
 func (sr *sessionResolver) evictLocked() {
 	now := time.Now().UTC()
 	for id, s := range sr.sessions {
 		if now.Sub(s.LastUsedAt) > sr.ttl {
 			sr.dropLocked(id, s)
 		}
+	}
+	if sr.maxSessions < 1 {
+		sr.maxSessions = defaultMaxSessions
 	}
 	if len(sr.sessions) > sr.maxSessions {
 		// Bound memory by dropping the least recently used sessions.
@@ -176,6 +328,9 @@ func (sr *sessionResolver) evictLocked() {
 
 func (sr *sessionResolver) dropLocked(id string, s sessionBinding) {
 	delete(sr.sessions, id)
+	if sr.byExplicit[s.SessionID] == id {
+		delete(sr.byExplicit, s.SessionID)
+	}
 	if sr.byUserField[s.UserField] == id {
 		delete(sr.byUserField, s.UserField)
 	}
@@ -234,16 +389,63 @@ func contextSimilarity(hist, msgs []oaiMsg) float64 {
 	return jaccardSets(messageTokenSet(hist), messageTokenSet(msgs))
 }
 
-// messageTokenSet flattens and tokenises a message slice into a set. Callers on
-// the hot path cache the result per session instead of rebuilding it for every
-// request.
+// messageTokenSet tokenises a recent suffix rather than flattening the complete
+// history. Similarity is only a fallback after strict-prefix matching failed, so
+// the useful signal is whether the newest turns continue each other; holding an
+// unbounded vocabulary for old turns buys little and made every stored session
+// scale with lifetime conversation text. Both caps are environment-overridable
+// for installations with an unusual turn shape, using the same strict parsing
+// policy as the other M365_SESSION_* bounds.
 func messageTokenSet(msgs []oaiMsg) map[string]bool {
 	if len(msgs) == 0 {
 		return nil
 	}
+	maxMessages := boundedPositiveIntEnv("M365_SESSION_SIMILARITY_WINDOW_MESSAGES", defaultSimilarityWindowMessages, 1, 10000)
+	maxBytes := boundedPositiveInt64Env("M365_SESSION_SIMILARITY_WINDOW_BYTES", defaultSimilarityWindowBytes, 1024, 16<<20)
+
+	// Walk from the newest message backwards, then write forward again. A suffix
+	// gives a new request's latest user turn the same weight as the stored one;
+	// writing forward preserves ordinary role/content token boundaries.
+	start := len(msgs)
+	var used int64
+	for start > 0 && len(msgs)-start < maxMessages {
+		m := msgs[start-1]
+		messageBytes := int64(len(m.Role) + 1 + len(contentToString(m.Content)))
+		if used+messageBytes > maxBytes {
+			break
+		}
+		used += messageBytes
+		start--
+	}
+	// Always admit the last message, but only its tail up to maxBytes. An oversized
+	// final turn must not turn the set into nil (which disables the fallback), nor
+	// may a single pasted log evade the byte cap.
+	if start == len(msgs) {
+		start--
+	}
+
 	var text strings.Builder
-	for _, m := range msgs {
-		text.WriteString(m.Role + ":" + contentToString(m.Content) + "\n")
+	text.Grow(int(used))
+	for _, m := range msgs[start:] {
+		remaining := maxBytes - int64(text.Len())
+		if remaining <= 1 { // reserve one byte for the separator below
+			break
+		}
+		prefix := m.Role + ":"
+		if int64(len(prefix))+1 > remaining {
+			break
+		}
+		text.WriteString(prefix)
+		content := contentToString(m.Content)
+		contentBudget := remaining - int64(len(prefix)) - 1
+		if int64(len(content)) > contentBudget {
+			// Keep the end of an oversized message: it contains the newest natural-
+			// language clause, and slicing bytes is safe because strings.Fields will
+			// simply treat any incomplete UTF-8 rune as a separator/non-word byte.
+			content = content[len(content)-int(contentBudget):]
+		}
+		text.WriteString(content)
+		text.WriteByte('\n')
 	}
 	tokens := tokenize(text.String())
 	set := make(map[string]bool, len(tokens))
@@ -559,7 +761,7 @@ func repeatSuffixLen(hist, msgs []oaiMsg, histHashes, msgHashes []string) int {
 
 // messagesEqualCached falls back to the uncached path when either hash slice
 // is missing or shorter than the message index. The hot path (matchContext)
-// always has both caches populated by computeContentHashes.
+// always has both caches populated by computeContentDigests.
 func messagesEqualCached(a, b oaiMsg, idx int, aHashes, bHashes []string) bool {
 	if aHashes != nil && bHashes != nil && idx < len(aHashes) && idx < len(bHashes) {
 		// The hash only covers role + text. Comparing hashes alone treated two
@@ -626,9 +828,15 @@ func toolCallEqual(x, y map[string]any) bool {
 	return xa == ya
 }
 
-// computeContentHashes returns the contentToString of each message, computed
-// once. Callers store the result in contentHashes and compare slices on the
-// hot path instead of re-running contentToString over the full history.
+// computeContentHashes returns the role + NUL + contentToString of each message.
+// Despite the name it does not hash: it is the full content key, and its LENGTH
+// is what estimateContextBytes uses as the per-message size proxy. Keep it that
+// way — history_archive.go depends on that length for compression detection, so
+// switching this to a fixed-width digest would make ContextBytes proportional to
+// message count instead of bytes and silently disable shrink detection.
+//
+// 因此这个切片只用于「算大小」，是一次性中间产物，绝不长期持有：常驻缓存存的是
+// 下面 computeContentDigests 的定长摘要。
 func computeContentHashes(msgs []oaiMsg) []string {
 	if len(msgs) == 0 {
 		return nil
@@ -640,9 +848,53 @@ func computeContentHashes(msgs []oaiMsg) []string {
 	return out
 }
 
+// computeContentDigests 返回每条消息内容键的定长摘要，供 contentHashes 常驻缓存。
+//
+// 原实现把 role+NUL+正文原样存下来，等于给每条消息的正文留了第二份完整副本 ——
+// pprof 归因 computeContentHashes 75.91MB、复现负载里 contentHashes 常驻 23.3MB，
+// 而这份副本的全部用途只是字符串「相等比较」（contextPrefixLenHashed /
+// repeatSuffixLen / matchContextLocked）。摘要对相等比较是等价的：同内容同摘要，
+// 异内容异摘要，于是常驻量从"正文大小"塌缩成"消息条数 x 64 字节"。
+//
+// 这里不像 clientIPFingerprint 那样截断到 16 字节。指纹只是索引，撞了还有后续
+// 校验兜底；而内容相等直接决定"要不要复用这个云端对话"，一次碰撞就是把两段无关
+// 对话接在一起。留全 256 位，代价是每条消息多 32 字节，换掉这个风险很划算。
+func computeContentDigests(msgs []oaiMsg) []string {
+	if len(msgs) == 0 {
+		return nil
+	}
+	out := make([]string, len(msgs))
+	for i, m := range msgs {
+		out[i] = digestContentKey(m.Role + "\x00" + contentToString(m.Content))
+	}
+	return out
+}
+
+// digestContentKeys digests an already-built content key slice. Bind needs the
+// keys anyway to size the context, so reusing them avoids a second pass over
+// every message body.
+func digestContentKeys(keys []string) []string {
+	if len(keys) == 0 {
+		return nil
+	}
+	out := make([]string, len(keys))
+	for i, key := range keys {
+		out[i] = digestContentKey(key)
+	}
+	return out
+}
+
+func digestContentKey(key string) string {
+	sum := sha256.Sum256([]byte(key))
+	return hex.EncodeToString(sum[:])
+}
+
 // requestContentHashes is the per-request analogue, computed once before the
-// resolver loop so matchContextLocked and contextSimilarity share the work.
-func requestContentHashes(msgs []oaiMsg) []string { return computeContentHashes(msgs) }
+// resolver loop so matchContextLocked shares the work across candidate sessions.
+// It must produce the SAME flavour as the retained contentHashes — comparing a
+// digest against a raw content key would never be equal and would quietly turn
+// every strict-prefix match into a new session.
+func requestContentHashes(msgs []oaiMsg) []string { return computeContentDigests(msgs) }
 
 // requestTenantKey 提取请求的租户键，与 server.extractAPIKey 同源：
 // 优先 X-API-Key，其次 Authorization Bearer，超过 8 字符取前缀加省略号，
@@ -666,7 +918,7 @@ func requestTenantKey(r *http.Request) string {
 	return key
 }
 
-func (sr *sessionResolver) Bind(sessionID, conversationID, accountID string, body *oaiReq, assistantText string, r *http.Request) {
+func (sr *sessionResolver) Bind(sessionID, conversationID, accountID string, body *oaiReq, assistantText string, r *http.Request) *compressionEvent {
 	sr.mu.Lock()
 	defer sr.mu.Unlock()
 	sr.evictLocked()
@@ -677,6 +929,9 @@ func (sr *sessionResolver) Bind(sessionID, conversationID, accountID string, bod
 	if strings.TrimSpace(assistantText) != "" {
 		history = append(history, oaiMsg{Role: "assistant", Content: assistantText})
 	}
+	hashes := computeContentHashes(history)
+	digests := digestContentKeys(hashes)
+	contextBytes := estimateContextBytes(history, hashes)
 	explicitID := r.Header.Get("X-M365-Session-Id")
 	if explicitID != "" && sessionID == "" {
 		sessionID = explicitID
@@ -685,6 +940,10 @@ func (sr *sessionResolver) Bind(sessionID, conversationID, accountID string, bod
 	// 而不是每次 Bind 都新建一条，避免 sessions.json 膨胀。
 	if sessionID != "" {
 		if sess, ok := sr.sessions[sessionID]; ok {
+			var compression *compressionEvent
+			if sess.ConversationID == conversationID && sess.TenantKey == tenantKey {
+				compression = compressionEventFor(sess, history, contextBytes, now, sr.compressionThresholdBytes, sr.compressionRatio)
+			}
 			sess.ConversationID = conversationID
 			sess.AccountID = accountID
 			sess.TenantKey = tenantKey
@@ -693,17 +952,44 @@ func (sr *sessionResolver) Bind(sessionID, conversationID, accountID string, bod
 			sess.IPFingerprint = clientIPFingerprint(r)
 			sess.ContextFinger = contextFingerprint(history)
 			sess.ContextHistory = history
-			sess.contentHashes = computeContentHashes(history)
+			sess.ContextBytes = contextBytes
+			sess.contentHashes = digests
 			sess.contextTokens = messageTokenSet(history)
-			sr.sessions[sessionID] = sess
+			// 不再先写 map 再 reindex：reindexLocked 要读到"更新前"的绑定才能删掉
+			// 被取代的旧指纹索引，提前赋值会让它读到新值而漏删。sessions 的 key
+			// 恒等于 SessionID，reindexLocked 写的是同一格，语义不变。
 			sr.reindexLocked(sess)
 			sr.persist.markDirty()
-			return
+			return compression
+		}
+	}
+	// A cloud conversation can retain its ConversationID while ChatHub issues a
+	// new SessionID. Preserve the existing per-session binding semantics, but
+	// still use the most recent same-conversation context as the compression
+	// baseline before creating the new binding.
+	var pendingCompression *compressionEvent
+	if sessionID != "" && conversationID != "" {
+		var candidate sessionBinding
+		found := false
+		for _, sess := range sr.sessions {
+			if sess.ConversationID != conversationID || sess.TenantKey != tenantKey {
+				continue
+			}
+			if !found || sess.LastUsedAt.After(candidate.LastUsedAt) {
+				candidate, found = sess, true
+			}
+		}
+		if found {
+			pendingCompression = compressionEventFor(candidate, history, contextBytes, now, sr.compressionThresholdBytes, sr.compressionRatio)
+			if pendingCompression != nil {
+				pendingCompression.SessionID = sessionID
+			}
 		}
 	}
 	if sessionID == "" {
-		for sid, sess := range sr.sessions {
-			if sess.ConversationID == conversationID {
+		for _, sess := range sr.sessions {
+			if sess.ConversationID == conversationID && sess.TenantKey == tenantKey {
+				compression := compressionEventFor(sess, history, contextBytes, now, sr.compressionThresholdBytes, sr.compressionRatio)
 				sess.LastUsedAt = now
 				sess.AccountID = accountID
 				sess.TenantKey = tenantKey
@@ -711,12 +997,12 @@ func (sr *sessionResolver) Bind(sessionID, conversationID, accountID string, bod
 				sess.IPFingerprint = clientIPFingerprint(r)
 				sess.ContextFinger = contextFingerprint(history)
 				sess.ContextHistory = history
-				sess.contentHashes = computeContentHashes(history)
+				sess.ContextBytes = contextBytes
+				sess.contentHashes = digests
 				sess.contextTokens = messageTokenSet(history)
-				sr.sessions[sid] = sess
 				sr.reindexLocked(sess)
 				sr.persist.markDirty()
-				return
+				return compression
 			}
 		}
 		sessionID = uuid.NewString()
@@ -733,12 +1019,55 @@ func (sr *sessionResolver) Bind(sessionID, conversationID, accountID string, bod
 		UserField:      body.User,
 		ContextFinger:  contextFingerprint(history),
 		ContextHistory: history,
+		ContextBytes:   contextBytes,
 	}
-	sess.contentHashes = computeContentHashes(history)
+	sess.contentHashes = digests
 	sess.contextTokens = messageTokenSet(history)
 
 	sr.reindexLocked(sess)
 	sr.persist.markDirty()
+	return pendingCompression
+}
+
+// SetMaxSessions changes the live-context ceiling without requiring a restart.
+// Lowering the ceiling immediately removes the least recently used entries and
+// synchronously flushes sessions.json so a restart cannot resurrect them.
+func (sr *sessionResolver) SetMaxSessions(max int) (evicted int) {
+	if sr == nil || max < 1 || max > 10000 {
+		return 0
+	}
+	sr.mu.Lock()
+	if sr.maxSessions == max {
+		sr.mu.Unlock()
+		return 0
+	}
+	before := len(sr.sessions)
+	sr.maxSessions = max
+	sr.evictLocked()
+	evicted = before - len(sr.sessions)
+	persist := sr.persist
+	if evicted > 0 && persist != nil {
+		persist.markDirty()
+	}
+	sr.mu.Unlock()
+	if evicted > 0 && persist != nil {
+		if err := persist.flushNowBlocking(); err != nil {
+			log.Printf("[session-resolver] persist after max-session eviction failed: %v", err)
+		}
+	}
+	return evicted
+}
+
+func (sr *sessionResolver) MaxSessions() int {
+	if sr == nil {
+		return defaultMaxSessions
+	}
+	sr.mu.Lock()
+	defer sr.mu.Unlock()
+	if sr.maxSessions < 1 {
+		return defaultMaxSessions
+	}
+	return sr.maxSessions
 }
 
 func (sr *sessionResolver) GetSession(sessionID string) (sessionBinding, bool) {
@@ -780,16 +1109,7 @@ func (sr *sessionResolver) DeleteSession(sessionID string) bool {
 	if !ok {
 		return false
 	}
-	delete(sr.sessions, sessionID)
-	if s.UserField != "" {
-		delete(sr.byUserField, s.UserField)
-	}
-	if s.IPFingerprint != "" {
-		delete(sr.byIPFinger, s.IPFingerprint)
-	}
-	if s.ContextFinger != "" {
-		delete(sr.byContext, s.ContextFinger)
-	}
+	sr.dropLocked(sessionID, s)
 	sr.persist.markDirty()
 	return true
 }
@@ -810,7 +1130,6 @@ func (sr *sessionResolver) ReassignAccount(sessionID, accountID string) bool {
 	sess.AccountID = accountID
 	sess.ConversationID = ""
 	sess.LastUsedAt = time.Now().UTC()
-	sr.sessions[sessionID] = sess
 	sr.reindexLocked(sess)
 	sr.persist.markDirty()
 	return true
@@ -843,16 +1162,7 @@ func (sr *sessionResolver) UnbindByConversation(conversationID string) int {
 		if s.ConversationID != conversationID {
 			continue
 		}
-		delete(sr.sessions, sid)
-		if s.UserField != "" {
-			delete(sr.byUserField, s.UserField)
-		}
-		if s.IPFingerprint != "" {
-			delete(sr.byIPFinger, s.IPFingerprint)
-		}
-		if s.ContextFinger != "" {
-			delete(sr.byContext, s.ContextFinger)
-		}
+		sr.dropLocked(sid, s)
 		removed++
 	}
 	if removed > 0 {

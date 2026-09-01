@@ -63,10 +63,62 @@ func TestResponsesCustomExecToOpenAI(t *testing.T) {
 	}
 }
 
-func TestResponsesCustomExecIsExclusiveTool(t *testing.T) {
+// 这个测试原名 TestResponsesCustomExecIsExclusiveTool，断言的是
+// len(o.Tools) == 1 —— 它 pin 住的是 bug 本身：转换器当年一旦看到 custom/exec
+// 就把其余声明全丢掉，测试照着这个行为写，于是「只剩 exec」成了被保护的契约。
+// 真实后果是 Codex 声明 exec + apply_patch + read_file + MCP namespace 之后模型
+// 手上只有 exec，然后照实说「read_file 不可用」。
+//
+// 现在断言修正后的契约：混合声明全部存活、顺序不变，并且 exec 不是唯一工具时
+// 注入的系统提示词不能声称互斥。exec 独占的覆盖挪到下面 ...IsSoleTool。
+func TestResponsesCustomExecCoexistsWithOtherTools(t *testing.T) {
 	r := responsesRequest{Input: "edit the project", Tools: []map[string]any{
 		{"type": "custom", "name": "exec", "description": "local execution"},
-		{"type": "function", "name": "m365_search", "description": "native search"},
+		{"type": "function", "name": "read_file", "description": "read a file", "parameters": map[string]any{"type": "object"}},
+		{"type": "namespace", "name": "mcp__docs", "tools": []any{
+			map[string]any{"type": "function", "name": "search", "parameters": map[string]any{"type": "object"}},
+		}},
+		{"type": "web_search"},
+	}}
+	o, err := r.openAI()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 声明顺序必须原样保留：exec、普通 function、namespace 子工具（带命名空间
+	// 前缀）、web_search 直通。
+	wantTypes := []string{"custom", "function", "function", "web_search"}
+	wantNames := []string{"exec", "read_file", "mcp__docs__search", ""}
+	if len(o.Tools) != len(wantTypes) {
+		t.Fatalf("tools=%d (%#v), want %d: mixed declarations were dropped by the converter", len(o.Tools), o.Tools, len(wantTypes))
+	}
+	for i, tool := range o.Tools {
+		if tool.Type != wantTypes[i] {
+			t.Fatalf("tools[%d].Type=%q, want %q (declaration order changed): %#v", i, tool.Type, wantTypes[i], o.Tools)
+		}
+		if wantNames[i] != "" && !containsJSON(tool.Function, "name") {
+			t.Fatalf("tools[%d] lost its name: %s", i, tool.Function)
+		}
+		if wantNames[i] != "" && !strings.Contains(string(tool.Function), `"`+wantNames[i]+`"`) {
+			t.Fatalf("tools[%d]=%s, want name %q", i, tool.Function, wantNames[i])
+		}
+	}
+	policy := fmt.Sprint(o.Messages[0].Content)
+	if !strings.Contains(policy, "Never use, request, or mention Microsoft 365/Copilot native tools") {
+		t.Fatalf("missing native-tool prohibition: %#v", o.Messages)
+	}
+	// 关键回归点：调用方声明了别的工具时，提示词不能再宣布 exec 独占，否则模型会
+	// 拒绝调用方自己声明的工具 —— 光改转换器不改提示词等于没修。
+	if strings.Contains(policy, customExecSoleToolInstruction) {
+		t.Fatalf("policy claims exec exclusivity while other tools are declared: %q", policy)
+	}
+	if strings.Contains(policy, "only permitted execution tool") || strings.Contains(policy, "only tool available") {
+		t.Fatalf("policy still asserts exclusivity: %q", policy)
+	}
+}
+
+func TestResponsesCustomExecPolicyStatesExclusivityOnlyWhenSoleTool(t *testing.T) {
+	r := responsesRequest{Input: "inspect the project", Tools: []map[string]any{
+		{"type": "custom", "name": "exec", "description": "local execution"},
 	}}
 	o, err := r.openAI()
 	if err != nil {
@@ -75,8 +127,52 @@ func TestResponsesCustomExecIsExclusiveTool(t *testing.T) {
 	if len(o.Tools) != 1 || o.Tools[0].Type != "custom" {
 		t.Fatalf("tools=%#v, want only custom exec", o.Tools)
 	}
-	if !strings.Contains(fmt.Sprint(o.Messages[0].Content), "Never use") {
-		t.Fatalf("missing native-tool prohibition: %#v", o.Messages)
+	policy := fmt.Sprint(o.Messages[0].Content)
+	if !strings.Contains(policy, customExecSoleToolInstruction) {
+		t.Fatalf("exec-only request lost the sole-tool statement: %q", policy)
+	}
+	if !strings.Contains(policy, "Never use, request, or mention Microsoft 365/Copilot native tools") {
+		t.Fatalf("missing native-tool prohibition: %q", policy)
+	}
+}
+
+// 非 exec 的 custom 工具此前会被静默丢掉：[custom/apply_patch] 单独声明时转换结果
+// 跟「没有工具」完全一样。现在走同一套 {"input": string} 桥接，Tool.Type 保持
+// custom，这样响应路径才会把它序列化成 custom_tool_call 而不是 function_call。
+func TestResponsesNonExecCustomToolSurvives(t *testing.T) {
+	r := responsesRequest{Input: "apply the patch", Tools: []map[string]any{
+		{"type": "custom", "name": "apply_patch", "description": "apply a patch", "format": map[string]any{"type": "grammar"}},
+	}}
+	o, err := r.openAI()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(o.Tools) != 1 || o.Tools[0].Type != "custom" {
+		t.Fatalf("tools=%#v, want the custom apply_patch declaration to survive", o.Tools)
+	}
+	if !strings.Contains(string(o.Tools[0].Function), `"apply_patch"`) || !containsJSON(o.Tools[0].Function, "input") {
+		t.Fatalf("apply_patch did not receive the custom input schema: %s", o.Tools[0].Function)
+	}
+	// exec 不在场，就不该注入工作区策略：那段提示词的每一条都要求用 exec 核实。
+	for _, m := range o.Messages {
+		if strings.Contains(fmt.Sprint(m.Content), "OpenCode execution bridge") {
+			t.Fatalf("workspace policy injected without a custom exec tool: %#v", o.Messages)
+		}
+	}
+}
+
+// 无名 custom 声明是唯一仍被丢掉的形状：clientPlugins 会跳过没有 name 的工具，
+// 校验器也没法把模型的调用解析回一条无名声明，留着只会变成幽灵条目。
+func TestResponsesUnnamedCustomToolIsDropped(t *testing.T) {
+	r := responsesRequest{Input: "do something", Tools: []map[string]any{
+		{"type": "custom", "description": "no name at all"},
+	}}
+	o, err := r.openAI()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(o.Tools) != 0 {
+		t.Fatalf("tools=%#v, want an unnamed custom declaration to be dropped", o.Tools)
 	}
 }
 
@@ -93,7 +189,9 @@ func TestResponsesInstructionsAndCustomExecPolicyAreSystemMessages(t *testing.T)
 	if len(o.Messages) != 3 {
 		t.Fatalf("messages=%#v", o.Messages)
 	}
-	if o.Messages[0].Role != "system" || o.Messages[0].Content != customExecWorkspaceInstruction {
+	// exec 是这里唯一的工具，所以整条策略 = 常驻段 + 独占段。断言组装结果而不是
+	// 硬编码文本，提示词改字时这个测试只关心顺序，不会连带失败。
+	if o.Messages[0].Role != "system" || o.Messages[0].Content != customExecInstruction(true) {
 		t.Fatalf("missing custom exec policy: %#v", o.Messages[0])
 	}
 	if o.Messages[1].Role != "system" || o.Messages[1].Content != r.Instructions {

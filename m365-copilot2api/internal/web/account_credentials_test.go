@@ -15,6 +15,9 @@ import (
 
 // 详情端点必须真的返回消息内容，而不只是计数。
 func TestConversationDetailReturnsFullMessages(t *testing.T) {
+	// The production default keeps the high-allocation conversation panel off;
+	// this test exercises the detail contract only when an operator enables it.
+	t.Setenv(envConversationPanel, "1")
 	dir := t.TempDir()
 	t.Setenv("M365_SESSION_CACHE", filepath.Join(dir, "sessions.json"))
 	store, err := auth.OpenStore(filepath.Join(dir, "accounts.json"))
@@ -84,6 +87,9 @@ func TestConversationDetailReturnsFullMessages(t *testing.T) {
 }
 
 func TestConversationDetailErrors(t *testing.T) {
+	// The error contract below is for the enabled feature; disabled-default
+	// behavior is covered separately in conversations_disabled_test.go.
+	t.Setenv(envConversationPanel, "1")
 	dir := t.TempDir()
 	t.Setenv("M365_SESSION_CACHE", filepath.Join(dir, "sessions.json"))
 	s := &Server{sessionResolver: openSessionResolver()}
@@ -109,6 +115,8 @@ func TestConversationDetailErrors(t *testing.T) {
 
 // 详情路由必须已注册（否则前端点开会静默 404）。
 func TestConversationDetailRouteIsRegistered(t *testing.T) {
+	// Registering the endpoint is distinct from the production default-off gate.
+	t.Setenv(envConversationPanel, "1")
 	routes := (&Server{}).Routes()
 	rec := httptest.NewRecorder()
 	routes.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/conversations/detail?id=x", nil))

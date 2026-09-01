@@ -34,6 +34,13 @@ func (s *Server) conversationDetail(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	// 守在解析 id 之前：这条端点是面板里最贵的一笔 —— 命中后要把整段
+	// ContextHistory（正文 + reasoning + tool_calls）编成 JSON。停用期间
+	// 一次都不该发生，也不去问 sessionResolver 要东西。
+	if !conversationPanelEnabled() {
+		conversationPanelDisabled(w)
+		return
+	}
 	id := strings.TrimSpace(r.URL.Query().Get("id"))
 	if id == "" {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "id is required")

@@ -40,7 +40,39 @@ type responsesRequest struct {
 // 宿主 /workspace 就是可写的工程根，两条提示词进同一个 prompt，一条说那是根目
 // 录、另一条说不准写，模型只能二选一。改为「不要凭猜测使用任何绝对路径」，既
 // 保住原意，又不跟宿主实际情况打架。
-const customExecWorkspaceInstruction = `You are operating through the caller's local OpenCode execution bridge. Never use, request, or mention Microsoft 365/Copilot native tools. The only permitted execution tool is the caller-provided custom exec tool. The executor already starts in the caller-selected project workspace. Use relative paths only; do not guess at, cd to, or write under an absolute path you have not verified with the exec tool. Inspect the working directory and list it before making changes. Do not create files outside the current working directory. Never claim a file was created, modified, or verified until custom exec returns a successful result. After every execution, use custom exec to verify the result.`
+//
+// 同理，开头那句原本是「一律用相对路径」，跟同一句后半段（未经核实的绝对路径不
+// 要用）和 runtime_prompt.go（可以用上面那种形式的绝对路径）都对不上。用户开口
+// 就是 E:\download\... 这种绝对路径，禁掉它的直接后果是模型改口说这条路径用不
+// 了 —— 正是这套提示词要压住的那种回答。真正要禁的是凭猜测编出来的绝对路径。
+//
+// 第三处：原文有一句「The only permitted execution tool is the caller-provided
+// custom exec tool.」，是配合下面那段已删除的「exec 在场就丢掉其余工具」写的 ——
+// 当时模型手上确实只剩 exec，这句话是对的。转换器改成混合工具全部保留之后，这句
+// 话会让模型拒绝调用方自己声明的 read_file/apply_patch/MCP 工具：光改代码不改提
+// 示词，工具进了表也照样被模型自己挡回去。
+//
+// 现在拆成两段：customExecWorkspaceInstruction 是常驻策略，只说 exec 是本地
+// shell/文件操作的通道，同时明确其余声明过的工具照样可以调用；
+// customExecSoleToolInstruction 只在 exec 真的是转换后唯一那把工具时才追加，
+// 那种情况下「没有别的工具可调」是事实陈述，不再是对调用方声明的否定。
+// 「不许用/编造 Microsoft 365、Copilot 原生工具」这条跟工具表无关，留在常驻段里。
+const customExecWorkspaceInstruction = `You are operating through the caller's local OpenCode execution bridge. Never use, request, or mention Microsoft 365/Copilot native tools, and never invent a tool the caller did not declare. Route local shell and file work through the caller-provided custom exec tool; every other tool the caller declared stays available and may be called for its own purpose. The executor already starts in the caller-selected project workspace, so a relative path is the normal way to name a file there. An absolute path the caller gave you is equally valid; inventing one is not -- do not guess at, cd to, or write under an absolute path you have not verified with the exec tool. Inspect the working directory and list it before making changes. Do not create files outside the current working directory. Never claim a file was created, modified, or verified until custom exec returns a successful result. After every execution, use custom exec to verify the result.`
+
+// customExecSoleToolInstruction 只在 exec 是转换后唯一的工具时追加。措辞是「本次
+// 请求里只有这一把工具」而不是「只准用这一把」：前者随工具表变化自动成立或消失，
+// 后者在混合声明下就是错的。
+const customExecSoleToolInstruction = ` In this request the custom exec tool is the only tool available to you; there is no other tool to call.`
+
+// customExecInstruction 组装上面两段。soleTool 由调用点按转换后的 o.Tools 判断，
+// 而不是按 r.Tools 的原始声明 —— 模型看到的是转换结果（namespace 展平之后、
+// 无法表示的声明被丢掉之后），提示词必须跟那份表一致。
+func customExecInstruction(soleTool bool) string {
+	if soleTool {
+		return customExecWorkspaceInstruction + customExecSoleToolInstruction
+	}
+	return customExecWorkspaceInstruction
+}
 
 func (r responsesRequest) openAI() (oaiReq, error) {
 	o := oaiReq{
@@ -141,21 +173,28 @@ func (r responsesRequest) openAI() (oaiReq, error) {
 	default:
 		return o, fmt.Errorf("input must be string or array")
 	}
+	// 这里原先有一段 pre-scan：先扫一遍看有没有 custom/exec，只要有，循环里第一
+	// 句 `if hasCustomExec && !(typ=="custom" && name=="exec") { continue }` 就把
+	// 其余所有声明全部丢掉。Codex 一次声明 exec + apply_patch + read_file + 若干
+	// MCP namespace，落到模型手里的工具表只剩 [exec]，模型于是照实回答
+	// 「read_file 不可用」—— 它的工具表真的只有 exec。
+	//
+	// 用 /v1/responses 的 usage 估算器（按转换后的 o.Tools 计数）量过：
+	//   [exec] = 239，[exec, read_file, apply_patch] = 239（差 0，两个 function
+	//   schema 转换后根本不存在），[read_file, apply_patch] = 121，[] = 19
+	//   （差 102，同样两个 schema 在没有 exec 时是算进去的）。
+	//
+	// 现在整段 pre-scan 和那个 continue 都删掉了：exec 只是「要不要注入工作区策略
+	// 提示词」的信号，不再是对调用方工具表的过滤器。下面 namespace 展平和
+	// web_search 直通两个 case 在旧代码里只要 exec 在场就永远走不到，属于死代码，
+	// 一并复活。谁想把互斥逻辑加回来，请先重看上面那组 token 数字。
+	//
+	// 声明顺序按调用方给的原样保留：Codex 侧的工具优先级、以及
+	// toolType/declaredTool 的名字查找都依赖这份表，重排没有好处。
 	hasCustomExec := false
 	for _, t := range r.Tools {
 		typ, _ := t["type"].(string)
 		name, _ := t["name"].(string)
-		if typ == "custom" && name == "exec" {
-			hasCustomExec = true
-			break
-		}
-	}
-	for _, t := range r.Tools {
-		typ, _ := t["type"].(string)
-		name, _ := t["name"].(string)
-		if hasCustomExec && !(typ == "custom" && name == "exec") {
-			continue
-		}
 		switch typ {
 		case "namespace":
 			// Codex groups related tools (multi_agent_v1, mcp__*) into a namespace
@@ -198,12 +237,33 @@ func (r responsesRequest) openAI() (oaiReq, error) {
 			continue
 		}
 		f := map[string]any{"name": t["name"], "description": t["description"], "parameters": t["parameters"]}
-		if typ == "custom" && name == "exec" {
-			// ChatHub accepts JSON function arguments while Codex exec accepts a
-			// grammar-constrained raw input string. Preserve the distinction in
-			// Tool.Type and bridge the input through a single string field.
+		if typ == "custom" {
+			// A Responses custom tool has raw string input, while ChatHub's plugin
+			// protocol always carries JSON function arguments. exec was originally
+			// the only bridged custom name, but that made [custom/apply_patch] turn
+			// into no tool at all with no explanation. The response path already
+			// serializes every Tool.Type == "custom" as custom_tool_call and
+			// customToolInput reads this exact {"input": "..."} envelope, so the
+			// representation is not exec-specific: bridge every named custom tool
+			// through the same one-string schema.
+			//
+			// Do not flatten a custom tool into type "function" merely because its
+			// wire envelope is JSON. Codex distinguishes custom_tool_call (raw
+			// input) from function_call (JSON arguments), and losing Tool.Type here
+			// makes a correctly selected custom tool impossible for the caller to
+			// execute. A missing name is still unusable: clientPlugins skips it and
+			// the validator cannot resolve an unnamed declaration, so ignore that
+			// malformed shape explicitly instead of creating a ghost entry.
+			if name == "" {
+				continue
+			}
 			f["parameters"] = map[string]any{"type": "object", "properties": map[string]any{"input": map[string]any{"type": "string"}}, "required": []string{"input"}, "additionalProperties": false}
-			hasCustomExec = true
+			if name == "exec" {
+				// exec additionally enables the local-workspace system policy below;
+				// another custom tool remains callable but must not inherit rules that
+				// specifically require checking paths and mutations through exec.
+				hasCustomExec = true
+			}
 		} else if typ != "function" {
 			continue
 		}
@@ -211,7 +271,7 @@ func (r responsesRequest) openAI() (oaiReq, error) {
 		o.Tools = append(o.Tools, chathub.Tool{Type: typ, Function: b})
 	}
 	if hasCustomExec {
-		o.Messages = append([]oaiMsg{{Role: "system", Content: customExecWorkspaceInstruction}}, o.Messages...)
+		o.Messages = append([]oaiMsg{{Role: "system", Content: customExecInstruction(len(o.Tools) == 1)}}, o.Messages...)
 	}
 	return o, nil
 }

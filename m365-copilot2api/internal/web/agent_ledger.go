@@ -33,7 +33,6 @@ type agentLedger struct {
 }
 
 var failureSignal = regexp.MustCompile(`(?i)(exit\s*(code|status)?\s*[:=]?\s*[1-9]\d*|\berror\b|\bfailed\b|\bfailure\b|exception|traceback|timed?\s*out|permission denied|not found|refused)`)
-var unsupportedSuccess = regexp.MustCompile(`(?i)\b(installed|created|written|executed|ran|started|deployed|deleted|verified|completed|succeeded|successful(?:ly)?)\b`)
 
 func compactToolResult(s string, limit int) string {
 	s = strings.TrimSpace(s)
@@ -341,27 +340,49 @@ func activeMessages(messages []oaiMsg) []oaiMsg {
 	}
 	return messages[last:]
 }
+
+// completionEvidenceAllows 判断一段最终答复是否与 ledger 里的工具证据相符。
+// 调用方（server.go 非流式路径）在返回 false 时会整段丢弃模型答复，换成一句
+// 「无法确认完成」—— 所以这里每 return 一次 false，用户就收到一句模型没写过的话。
+//
+// 删掉的分支：ledger 为空时，曾用 unsupportedSuccess 正则
+//
+//	(?i)\b(installed|created|written|executed|ran|started|deployed|deleted|
+//	       verified|completed|succeeded|successful(?:ly)?)\b
+//
+// 对答复全文宽匹配，命中即 false。它想拦的是「没调工具却宣称干完了」，实际拦的是
+// 任何含有这些常见英文过去分词的句子 —— 而这些词本身就是日常英语。
+//
+// 实测（对运行中的网关，请求里一个工具都没声明）：
+//   - 让它翻译「数据已经写入磁盘」→ 正确答复含 "written" → 整段被换成罐头话；
+//   - 让它翻译「磁盘正在接收数据」→ "The disk is receiving data." 不含关键词 → 正常返回；
+//   - 同一条请求，历史里有一条已完成的工具结果 → 走 len(Completed)>0 分支 → 正常返回。
+//
+// 一批源码审查答复也是这样被静默改写的。
+//
+// 根本原因不是正则不够严，而是这个分支的前提不成立：ledger 为空意味着这一轮
+// 压根没有工具调用，也就没有「未经验证的外部动作」可拦。而且从签名看不出区别 ——
+// 「没声明工具」和「声明了工具但一次没调」在 ledger 里都是空，纯文本启发式必然
+// 在普通散文上误伤。真要拦「声明了工具却空口宣称成功」，判据在
+// isToolRefusal / correctSandboxDrift 那一侧（能看见 tools），不在这里。
+//
+// 保留的两条判据都有实际证据支撑，不要一起删：
+//   - Pending>0：客户端还欠着工具结果，此时宣称完成一定无据；
+//   - Completed>0：有工具证据却说「无法确认」，与证据自相矛盾。
 func completionEvidenceAllows(answer string, l agentLedger) bool {
 	if len(l.Pending) > 0 {
 		return false
 	}
-	if len(l.Completed) == 0 && len(l.Pending) == 0 {
-		return !unsupportedSuccess.MatchString(answer)
+	if len(l.Completed) == 0 {
+		// 无工具调用 = 无外部动作可核验，答复只是散文，原样放行。
+		return true
 	}
 	low := strings.ToLower(answer)
 	failureKeywords := []string{"cannot confirm", "not confirmed", "unable to confirm", "no tool result", "no matching tool results were returned", "no external action has been verified"}
-	hasFailure := false
 	for _, h := range failureKeywords {
 		if strings.Contains(low, h) {
-			hasFailure = true
-			break
+			return false
 		}
-	}
-	if len(l.Completed) > 0 {
-		return !hasFailure
-	}
-	if unsupportedSuccess.MatchString(answer) {
-		return false
 	}
 	return true
 }

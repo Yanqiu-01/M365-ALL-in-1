@@ -6,10 +6,53 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"sort"
 	"strings"
 	"time"
 )
+
+// 对话管理面板（侧栏「对话管理」/ #page-conversations）默认关闭，用
+// M365_CONVERSATION_PANEL=1 重新打开。
+//
+// 为什么默认关；也为什么别指望它省下已经占住的内存：
+// 常驻堆在 sessionResolver 里 —— 每个 sessionBinding 都带着完整的
+// ContextHistory，面板开不开它都在那儿占着。关掉面板省下的是「每次打开
+// 面板时的瞬时分配」：handleM365Conversations 会 ListSessions() 把全部
+// 会话拷一份出来、conversationDetail 会把整段消息正文（含 reasoning、
+// tool_calls）编成 JSON 再写给浏览器、captureConversations 还会顺手把
+// 快照落盘。这几笔在会话多、上下文长的时候相当可观，而且是按「点一次
+// 加一笔」累积的。真正要降常驻堆得去动 sessionResolver 的保留策略，不是
+// 关这个面板。
+//
+// 开关只读环境变量、不进 settings.json：改完重启网关即生效，不需要重新
+// 编译；也不会因为 settings.json 里存了个旧值而和运维的预期打架。
+const envConversationPanel = "M365_CONVERSATION_PANEL"
+
+// conversationPanelEnabled 的取值与仓库里其他布尔开关一致
+// （见 outbound.allowFakeIPSource、proxy_pool_sources.go），
+// 未设置 / 空串 / 无法识别的值一律视为关闭 —— 默认保守。
+func conversationPanelEnabled() bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv(envConversationPanel)))
+	return v == "1" || v == "true" || v == "yes" || v == "on"
+}
+
+// conversationPanelDisabled 是这批端点统一的「功能已关闭」出口。
+//
+// 状态码选 503 而不是 404：路由确实注册着（server.go 一直在 mux 里挂着这
+// 几条），资源也没被删掉 —— 只是被管理员按下了开关。404 会撒谎说「这个
+// 接口不存在」，既掩盖了它一条环境变量就能回来的事实，也和
+// conversationDetail 里真正的「对话不存在」404 撞在一起，调用方分不清是
+// 自己的 id 错了还是整个功能被关了。503 + 明确的 type 与仓库既有的
+// m365_not_configured / session_store_unavailable 是同一路数：
+// 「服务在，但当前不可用」。
+//
+// 返回前不碰 sessionResolver、不碰 historyArchive、不碰 M365 云端 ——
+// 这正是关掉面板要省下的那部分开销，顺带也保证停用期间不会有任何删除。
+func conversationPanelDisabled(w http.ResponseWriter) {
+	writeOpenAIError(w, http.StatusServiceUnavailable, "conversation_panel_disabled",
+		"Conversation management panel is disabled. Set "+envConversationPanel+"=1 and restart the gateway to re-enable it.")
+}
 
 func (s *Server) conversations(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
@@ -157,13 +200,34 @@ func (s *Server) handleM365Conversations(w http.ResponseWriter, r *http.Request)
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if m365CloudClient == nil && len(s.sessionResolver.ListSessions()) == 0 {
+	if !conversationPanelEnabled() {
+		conversationPanelDisabled(w)
+		return
+	}
+	// probe=1 是前端唯一的开关探测口：index.html 是从磁盘直接送出的静态
+	// 页面，服务端没有模板渲染的机会，前端只能问一次后端才知道开关状态。
+	// 这里在 ListSessions 之前就返回，探测本身不产生任何会话遍历开销 ——
+	// 关闭时上面那个分支已经先答了 503，前端把「非 200」一律当关闭处理，
+	// 于是旧版网关（不认识 probe 参数）也不会出现「入口在、接口不通」。
+	//
+	// 复用既有路由是刻意的：新增一条路由要改 server.go，而那个文件此刻
+	// 由别人在改。
+	if r.URL.Query().Get("probe") == "1" {
+		jsonOut(w, map[string]any{"object": "conversation.panel", "enabled": true})
+		return
+	}
+	sessions := []sessionBinding{}
+	if s.sessionResolver != nil {
+		sessions = s.sessionResolver.ListSessions()
+	}
+	remote := r.URL.Query().Get("remote") == "1" || strings.EqualFold(r.URL.Query().Get("remote"), "true")
+	if remote && m365CloudClient == nil && len(sessions) == 0 {
 		writeOpenAIError(w, http.StatusServiceUnavailable, "m365_not_configured", "M365 cloud client not configured. Please add an M365 account first via PKCE authorization.")
 		return
 	}
 	rows := make(map[string]map[string]any)
 	var cloudErr error
-	if m365CloudClient != nil {
+	if remote && m365CloudClient != nil {
 		var chats []map[string]any
 		chats, cloudErr = m365CloudClient.ListConversations()
 		for _, chat := range chats {
@@ -173,12 +237,12 @@ func (s *Server) handleM365Conversations(w http.ResponseWriter, r *http.Request)
 			}
 		}
 	}
-	if cloudErr != nil && len(s.sessionResolver.ListSessions()) == 0 {
+	if cloudErr != nil && len(sessions) == 0 {
 		err := cloudErr
 		writeOpenAIError(w, http.StatusBadGateway, "m365_error", err.Error())
 		return
 	}
-	for _, session := range s.sessionResolver.ListSessions() {
+	for _, session := range sessions {
 		row, ok := rows[session.ConversationID]
 		if !ok {
 			row = map[string]any{}
@@ -192,8 +256,10 @@ func (s *Server) handleM365Conversations(w http.ResponseWriter, r *http.Request)
 		row["messageCount"] = len(session.ContextHistory)
 		row["historyAvailable"] = len(session.ContextHistory) > 0
 		row["source"] = "gateway"
-		if account, found := s.tokens.Get(session.AccountID); found {
-			row["accountEmail"] = account.Email
+		if s.tokens != nil {
+			if account, found := s.tokens.Get(session.AccountID); found {
+				row["accountEmail"] = account.Email
+			}
 		}
 		if name, _ := row["chatName"].(string); strings.TrimSpace(name) == "" {
 			row["chatName"] = conversationTitle(session.ContextHistory)
@@ -207,7 +273,7 @@ func (s *Server) handleM365Conversations(w http.ResponseWriter, r *http.Request)
 	sort.Slice(data, func(i, j int) bool {
 		return conversationTimestamp(data[i]) > conversationTimestamp(data[j])
 	})
-	response := map[string]any{"object": "list", "data": data, "count": len(data)}
+	response := map[string]any{"object": "list", "data": data, "count": len(data), "remoteFetched": remote}
 	if cloudErr != nil {
 		response["warning"] = cloudErr.Error()
 	}
@@ -252,6 +318,13 @@ func (s *Server) handleM365Delete(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	// 面板关掉后这条也必须闭嘴：删除按钮只长在 #page-conversations 里，
+	// 但一个没刷新的旧标签页、或者照着旧文档写的脚本仍然能直接 POST 过来。
+	// 停用期间不接受任何云端删除 —— 守在这里，云端一次都不会被碰。
+	if !conversationPanelEnabled() {
+		conversationPanelDisabled(w)
+		return
+	}
 	if m365CloudClient == nil {
 		writeOpenAIError(w, http.StatusServiceUnavailable, "m365_not_configured", "M365 cloud client not configured. Please add an M365 account first via PKCE authorization.")
 		return
@@ -274,6 +347,17 @@ func (s *Server) handleM365Delete(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleM365Cleanup(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	// 比 handleM365Delete 更该守：CleanupOldConversations 是循环删除，一次
+	// 调用就能清掉一批云端对话。停用期间绝不放它进去 —— 用户要的是「别再
+	// 占内存」，不是「顺手把历史删了」。
+	//
+	// 注意这里守的只是「面板的云端清理入口」。后台按配置跑的自动清理
+	// （StartAutoCleanup）和本地 /api/conversations/cleanup 都不受影响，它们
+	// 不属于这个面板，也不该被这个开关连带停掉。
+	if !conversationPanelEnabled() {
+		conversationPanelDisabled(w)
 		return
 	}
 	if m365CloudClient == nil {
