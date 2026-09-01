@@ -182,17 +182,26 @@ type nativePanelFileConfig struct {
 		// 装在 WinGet 的包目录里并不在 PATH，于是每次换 IP 都以「adb 找不到」失败，
 		// 整批注册在第二个号就断掉。配置里必须能钉住绝对路径。
 		ADB string `json:"adb"`
-		// PhoneBrowserOff 关掉「用手机上的 Cromite 打开注册页」，退回到「本机 Chrome
-		// 经 SOCKS 隧道从手机出口发出」的老路。
+		// PhoneBrowserOn 打开「用手机上的 Cromite 打开注册页」。
 		//
-		// 默认（零值）是用手机浏览器：页面在手机上加载，出口天然就是运营商 IP，不再需要
-		// 把流量绕回 PC 再转出去，本机也不起浏览器进程。
+		// 默认（零值）是关的，也就是走「本机 Chrome 经 SOCKS 隧道从手机出口发出」：出口
+		// 一样是手机的运营商 IP，只是渲染在 PC 上。
 		//
-		// 刻意做成反向开关，就为了让零值等于「开」—— 正向的 phone_browser 会让所有还没
-		// 加这个键的旧配置默认退回老路，那和改动的意图正好相反。留这个开关是因为站点每个
-		// IP 一天只放行一次：万一手机浏览器这条路在某天出问题，要能立刻回退而不用重新
-		// 编译部署。
-		PhoneBrowserOff bool `json:"phone_browser_off"`
+		// 这个默认值是实测定下来的，不是保守起见 —— 手机上的 Cromite 解不出 Turnstile。
+		// Cromite 的卖点就是反指纹，而 Turnstile 本质是一次指纹采集：同一段绘制内容连续
+		// toDataURL 三次，在这台机器上给出 3586/3578/3626 三个不同结果（canvas 加噪）。
+		// Cloudflare 拿不到稳定指纹就一直不发 token —— 控件正常铺开、脚本一路 200、页面
+		// 也没有任何错误文案，只是 75 秒预算烧完为止。这个加噪关不掉：命令行
+		// --disable-features=FingerprintingCanvasImageDataNoise 能在 chrome://version 上
+		// 看到却不起作用（它是 chrome://flags 条目、落在 preferences 里，不是运行期
+		// feature），而那个 flags 条目两种取值都试过，canvas 照旧每次不同。
+		//
+		// 对照实验把原因钉死在浏览器上：同一个运营商出口 IP，PC 的 Chrome 走手机 SOCKS
+		// 隧道 8.2 秒拿到 token，手机上的 Cromite 六次全部失败。
+		//
+		// 手机浏览器那条路的代码留着（见 internal/turnstile/phone_cdp.go）：换一个不做反
+		// 指纹的浏览器（普通 Chrome/Chromium）就能用，把这个键设成 true 即可。
+		PhoneBrowserOn bool `json:"phone_browser_on"`
 		// RegisterBatch 是长跑任务不指定 batchSize 时每批注册多少个号。
 		//
 		// 一批越大，中途停止的粒度越粗；越小，每批之间的隧道检查越频繁。跑一天的任务

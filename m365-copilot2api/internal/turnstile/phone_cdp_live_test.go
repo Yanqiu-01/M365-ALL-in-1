@@ -92,3 +92,107 @@ func TestPhoneAttachLive(t *testing.T) {
 		t.Fatalf("等了 25 秒 window.turnstile 还没出现，手机上过不了挑战（先查 Cromite 的 Adblock 是否拦了 challenges.cloudflare.com）；页面提示：%q", state.Message)
 	}
 }
+
+// TestPhoneTurnstileTokenLive 把手机路径一直跑到「Turnstile 交出 token」为止。
+//
+// 和 TestPhoneAttachLive 的分工：那个只证明页面和控件起来了，而「控件起来了」离「拿到
+// token」还差最关键的一步 —— 实测过不了 CF 时，控件照样铺开、脚本照样 200，卡的是发不发
+// token。所以这个用例直接调 awaitTurnstileToken，走的是注册时一模一样的代码路径（同样的
+// 预算、同样的点击补偿），失败时把六种文案里真正命中的那条原样打出来，不必再靠猜。
+//
+// 同样不填表、不提交：token 拿到就丢掉。拿 token 本身不消耗站点的当日注册额度，只有提交才
+// 会 —— 所以这个用例可以反复跑，这正是排查需要的。
+//
+// 注意：手机上装的是 Cromite 时，这个用例**必然失败**，而且不是它自己的毛病。Cromite 给
+// canvas 加噪（见 TestPhoneFingerprintNoiseLive），Cloudflare 拿不到稳定指纹就一直不发
+// token。所以线上默认已经不走手机浏览器了（phone_browser_on 默认关）。留着这个用例是为了
+// 在手机上换成普通 Chrome/Chromium 之后能一次性验完那条路。
+//
+//	$env:M365_PHONE_LIVE=1; $env:M365_PHONE_ADB='<adb.exe 绝对路径>'
+//	go test -C <repo> ./internal/turnstile -run TestPhoneTurnstileTokenLive -v -count=1
+func TestPhoneTurnstileTokenLive(t *testing.T) {
+	if os.Getenv("M365_PHONE_LIVE") == "" {
+		t.Skip("需要真机；设置 M365_PHONE_LIVE=1 再跑")
+	}
+	adb := strings.TrimSpace(os.Getenv("M365_PHONE_ADB"))
+	if adb == "" {
+		t.Fatal("请用 M365_PHONE_ADB 给出 adb.exe 的绝对路径（Windows 上它一般不在 PATH 里）")
+	}
+	// 比 90 秒宽：awaitTurnstileToken 自己的预算就有一分钟量级，再加接管和首屏，卡到超时
+	// 的话得让它以自己的错误收场，而不是被外层 ctx 掐断成一句无信息的 context deadline。
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+
+	page := strings.TrimSpace(os.Getenv("M365_PHONE_PAGE"))
+	if page == "" {
+		page = "https://office.965007.xyz/"
+	}
+	phone, err := AttachPhone(ctx, phonecdp.Config{ADB: adb}, originOf(page))
+	if err != nil {
+		t.Fatalf("接管手机浏览器失败：%v", err)
+	}
+	defer phone.Close()
+	t.Logf("已接管：%s", phone.Describe())
+
+	if err := phone.sess.navigate(ctx, page); err != nil {
+		t.Fatalf("导航到 %s 失败：%v", page, err)
+	}
+	if err := phone.sess.waitForForm(ctx); err != nil {
+		t.Fatalf("注册表单没出现：%v", err)
+	}
+	// 填表 + 等控件铺开：真实注册路径（chromeRegister）在等 token 之前就做了这两步，少哪
+	// 一步这个用例就不是在验真实路径。填表尤其要紧 —— Turnstile 有的配置要等表单交互才开
+	// 始跑挑战，不填表的话「token 不来」可能只是这个用例自己的毛病，跟线上失败无关。
+	//
+	// 用户名故意用一个不会去提交的值：这个用例只到拿 token，永远不调 submitRegisterForm。
+	if err := phone.sess.fillRegisterForm(ctx, ChromeRequest{
+		DisplayName: "ProbeUser", Username: "probe-does-not-submit",
+		Password: "Probe-Only-Never-Submitted-1", PlanID: "1", DomainID: "1",
+	}); err != nil {
+		t.Fatalf("填表失败：%v", err)
+	}
+	if err := phone.sess.waitWidgetLaidOut(ctx); err != nil {
+		t.Fatalf("控件没铺开：%v", err)
+	}
+
+	started := time.Now()
+	token, tokenErr := phone.sess.awaitTurnstileToken(ctx)
+	elapsed := time.Since(started).Round(time.Second)
+
+	// 无论成败都把现场打全：部件状态和 iframe 几何是区分「脚本没加载」「控件没铺开」
+	// 「铺开了但不发 token」这三种情况的唯一依据，而它们的处置完全不同。
+	var state struct {
+		Box     bool   `json:"box"`
+		Hidden  bool   `json:"hidden"`
+		Input   bool   `json:"input"`
+		API     bool   `json:"api"`
+		Message string `json:"message"`
+	}
+	if err := phone.sess.eval(ctx, widgetStateJS, &state); err == nil {
+		t.Logf("部件状态：box=%v hidden=%v input=%v api=%v message=%q",
+			state.Box, state.Hidden, state.Input, state.API, state.Message)
+	}
+	// 视口尺寸 + 滚动量 + iframe 的视口坐标一起打：判断「点击有没有落在控件上」只能靠这
+	// 三个数一起看。iframe 的 y 必须落在 0..innerHeight 之间，否则点下去就是空气。
+	var view struct {
+		W       float64 `json:"w"`
+		H       float64 `json:"h"`
+		ScrollY float64 `json:"scrollY"`
+	}
+	if err := phone.sess.eval(ctx,
+		`({w: innerWidth, h: innerHeight, scrollY: scrollY})`, &view); err == nil {
+		t.Logf("视口：%.0fx%.0f scrollY=%.0f", view.W, view.H, view.ScrollY)
+	}
+	if rect, err := phone.sess.challengeIframeRect(ctx); err == nil {
+		t.Logf("challenge iframe（视口坐标）：ok=%v %.0fx%.0f @(%.0f,%.0f) reason=%s",
+			rect.OK, rect.Width, rect.Height, rect.X, rect.Y, rect.Reason)
+		if rect.OK && (rect.Y < 0 || rect.Y > view.H) && view.H > 0 {
+			t.Errorf("iframe 的 y=%.0f 在视口 0..%.0f 之外，点击必然落空", rect.Y, view.H)
+		}
+	}
+
+	if tokenErr != nil {
+		t.Fatalf("等了 %s 仍未拿到 token：%v", elapsed, tokenErr)
+	}
+	t.Logf("拿到 token，耗时 %s，长度 %d", elapsed, len(token))
+}

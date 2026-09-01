@@ -573,6 +573,16 @@ func (s *chromeSession) clickAtSession(ctx context.Context, sessionID string, x,
 // 这个 iframe 挂在闭合 shadow root 里，JS 查不到（document.querySelectorAll('iframe')
 // 是 0），只有 DOM.getDocument 带 pierce:true 能看到它。容器的 rect 是 454 宽而 iframe
 // 只有 300 宽，两者不能混用 —— 按容器算坐标会偏。
+//
+// 这里给的是视口坐标，和 Input.dispatchMouseEvent 收的是同一套 —— 实测确认过：控件滚到
+// 视口中间后，box.getBoundingClientRect().top 是 393，而本函数在同一时刻给出 392（iframe
+// 在 box 内部，差的是 box 的内边距）。所以调用方不要再去减 Page.getLayoutMetrics 的
+// pageY «滚动量»，那会把坐标再往上推一个屏，反而全打空。
+//
+// 真正要当心的是量之前得先滚：手机视口只有 362x707，而控件在页面 y≈1659 处，不滚的话本
+// 函数返回的 y 就是 1659，点击落在视口下方近 900px 的空气里，三次全丢，最后以「该出口 IP
+// 可能被判为高风险」收场 —— 一条和实际原因无关的结论。PC 上撞不见：表单短、窗口高，控件
+// 本来就在视口里，而且能过的出口 12~13 秒就自动给 token，那几次点击从没被真正用到。
 func (s *chromeSession) challengeIframeRect(ctx context.Context) (widgetRect, error) {
 	raw, err := s.call(ctx, s.sessionID, "DOM.getDocument", map[string]any{"depth": -1, "pierce": true})
 	if err != nil {

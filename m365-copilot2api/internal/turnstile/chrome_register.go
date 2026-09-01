@@ -294,6 +294,10 @@ func (s *chromeSession) awaitTurnstileToken(ctx context.Context) (string, error)
 		if time.Now().After(nextClick) && clicks < 3 {
 			clicks++
 			nextClick = time.Now().Add(12 * time.Second)
+			// 先滚再量：拿到的是视口坐标，量完到点下去之间控件要是被滚出视口，点击就落空。
+			// 手机视口只有 780 高而控件在页面 1600 多的位置，这一步不是保险，是必需。
+			var scrolled bool
+			_ = s.eval(ctx, scrollWidgetIntoViewJS, &scrolled)
 			if rect, err := s.challengeIframeRect(ctx); err == nil && rect.OK {
 				_ = s.clickAt(ctx, rect.X+28, rect.Y+rect.Height/2)
 			}
@@ -344,6 +348,18 @@ const widgetRectJS = `(() => {
   const r = box.getBoundingClientRect();
   if (r.width < 20 || r.height < 20) return {ok: false, reason: 'not-laid-out', width: r.width, height: r.height};
   return {ok: true, x: r.x, y: r.y, width: r.width, height: r.height};
+})()`
+
+// scrollWidgetIntoViewJS 把控件滚到视口中间，返回它现在是否真的在视口里。
+//
+// 用 'instant' 而不是默认的平滑滚动：平滑滚动是异步的，量坐标时可能还在半路上，点击就会
+// 落在控件外面。
+const scrollWidgetIntoViewJS = `(() => {
+  const box = document.getElementById('turnstileBox');
+  if (!box) return false;
+  box.scrollIntoView({block: 'center', behavior: 'instant'});
+  const r = box.getBoundingClientRect();
+  return r.top >= 0 && r.bottom <= (window.innerHeight || 0);
 })()`
 
 type widgetRect struct {
