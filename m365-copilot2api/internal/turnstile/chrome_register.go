@@ -39,7 +39,7 @@ type ChromeRequest struct {
 	// 给的是配置而不是一个已经建好的会话：接管要和 launchChrome 一样每号一次，这样每个号
 	// 拿到的是全新的浏览器上下文（cookie/storage 独立）。共用一个会话能省一两秒，但要用
 	// 上一个号的 cookie 去解下一个号的 Turnstile，那正是本机模式用「一次性 profile」在
-	// 避免的事。EnsureCromite 是幂等的，重复调用只多一次 forward --list 和一次探测。
+	// 避免的事 —— AttachPhone 为此每号都把手机上的浏览器整个擦掉重启，代价是几秒冷启动。
 	Phone *phonecdp.Config
 }
 

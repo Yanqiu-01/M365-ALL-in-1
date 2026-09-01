@@ -18,7 +18,9 @@ import (
 // 和 launchChrome 的差别集中在四处，其余（call/eval/navigate/clickAt/求解流程）完全复用：
 //
 //  1. 不起进程、没有一次性 user-data-dir —— 浏览器是手机上长驻的，我们只是拨过去。
-//     号与号之间的隔离因此改成开跑前显式清掉 cookie/缓存/站点存储，见 clearProfileState。
+//     号与号之间的隔离因此靠两层：AttachPhone 先 pm clear 把整个 profile 擦掉（主力），
+//     本函数再显式清一遍 cookie/缓存/站点存储（见 clearProfileState，兜住擦除之后、导航
+//     之前这段里可能留下的东西）。
 //     本来想用 Target.createBrowserContext（独立上下文，等于隐身），但 Android 上它恒
 //     失败（实测回 "Failed to create browser context"），所以不留那次注定失败的调用。
 //  2. 不做 maskHeadless。那个函数是为了把 PC 上的无头 Chrome 伪装成有头 —— 改 UA 里的
@@ -148,11 +150,19 @@ type PhoneSession struct {
 	info phonecdp.Result
 }
 
-// AttachPhone 接通手机上的浏览器：确保转发和浏览器就位，开一个新标签页，并清掉上一个号的痕迹。
+// AttachPhone 接通手机上的浏览器：先把浏览器整个擦干净再拉起来，然后开一个新标签页。
 //
 // origin 是即将访问的站点来源（如 https://office.965007.xyz），用来清该站的 localStorage
 // 一类存储；留空则只清 cookie 和缓存。
+//
+// 为什么先 WipeBrowser 再 EnsureCromite：这两步的顺序就是「隔离」本身。EnsureCromite 是幂等
+// 的，浏览器在跑它就直接复用 —— 复用的是上一个号跑完的那个 profile，标签页还开着、渲染进程还
+// 挂着。只靠 attachPhoneChrome 里的 clearProfileState 兜不住，那个只能按来源清存储。
+// 擦完是冷启动，多花几秒，但这几秒买的是「这个号和上一个号无关」，值得付。
 func AttachPhone(ctx context.Context, cfg phonecdp.Config, origin string) (*PhoneSession, error) {
+	if err := phonecdp.WipeBrowser(ctx, cfg); err != nil {
+		return nil, err
+	}
 	info, err := phonecdp.EnsureCromite(ctx, cfg)
 	if err != nil {
 		return nil, err
@@ -173,7 +183,7 @@ func (p *PhoneSession) Describe() string {
 	if p == nil {
 		return ""
 	}
-	return fmt.Sprintf("手机浏览器 %s（%s，出口为手机自身运营商 IP）在 %s 上，已清 cookie",
+	return fmt.Sprintf("手机浏览器 %s（%s，出口为手机自身运营商 IP）在 %s 上，本轮已整个擦掉数据重启",
 		p.info.Browser, p.info.Package, p.info.BaseURL)
 }
 

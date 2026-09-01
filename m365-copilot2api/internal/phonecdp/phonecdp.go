@@ -206,6 +206,39 @@ func ensureForward(ctx context.Context, cfg Config) error {
 	return nil
 }
 
+// WipeBrowser 把浏览器整个停掉并擦掉它的数据，让下一次 EnsureCromite 从全新 profile 起跑。
+//
+// 为什么非得这么重：手机上只有一个长驻 profile，CDP 那几个 clear* 命令只能按来源清，永远盖
+// 不全 —— 清得掉 cookie 和两个 origin 的存储，清不掉上一个号留下的渲染进程、还开着的标签页、
+// 各种偏好和内存里的状态。实测过一次：一个号成功之后不擦，下一个号就再也走不下去，页面停在
+// 注册站上、四个 sandboxed renderer 全挂着，五分钟一个号都没出来；把 pm clear 一发立刻恢复。
+//
+// force-stop 和 pm clear 都发：pm clear 本身会杀进程，但先 force-stop 能让「进程已退出」和
+// 「数据已清空」分成两步，其中任一步失败时报错指向明确。
+//
+// /data/local/tmp/chrome-command-line 不在应用数据里，pm clear 不会动它（实测确认），所以
+// 擦完之后那些必需的启动参数（尤其是 --remote-debugging-port 和 --no-proxy-server）还在。
+//
+// 失败要往上报而不是忽略：擦不掉就意味着下一个号在脏 profile 上跑，而那个故障的现象是「解不
+// 出 Turnstile」，会把排查引到出口 IP 上去，事后极难归因。宁可当场停下。
+func WipeBrowser(ctx context.Context, cfg Config) error {
+	if strings.TrimSpace(cfg.ADB) == "" {
+		return errNoADB
+	}
+	if _, err := adbOutput(ctx, cfg, "shell", "am", "force-stop", cfg.pkg()); err != nil {
+		return fmt.Errorf("停掉 %s 失败，无法保证和上一个号隔离：%w", cfg.pkg(), err)
+	}
+	out, err := adbOutput(ctx, cfg, "shell", "pm", "clear", cfg.pkg())
+	if err != nil {
+		return fmt.Errorf("清空 %s 的数据失败，无法保证和上一个号隔离：%w", cfg.pkg(), err)
+	}
+	// pm clear 失败时退出码仍是 0，只在 stdout 上回 "Failed"。不看这一行就会把失败当成功。
+	if !strings.Contains(out, "Success") {
+		return fmt.Errorf("清空 %s 的数据没有成功（pm clear 回：%s）", cfg.pkg(), strings.TrimSpace(out))
+	}
+	return nil
+}
+
 // startBrowser 把浏览器拉到前台并打开 about:blank。
 //
 // 用 about:blank 而不是直接打开注册页：这一步只为了让它开始监听调试端口，页面导航由

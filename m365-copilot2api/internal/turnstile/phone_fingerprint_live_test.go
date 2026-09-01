@@ -13,44 +13,24 @@ import (
 	"m365-copilot2api/internal/procwin"
 )
 
-// TestPhoneFingerprintNoiseLive 查 Cromite 是不是在给指纹加噪。
-//
-// 为什么查这个：同一个出口 IP 下，PC 的 Chrome 走手机 SOCKS 隧道 8.2 秒就拿到 token，而手
-// 机上的 Cromite 六次全部失败（每次 75 秒）。IP 和站点都被这个对照排除了，剩下的唯一变量
-// 就是浏览器本身。Cromite 是主打反指纹的 Chromium 分支，而 Turnstile 本质上就是一次指纹
-// 采集 —— canvas 读回来的像素被掺了随机噪声的话，Cloudflare 拿不到稳定指纹，就会一直不发
-// token：控件正常铺开、脚本一路 200、也没有任何错误文案，正是我们看到的样子。
-//
-// 判据是「同一段绘制内容连续读两次，结果是否一致」。真实浏览器必然一致；加噪的实现每次
-// 读都不同。
-//
-//	$env:M365_PHONE_LIVE=1; $env:M365_PHONE_ADB='<adb.exe 绝对路径>'
-//	go test -C <repo> ./internal/turnstile -run TestPhoneFingerprintNoiseLive -v -count=1
 // wipePhoneBrowser 把手机浏览器的数据整个擦掉再拉起来。
 //
-// pm clear 会连 cookie、localStorage、IndexedDB、缓存和各种偏好一起清掉，是「真正干净的
-// profile」唯一可靠的做法 —— CDP 那几个 clear* 命令只能按来源清，永远盖不全。
-// /data/local/tmp/chrome-command-line 不在应用数据里，pm clear 不会动它（实测确认）。
+// 擦除本身走生产路径 phonecdp.WipeBrowser，不在测试里另写一份 —— 早先这里自己拼
+// pm clear + am start，而生产路径压根没擦，两边不一致正是「测试里能过、跑批就死」的来源。
+//
+// 这里只额外多做一件事：等冷启动。pm clear 之后调试 socket 要过几秒才在，EnsureCromite
+// 自己会轮询 25 秒，对注册够用；但本文件里的用例擦完就直接连，先等一等省掉一次没必要的失败。
 func wipePhoneBrowser(ctx context.Context, adb string) error {
-	run := func(args ...string) error {
-		cmd := exec.CommandContext(ctx, adb, args...)
-		procwin.HideWindow(cmd)
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			return fmt.Errorf("%s: %w (%s)", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
-		}
-		return nil
-	}
-	if err := run("shell", "pm", "clear", phonecdp.DefaultPackage); err != nil {
+	if err := phonecdp.WipeBrowser(ctx, phonecdp.Config{ADB: adb}); err != nil {
 		return err
 	}
-	if err := run("shell", "am", "start", "-n",
+	cmd := exec.CommandContext(ctx, adb, "shell", "am", "start", "-n",
 		phonecdp.DefaultPackage+"/"+phonecdp.DefaultActivity,
-		"-a", "android.intent.action.VIEW", "-d", "about:blank"); err != nil {
-		return err
+		"-a", "android.intent.action.VIEW", "-d", "about:blank")
+	procwin.HideWindow(cmd)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("拉起浏览器失败：%w (%s)", err, strings.TrimSpace(string(out)))
 	}
-	// pm clear 之后浏览器是冷启动，调试 socket 要过几秒才在。EnsureCromite 自己会重试，但
-	// 冷启动比它的预算慢，这里先等一等，省掉一次没必要的失败。
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
@@ -58,6 +38,19 @@ func wipePhoneBrowser(ctx context.Context, adb string) error {
 	}
 	return nil
 }
+
+// TestPhoneFingerprintNoiseLive 查 Cromite 是不是在给指纹加噪。
+//
+// 结论先写在这：**它确实在加噪，但这不影响 Turnstile**。同一段绘制内容连续 toDataURL 三次给
+// 出三个不同结果（3586/3578/3626），每次读都重新随机，pm clear 擦不掉，命令行和 chrome://flags
+// 两种极性都关不掉。所以这个用例按设计是失败的，留着只为把「噪声存在」这件事钉住。
+//
+// 别再拿它当「解不出 Turnstile」的原因 —— 那次真因是清状态漏了 challenges.cloudflare.com，
+// 加上生产路径每个号之间没擦浏览器。当时的对照实验也不成立：PC 侧每次都是新的 user-data-dir，
+// 手机侧却是一个跑过六次失败的长驻 profile，两边干净程度根本不一样。
+//
+//	$env:M365_PHONE_LIVE=1; $env:M365_PHONE_ADB='<adb.exe 绝对路径>'
+//	go test -C <repo> ./internal/turnstile -run TestPhoneFingerprintNoiseLive -v -count=1
 
 func TestPhoneFingerprintNoiseLive(t *testing.T) {
 	if os.Getenv("M365_PHONE_LIVE") == "" {
