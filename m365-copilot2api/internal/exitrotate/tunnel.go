@@ -43,6 +43,8 @@ type TunnelResult struct {
 }
 
 const (
+	// defaultPhoneSocksBinary 只是 TunnelRequest.Binary 为空时的兜底。真正用哪条路径由
+	// 面板配置的 phone_socks_bin 决定 —— 部署位置不该写死在库里。
 	defaultPhoneSocksBinary = "/data/local/tmp/phone-socks"
 	tunnelProbeBudget       = 20 * time.Second
 )

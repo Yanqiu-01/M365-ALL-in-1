@@ -160,26 +160,38 @@ type nativePanelFileConfig struct {
 		// FlareSolverr 只能回一张页面快照，而 token 写在隐藏 input 的 value
 		// property 上，快照里没有它。留下这个键是为了让「我就要用 FlareSolverr」
 		// 这种意图能表达出来，而不是被代码悄悄改掉。
-		Solver         string            `json:"solver"`
-		EmailDomain    string            `json:"email_domain"`
-		EmailPrefix    string            `json:"email_prefix"`
-		Password       string            `json:"password"`
-		PlanID         string            `json:"plan_id"`
-		DomainID       string            `json:"domain_id"`
-		EmailStartNum  int               `json:"email_start_num"`
-		DisplayBase    int               `json:"display_base"`
-		CredentialFile string            `json:"cred_file"`
-		PhoneSOCKS     string            `json:"phone_socks"`
+		Solver         string `json:"solver"`
+		EmailDomain    string `json:"email_domain"`
+		EmailPrefix    string `json:"email_prefix"`
+		Password       string `json:"password"`
+		PlanID         string `json:"plan_id"`
+		DomainID       string `json:"domain_id"`
+		EmailStartNum  int    `json:"email_start_num"`
+		DisplayBase    int    `json:"display_base"`
+		CredentialFile string `json:"cred_file"`
+		PhoneSOCKS     string `json:"phone_socks"`
+		// PhoneSOCKSBin 是手机上 phone-socks 可执行文件的路径。
+		//
+		// 放在哪里属于部署决定：有的机型会清 /data/local/tmp，也有人把它推到别处。
+		// exitrotate.TunnelRequest 一直有 Binary 这个字段，但没人填过，于是
+		// EnsureTunnel 只能用它自己写死的那条路径 —— 换个位置部署，每一批都以
+		// 「手机上没有可执行的 …」失败，而配置里找不到任何地方能改。
+		PhoneSOCKSBin string `json:"phone_socks_bin"`
 		// ADB 是 adb 可执行文件的路径。phone 模式靠它切飞行模式换运营商 IP，而
 		// exitrotate 在找不到配置时只会执行 PATH 上的 "adb" —— Windows 上 adb 通常
 		// 装在 WinGet 的包目录里并不在 PATH，于是每次换 IP 都以「adb 找不到」失败，
 		// 整批注册在第二个号就断掉。配置里必须能钉住绝对路径。
-		ADB            string            `json:"adb"`
-		ClashAPI       string            `json:"clash_api"`
-		ClashSecret    string            `json:"clash_secret"`
-		ClashGroup     string            `json:"clash_group"`
-		ClashProxy     string            `json:"clash_proxy"`
-		ClashNodes     []clashNodeConfig `json:"clash_nodes"`
+		ADB string `json:"adb"`
+		// RegisterBatch 是长跑任务不指定 batchSize 时每批注册多少个号。
+		//
+		// 一批越大，中途停止的粒度越粗；越小，每批之间的隧道检查越频繁。跑一天的任务
+		// 该能在配置里定这个值，而不是只能靠调接口时传参数。
+		RegisterBatch int               `json:"register_batch_size"`
+		ClashAPI      string            `json:"clash_api"`
+		ClashSecret   string            `json:"clash_secret"`
+		ClashGroup    string            `json:"clash_group"`
+		ClashProxy    string            `json:"clash_proxy"`
+		ClashNodes    []clashNodeConfig `json:"clash_nodes"`
 	} `json:"register"`
 }
 
@@ -241,7 +253,9 @@ type nativePanelRegisterConfigRequest struct {
 	EmailStartNum   int    `json:"emailStartNum"`
 	FlareSolverrURL string `json:"flaresolverrUrl"`
 	PhoneSOCKS      string `json:"phoneSocks"`
+	PhoneSOCKSBin   string `json:"phoneSocksBin"`
 	ADB             string `json:"adb"`
+	RegisterBatch   int    `json:"registerBatchSize"`
 	ClashAPI        string `json:"clashApi"`
 	ClashSecret     string `json:"clashSecret"`
 	ClashGroup      string `json:"clashGroup"`
@@ -285,8 +299,14 @@ func (m *nativePanelManager) saveRegisterConfig(req nativePanelRegisterConfigReq
 	if v := strings.TrimSpace(req.PhoneSOCKS); v != "" {
 		cfg.Register.PhoneSOCKS = v
 	}
+	if v := strings.TrimSpace(req.PhoneSOCKSBin); v != "" {
+		cfg.Register.PhoneSOCKSBin = v
+	}
 	if v := strings.TrimSpace(req.ADB); v != "" {
 		cfg.Register.ADB = v
+	}
+	if req.RegisterBatch > 0 {
+		cfg.Register.RegisterBatch = req.RegisterBatch
 	}
 	if v := strings.TrimSpace(req.ClashAPI); v != "" {
 		cfg.Register.ClashAPI = strings.TrimRight(v, "/")
@@ -409,6 +429,27 @@ func (p nativePanelPaths) credentialPath(cfg nativePanelFileConfig) (string, err
 		return "", fmt.Errorf("%w: credential path is invalid", errNativePanelUnavailable)
 	}
 	return filepath.Clean(abs), nil
+}
+
+// registerLogPath 是批量注册长跑任务的落盘日志。
+//
+// 位置由面板根目录派生，和 config.json 同级 —— 理由与 credentialPath 一致：面板管的
+// 数据都在这个根下面，网关不该往根之外写东西，也不该把绝对路径写死在代码里。
+func (p nativePanelPaths) registerLogPath() string {
+	return filepath.Join(p.root, "register-job.log")
+}
+
+// registerLogPath 解析数据目录并给出日志位置。不读 config.json：日志的位置只取决于
+// 根目录，配置文件坏了也不该连日志都写不了 —— 那正是最需要日志的时候。
+func (m *nativePanelManager) registerLogPath() (string, error) {
+	if m == nil {
+		return "", errNativePanelUnavailable
+	}
+	paths, err := m.config.paths()
+	if err != nil {
+		return "", err
+	}
+	return paths.registerLogPath(), nil
 }
 
 func nativePanelReadCredentials(path string) (map[string]string, error) {
@@ -547,7 +588,11 @@ func (m *nativePanelManager) state(server *Server) map[string]any {
 	// 「clash api, group and node are required」失败，第二个账号起全部报「上一号
 	// 已写入本地，但换 IP 失败」，而用户在界面上找不到任何能填这些值的地方。
 	state["phone_socks"] = strings.TrimSpace(cfg.Register.PhoneSOCKS)
+	state["phone_socks_bin"] = strings.TrimSpace(cfg.Register.PhoneSOCKSBin)
 	state["adb"] = strings.TrimSpace(cfg.Register.ADB)
+	// 回传的是实际会用的每批数量，不是配置里的原值：配置没写这个键时界面该显示 20
+	// （那正是任务会用的值），而不是一个会被读成「每批 0 个」的空格子。
+	state["register_batch_size"] = cfg.registerBatchSize()
 	state["clash_api"] = strings.TrimSpace(cfg.Register.ClashAPI)
 	state["clash_group"] = strings.TrimSpace(cfg.Register.ClashGroup)
 	state["clash_proxy"] = strings.TrimSpace(cfg.Register.ClashProxy)
@@ -648,12 +693,14 @@ func (c *nativePanelController) ServeHTTP(w http.ResponseWriter, r *http.Request
 			return
 		}
 		jsonOut(w, map[string]any{
-			"ok":             true,
-			"register_ready": cfg.registerReady(),
-			"siteUrl":        cfg.Register.SiteURL,
-			"emailDomain":    cfg.Register.EmailDomain,
-			"emailPrefix":    cfg.Register.EmailPrefix,
-			"emailStartNum":  cfg.Register.EmailStartNum,
+			"ok":                true,
+			"register_ready":    cfg.registerReady(),
+			"siteUrl":           cfg.Register.SiteURL,
+			"emailDomain":       cfg.Register.EmailDomain,
+			"emailPrefix":       cfg.Register.EmailPrefix,
+			"emailStartNum":     cfg.Register.EmailStartNum,
+			"phoneSocksBin":     cfg.Register.PhoneSOCKSBin,
+			"registerBatchSize": cfg.registerBatchSize(),
 		})
 	case "/api/admin/panel/job/stop":
 		if r.Method != http.MethodPost {

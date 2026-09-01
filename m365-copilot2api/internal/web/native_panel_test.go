@@ -182,6 +182,50 @@ func TestNativePanelSaveRegisterConfig(t *testing.T) {
 	}
 }
 
+// phone_socks_bin / register_batch_size 要能存进去、也要能读回来。
+//
+// 配置往返是单向的就等于没有这个配置项：界面显示不出已存的值，操作员也看不出缺了什么。
+// 顺带钉住「只覆盖这次真的传了的字段」这条既有约定 —— 界面上单独保存一个格子不该把旁边
+// 那个刚填好的路径清空。
+func TestNativePanelSaveRegisterConfigRoundTripsPhoneBinaryAndBatchSize(t *testing.T) {
+	root := t.TempDir()
+	manager := newNativePanelManager(nativePanelConfig{Root: root})
+	if _, err := manager.saveRegisterConfig(nativePanelRegisterConfigRequest{
+		PhoneSOCKSBin: " /data/local/tmp/socks-elsewhere ", RegisterBatch: 6,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	state := manager.state(nil)
+	if state["phone_socks_bin"] != "/data/local/tmp/socks-elsewhere" {
+		t.Fatalf("phone_socks_bin = %v", state["phone_socks_bin"])
+	}
+	if state["register_batch_size"] != 6 {
+		t.Fatalf("register_batch_size = %v，想要 6", state["register_batch_size"])
+	}
+
+	// 只改批量，路径必须原样留着。
+	cfg, err := manager.saveRegisterConfig(nativePanelRegisterConfigRequest{RegisterBatch: 9})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Register.PhoneSOCKSBin != "/data/local/tmp/socks-elsewhere" {
+		t.Fatalf("局部保存把 phone_socks_bin 清掉了：%#v", cfg.Register)
+	}
+	if cfg.Register.RegisterBatch != 9 {
+		t.Fatalf("register_batch_size = %d，想要 9", cfg.Register.RegisterBatch)
+	}
+
+	// 配置里没写过这个键时，回报的是任务实际会用的那个值，而不是会被界面读成
+	// 「每批 0 个」的空值。
+	fresh := newNativePanelManager(nativePanelConfig{Root: t.TempDir()}).state(nil)
+	if fresh["register_batch_size"] != registerJobDefaultBatch {
+		t.Fatalf("没配过时 register_batch_size = %v，想要 %d", fresh["register_batch_size"], registerJobDefaultBatch)
+	}
+	if fresh["phone_socks_bin"] != "" {
+		t.Fatalf("没配过时 phone_socks_bin = %v，想要空串", fresh["phone_socks_bin"])
+	}
+}
+
 func TestNativePanelLoadFillsEmptyRegisterFields(t *testing.T) {
 	// 同上：空密码要由默认值补齐，而默认值本身来自环境变量。
 	t.Setenv("M365_REGISTER_PASSWORD", "test-only-register-password")

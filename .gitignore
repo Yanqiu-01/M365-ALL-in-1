@@ -18,5 +18,18 @@ coverage.txt
 # 网关运行时产物（与源码同目录，见 cmd/server/gatewayLogPath）
 m365-gateway.log
 
+# 交叉编译给手机的 SOCKS 代理（GOOS=android GOARCH=arm64，见 tools/phone-socks）。
+# 没有扩展名，*.exe 挡不住；3.7MB，而且它是部署产物 —— 源码在 tools/phone-socks 里。
+/phone-socks
+
+# 退役的批量注册驱动。逻辑已经进网关（internal/web/panel_register_runner.go），
+# 留着这两个文件只是历史记录：驱动最后是因为按 GBK 解 UTF-8 把注册结果解坏、
+# 连续三批判定「返回无法解析」自己停的。
+/register-driver.ps1
+/register-driver.log
+
+# 代码索引缓存（codebase-memory MCP）。m365-copilot2api/.gitignore 里那条只管子目录。
+.codebase-memory/
+
 # 面板数据目录：内含账密清单与令牌，永远不提交
 M365-自用/

@@ -8,6 +8,8 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -63,6 +65,45 @@ func writeRunnerPanelConfig(t *testing.T, root, siteURL string) {
 	if err := os.WriteFile(cfgPath, body, 0o600); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// patchRunnerRegisterConfig 往已经写好的 config.json 的 register 段里补几个键。
+//
+// 刻意直接改文件而不是走 saveRegisterConfig：要测的是「配置里有这个键时代码怎么用它」，
+// 不该顺带依赖写入路径也正确。
+func patchRunnerRegisterConfig(t *testing.T, root string, keys map[string]any) {
+	t.Helper()
+	cfgPath := filepath.Join(root, "config.json")
+	raw, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg map[string]any
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	reg, ok := cfg["register"].(map[string]any)
+	if !ok {
+		reg = map[string]any{}
+		cfg["register"] = reg
+	}
+	for key, value := range keys {
+		reg[key] = value
+	}
+	body, _ := json.Marshal(cfg)
+	if err := os.WriteFile(cfgPath, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// okSite 是一个总是回「注册成功」的站点桩。
+func okSite(t *testing.T) *httptest.Server {
+	t.Helper()
+	site := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "upn": "ok"})
+	}))
+	t.Cleanup(site.Close)
+	return site
 }
 
 func waitForJob(t *testing.T, server *Server, want func(registerJobState) bool) registerJobState {
@@ -262,4 +303,250 @@ func TestStartRegisterJobClampsBatchSize(t *testing.T) {
 	}
 	server.registerJob().stop()
 	waitForJob(t, server, func(st registerJobState) bool { return !st.Running })
+}
+
+// 手机上 phone-socks 放在哪里属于部署决定，配置里必须能钉住。
+//
+// ensurePhoneTunnel 从来没填过 TunnelRequest.Binary，于是 EnsureTunnel 只能用它自己写死
+// 的 /data/local/tmp/phone-socks —— 换个位置部署（有的机型会清那个目录），每一批都以
+// 「手机上没有可执行的 …」失败，而配置里根本没有能改它的键。
+func TestRegisterJobPassesConfiguredPhoneSocksBinaryToTunnel(t *testing.T) {
+	stubRotate(t)
+	const want = "/data/local/tmp/socks-elsewhere"
+	seen := make(chan string, 4)
+	old := ensureTunnel
+	t.Cleanup(func() { ensureTunnel = old })
+	ensureTunnel = func(_ context.Context, req exitrotate.TunnelRequest) (exitrotate.TunnelResult, error) {
+		select {
+		case seen <- req.Binary:
+		default:
+		}
+		return exitrotate.TunnelResult{OK: true, IP: "2409:895a:1::1"}, nil
+	}
+
+	root := t.TempDir()
+	writeRunnerPanelConfig(t, root, okSite(t).URL)
+	patchRunnerRegisterConfig(t, root, map[string]any{"phone_socks_bin": want})
+
+	server := &Server{}
+	if _, err := server.startRegisterJob(newNativePanelManager(nativePanelConfig{Root: root}), registerJobRequest{
+		Mode: "phone", StartNum: 5026, Target: 5026, BatchSize: 1, SkipOAuth: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	waitForJob(t, server, func(st registerJobState) bool { return !st.Running })
+
+	select {
+	case got := <-seen:
+		if got != want {
+			t.Fatalf("TunnelRequest.Binary = %q，想要配置里的 %q", got, want)
+		}
+	default:
+		t.Fatal("phone 模式却没有检查过隧道")
+	}
+}
+
+// 请求不带 batchSize 时要听配置里的 register_batch_size，而不是永远退回写死的 20。
+func TestStartRegisterJobFallsBackToConfiguredBatchSize(t *testing.T) {
+	stubRotate(t)
+	stubTunnel(t, "", errors.New("手机没插"))
+	root := t.TempDir()
+	writeRunnerPanelConfig(t, root, okSite(t).URL)
+	patchRunnerRegisterConfig(t, root, map[string]any{"register_batch_size": 7})
+
+	server := &Server{}
+	state, err := server.startRegisterJob(newNativePanelManager(nativePanelConfig{Root: root}), registerJobRequest{
+		Mode: "phone", StartNum: 5026, Target: 9000, SkipOAuth: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.BatchSize != 7 {
+		t.Fatalf("batchSize = %d，想要配置里的 7", state.BatchSize)
+	}
+	server.registerJob().stop()
+	waitForJob(t, server, func(st registerJobState) bool { return !st.Running })
+}
+
+// 配置里的值也要压到单次注册接口的上限：写了 500 不压的话每一批都会以「单次最多注册
+// 20 个账号」失败 —— 一个从配置文件里就能埋下的、跑起来才发现的坑。
+func TestStartRegisterJobClampsConfiguredBatchSize(t *testing.T) {
+	stubRotate(t)
+	stubTunnel(t, "", errors.New("手机没插"))
+	root := t.TempDir()
+	writeRunnerPanelConfig(t, root, okSite(t).URL)
+	patchRunnerRegisterConfig(t, root, map[string]any{"register_batch_size": 500})
+
+	server := &Server{}
+	state, err := server.startRegisterJob(newNativePanelManager(nativePanelConfig{Root: root}), registerJobRequest{
+		Mode: "phone", StartNum: 5026, Target: 9000, SkipOAuth: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.BatchSize != panelRegisterMax {
+		t.Fatalf("batchSize = %d，想要压到 %d", state.BatchSize, panelRegisterMax)
+	}
+	server.registerJob().stop()
+	waitForJob(t, server, func(st registerJobState) bool { return !st.Running })
+}
+
+// 请求里显式给的 batchSize 仍然优先：那是调用方对这一次任务的明确意图，配置只是默认值。
+func TestStartRegisterJobPrefersRequestBatchSizeOverConfig(t *testing.T) {
+	stubRotate(t)
+	stubTunnel(t, "", errors.New("手机没插"))
+	root := t.TempDir()
+	writeRunnerPanelConfig(t, root, okSite(t).URL)
+	patchRunnerRegisterConfig(t, root, map[string]any{"register_batch_size": 7})
+
+	server := &Server{}
+	state, err := server.startRegisterJob(newNativePanelManager(nativePanelConfig{Root: root}), registerJobRequest{
+		Mode: "phone", StartNum: 5026, Target: 9000, BatchSize: 3, SkipOAuth: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.BatchSize != 3 {
+		t.Fatalf("batchSize = %d，想要请求里的 3", state.BatchSize)
+	}
+	server.registerJob().stop()
+	waitForJob(t, server, func(st registerJobState) bool { return !st.Running })
+}
+
+// 内存里只留最近 40 条，而一次跑几千个号意味着「哪些号失败了、要重试哪些」这类事在跑完
+// 之前就被后面的批次挤掉了 —— 那恰恰是事后唯一要读的东西。落盘那份必须比内存环长命。
+func TestRegisterJobNotesOutliveTheInMemoryRingOnDisk(t *testing.T) {
+	stubRotate(t)
+	stubTunnel(t, "2409:895a:1::1", nil)
+	root := t.TempDir()
+	writeRunnerPanelConfig(t, root, okSite(t).URL)
+
+	// 每批 1 个、50 个号 → 启动 1 条 + 每批 1 条 + 收尾 1 条 = 52 条 > 40，前面十几条必然
+	// 已经不在内存里。
+	const start, target = 5026, 5075
+	server := &Server{}
+	if _, err := server.startRegisterJob(newNativePanelManager(nativePanelConfig{Root: root}), registerJobRequest{
+		Mode: "phone", StartNum: start, Target: target, BatchSize: 1, SkipOAuth: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	final := waitForJob(t, server, func(st registerJobState) bool { return !st.Running })
+	if final.Success != target-start+1 {
+		t.Fatalf("success = %d，想要 %d", final.Success, target-start+1)
+	}
+	if len(final.Notes) > registerJobMaxNotes {
+		t.Fatalf("内存里留了 %d 条，上限是 %d", len(final.Notes), registerJobMaxNotes)
+	}
+
+	logPath := filepath.Join(root, "register-job.log")
+	if final.LogPath != logPath {
+		t.Fatalf("logPath = %q，想要 %q", final.LogPath, logPath)
+	}
+	raw, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	onDisk := string(raw)
+	memory := strings.Join(final.Notes, "\n")
+
+	// 先确认这个用例真的有话可说：被挤掉的那几条必须确实不在内存里，否则它证明不了任何事。
+	for _, dropped := range []string{"任务启动", "批次 5026-5026", "批次 5030-5030"} {
+		if strings.Contains(memory, dropped) {
+			t.Fatalf("样本不够：%q 还留在内存里，这个用例什么都没验证到", dropped)
+		}
+		if !strings.Contains(onDisk, dropped) {
+			t.Fatalf("落盘日志里没有 %q：\n%s", dropped, onDisk)
+		}
+	}
+	// 最后一条也要在：不能只落了前半段就断了。
+	if !strings.Contains(onDisk, "跑完：到 5075") {
+		t.Fatalf("落盘日志里没有收尾那一行：\n%s", onDisk)
+	}
+
+	lines := strings.Split(strings.TrimRight(onDisk, "\n"), "\n")
+	if len(lines) <= registerJobMaxNotes {
+		t.Fatalf("落盘 %d 行，没有超过内存上限 %d，等于没留下额外历史", len(lines), registerJobMaxNotes)
+	}
+	// 每行都要带完整日期：内存里只有 [HH:MM:SS]，而这种任务会跨过午夜，事后翻日志分不清
+	// 「03:12:07 失败」是哪一天的。
+	// 允许日期之后有缩进：批次里的子项（失败明细、report.Notes）是缩进两格写的，那是
+	// 刻意的层次，和「这一行有没有完整日期」无关。收尾的 \S 只用来挡住「只有时间戳、
+	// 正文是空的」那种行。
+	stamped := regexp.MustCompile(`^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} +\S`)
+	for i, line := range lines {
+		if !stamped.MatchString(line) {
+			t.Fatalf("第 %d 行没有完整日期前缀：%q", i+1, line)
+		}
+	}
+}
+
+// 日志开不出来不该拖死任务：任务是值钱的那个，日志只是诊断。
+//
+// 用一个同名目录顶掉日志文件 —— 以写方式打开一个目录在 Windows 和 Linux 上都必然失败，
+// 不像权限位那样依赖平台。
+func TestRegisterJobKeepsRegisteringWhenTheLogCannotBeOpened(t *testing.T) {
+	stubRotate(t)
+	stubTunnel(t, "2409:895a:1::1", nil)
+	root := t.TempDir()
+	writeRunnerPanelConfig(t, root, okSite(t).URL)
+	if err := os.MkdirAll(filepath.Join(root, "register-job.log"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	server := &Server{}
+	if _, err := server.startRegisterJob(newNativePanelManager(nativePanelConfig{Root: root}), registerJobRequest{
+		Mode: "phone", StartNum: 5026, Target: 5028, BatchSize: 1, SkipOAuth: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	final := waitForJob(t, server, func(st registerJobState) bool { return !st.Running })
+	if final.Success != 3 {
+		t.Fatalf("success = %d，想要 3：写不了日志不该少注册一个号", final.Success)
+	}
+	if final.Detail != "已完成" {
+		t.Fatalf("detail = %q，想要 已完成", final.Detail)
+	}
+	// 但也不能静默：日志没了这件事本身要说一声。
+	if !strings.Contains(strings.Join(final.Notes, "\n"), "日志落盘不可用") {
+		t.Fatalf("日志打不开却没有任何提示：%#v", final.Notes)
+	}
+	if final.LogPath != "" {
+		t.Fatalf("logPath = %q，日志根本没开成，不该报一个位置出去", final.LogPath)
+	}
+}
+
+// 跑到一半写不下去了（盘满了、U 盘被拔了）也一样：就地放弃这份日志，说一次，然后继续。
+//
+// 关键是不能留着坏句柄反复重试 —— note 是在 j.mu 里跑的，状态接口要拿同一把锁，每条日志
+// 都去撞一次坏掉的目标会把面板一起拖住。
+func TestRegisterJobNoteGivesUpOnceWhenTheLogWriteFails(t *testing.T) {
+	file, err := os.CreateTemp(t.TempDir(), "register-job-*.log")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 提前关掉句柄，之后每次 WriteString 都会失败 —— 等价于跑到一半目标没了。
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	job := &registerJob{logFile: file}
+	job.note("第一条")
+	if job.logFile != nil {
+		t.Fatal("写失败之后还留着句柄，后面每条日志都会再撞一次")
+	}
+	job.note("第二条")
+	job.note("第三条")
+
+	joined := strings.Join(job.snapshot().Notes, "\n")
+	if !strings.Contains(joined, "日志写入失败") {
+		t.Fatalf("写失败却没有任何提示：%q", joined)
+	}
+	if got := strings.Count(joined, "日志写入失败"); got != 1 {
+		t.Fatalf("「日志写入失败」出现 %d 次，只该说一次", got)
+	}
+	for _, want := range []string{"第一条", "第二条", "第三条"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("%q 没进内存：写不了日志不该连内存里的进度都丢掉", want)
+		}
+	}
 }

@@ -31,6 +31,17 @@ type panelRegisterRequest struct {
 	TurnstileToken string `json:"turnstileToken"`
 	Node           string `json:"node"`
 	Proxy          string `json:"proxy"`
+	// SpentIP 是调用方已知「当日注册额度已用掉」的出口地址。
+	//
+	// 为什么需要它：批次末尾那一号成功之后不换出口（见循环里的 i < count-1），于是
+	// 那个已经用掉额度的 IP 会留在手机上。下一批的第一个号照常探测、照常花十几秒解一
+	// 次 Turnstile、照常 POST，然后必然收到「当前 IP 在 1 天内注册次数已达上限」，靠
+	// 重试才换出口。实测 5921、5941、5961 三个批次首号全部是「换了 2 个出口才成功」，
+	// 而批次内其他号极少这样 —— 每个批次边界白烧一次求解，还白占一次重试额度。
+	//
+	// 调用方把上一批的 report.LastIP 原样传回来即可。只在探测到的地址与它相同时才提
+	// 前换出口：地址自己变了就什么都不做，不为此多切一次飞行模式。
+	SpentIP string `json:"spentIp"`
 }
 
 type panelRegisterAccount struct {
@@ -52,6 +63,19 @@ type panelRegisterReport struct {
 	Failed   int                    `json:"failed"`
 	Accounts []panelRegisterAccount `json:"accounts"`
 	Rotate   *exitrotate.Result     `json:"rotate,omitempty"`
+	// LastIP 是最后一次成功注册所用的出口地址，调用方下一批应当作为 SpentIP 传回来。
+	// 只有 phone 模式填得有意义：其余模式的出口是代理地址，不是运营商下发的 IP。
+	LastIP string `json:"lastIp,omitempty"`
+	// NextNum 是「本次没有尝试到的第一个编号」。正常跑完时它等于 start+count；
+	// 提前中断时它指向真正的断点。
+	//
+	// 为什么必须有：原先中断时会给剩下每个号伪造一条 failed 记录，而调用方看到
+	// err == nil 就按 num += count 推进 —— 那些号一次都没试过，却被永久跳过了。实测
+	// 形态是 adb 抖一下（USB 掉一下、adb server 重启、手机重启），换 IP 报错，于是
+	// 一批 20 个号里 19 个被判死，号段照样往前走。
+	NextNum int `json:"nextNum,omitempty"`
+	// Stopped 表示本次是提前中断的，NextNum 之后的号一次都没尝试过。
+	Stopped bool `json:"stopped,omitempty"`
 	// Notes 记录「做完了但没完全达到预期」的情况，例如代理池只有一个条目、整批
 	// 账号只能复用同一出口。这类事不该只是静默通过，也不该算成失败。
 	Notes []string `json:"notes,omitempty"`
@@ -168,12 +192,41 @@ func (s *Server) runRegister(ctx context.Context, manager *nativePanelManager, r
 	if mode != "proxy" {
 		proxyURL = firstNonEmpty(proxyURL, cfg.Register.PhoneSOCKS, cfg.Register.ClashProxy)
 	}
+	// phone 模式没有出口就必须停下，不能回落到代理池、更不能回落到直连。
+	//
+	// 原先这里的条件是 `mode == "proxy" || proxyURL == ""`，于是 phone 模式在
+	// phone_socks 没配的时候会掉进池子分支 —— 而 registerReady() 只校验 site_url /
+	// email_domain / email_prefix / password，defaultNativePanelFileConfig 也从不设
+	// phone_socks，所以这个组合是可达的。后果是三个组件对「手机出口是什么」的理解不
+	// 一致：EnsureTunnel 和 rotatePhone 都默认 socks5://127.0.0.1:1081，而这里什么默
+	// 认都不用。表现出来就是：隧道探测拿到运营商 IPv6、状态页显示轮换一切正常，而注册
+	// 实际全部从池子里某个代理发出，把那个 IP 的当日额度用掉；飞行模式照切，切的是一
+	// 个没人在用的出口，所以连「换出口未生效」都不会报。
+	//
+	// 池子空的时候更糟：proxyURL 留空，下面那条求解器提示又以 p != "" 为前提不会触发，
+	// Chrome 于是不带代理启动，注册直接走本机家庭宽带出口 —— 用户明确要求不能走直连。
+	//
+	// 所以 phone 模式在这里补上和另外两个组件相同的默认值，而不是回落到代理池。宁可
+	// 打一个没监听的本地端口、当场失败，也不要从一个「轮换管不到」的 IP 上悄悄注册。
+	if mode == "phone" && strings.TrimSpace(proxyURL) == "" {
+		proxyURL = exitrotate.DefaultPhoneSOCKS
+		report.Notes = append(report.Notes,
+			fmt.Sprintf("未配置 phone_socks，按手机出口默认地址 %s 走；如果手机隧道不在这个端口上，请在面板里显式配置", proxyURL))
+	}
 	if mode == "proxy" || strings.TrimSpace(proxyURL) == "" {
 		// 第一个候选也按近期表现排：否则每一轮注册都从同一个已知过不了 CF 的出口开始，
 		// 白烧一次重试额度。
 		usableLive := turnstile.PreferProvenExits(turnstile.FilterExits(outbound.LiveProxyPoolRawURLs(), solverUsable))
 		usableAll := turnstile.PreferProvenExits(turnstile.FilterExits(outbound.ProxyPoolRawURLs(), solverUsable))
 		proxyURL = firstNonEmpty(proxyURL, firstOf(usableLive), firstOf(usableAll))
+	}
+	// 池子空、又没有本地出口时，proxyURL 到这里仍然是空的，Chrome 会不带代理启动，
+	// 注册走本机家庭宽带 —— 用户明确要求不能走直连。单次注册是人点出来的，这里只如实
+	// 记一条，不替他改主意；长跑任务是无人值守的，由 runner 在启动前直接拒绝（见
+	// panel_register_runner.go），免得几千个号全从家里的 IP 发出去。
+	if strings.TrimSpace(proxyURL) == "" {
+		report.Notes = append(report.Notes,
+			fmt.Sprintf("%s 模式没拿到任何出口（代理池为空且未配置本地出口），这一轮将不带代理注册，本机 IP 会直接暴露给站点", mode))
 	}
 	// 调用方显式指定的出口也要能被求解器用到，否则整轮注册必然失败，且失败原因
 	// 落在浏览器报错上。这里不改它，只如实说清楚。
@@ -224,9 +277,25 @@ func (s *Server) runRegister(ctx context.Context, manager *nativePanelManager, r
 	poolURLs = turnstile.PreferProvenExits(poolURLs)
 	exitTurn := 0
 	var lastIP string
+	// carriedIP 是上一批最后一个号用掉的出口 IP，只对 phone 模式有意义：其余模式的
+	// 「出口」是代理地址，换出口靠换代理、由 poolURLs 推进，不需要这条信息。
+	//
+	// 它刻意只表示「跨批带进来的那一个 IP」，用掉即清。批次内部各号之间由每次成功后的
+	// 尾部轮换负责，不能也走这条路径 —— 否则每个号开头都会再切一次飞行模式（一次约
+	// 10 秒），而它要防的重复只存在于批次边界上。
+	carriedIP := ""
+	if mode == "phone" {
+		carriedIP = strings.TrimSpace(request.SpentIP)
+	}
+	// 正常跑完时断点就是号段末尾之后一个；提前中断时下面会改写它。
+	report.NextNum = start + count
 	for i := 0; i < count; i++ {
 		select {
 		case <-ctx.Done():
+			// 被取消时也要如实报断点。调用方通常只看 err 就丢掉整个 report，但断点是
+			// 唯一能说明「哪个号之后没试过」的信息 —— 停止时用它续跑比按批长推进准确。
+			report.Stopped = true
+			report.NextNum = start + i
 			return report, ctx.Err()
 		default:
 		}
@@ -284,6 +353,27 @@ func (s *Server) runRegister(ctx context.Context, manager *nativePanelManager, r
 				lastIP = ""
 			}
 			probeCancel()
+			// 出口已知用掉了当日额度就先换，别拿它去解一次 Turnstile。
+			//
+			// 只在「探测到的地址确实等于调用方告知的已用地址」时才动手：地址自己变了就
+			// 什么都不做。所以这不会多切飞行模式，只是把必然失败的那一次尝试省掉 ——
+			// 那一次要花十几秒解 Turnstile、POST 一次，然后必然收到「已达上限」。
+			if mode == "phone" && attempts == 1 && carriedIP != "" && item.IP != "" && item.IP == carriedIP {
+				rotateReq.PrevIP = carriedIP
+				rotated, rotateErr := rotateExit(ctx, rotateReq)
+				report.Rotate = &rotated
+				// 成功也好失败也好，这条跨批信息就地用完清掉：留着只会让本批后面每个号
+				// 都再判一次、再切一次。失败的后果只是这一个号白试一次，下一个号有尾部
+				// 轮换兜着。
+				carriedIP = ""
+				if rotateErr != nil {
+					report.Notes = append(report.Notes,
+						fmt.Sprintf("第 %d 号开始前换出口失败（上一批末号已用掉该 IP 的当日额度）：%v", num, rotateErr))
+				} else if rotated.IP != "" {
+					item.IP = rotated.IP
+					lastIP = rotated.IP
+				}
+			}
 			// phone 模式记的是实际出口 IP，不是代理地址：本机 SOCKS 地址每轮都一样，
 			// 记它只会得到「已换 3 个出口：127.0.0.1:1081、127.0.0.1:1081、…」这种
 			// 看不出任何信息的报告。真正变的是运营商下发的地址。
@@ -429,6 +519,16 @@ func (s *Server) runRegister(ctx context.Context, manager *nativePanelManager, r
 		}
 		report.Success++
 		report.Accounts = append(report.Accounts, item)
+		// 记下这次成功用掉的出口，交给调用方作为下一批的 SpentIP。
+		// 站点每 IP 每天只允许成功注册 1 次，所以「成功」等价于「这个 IP 今天用完了」。
+		// 记下这个号是从哪个 IP 注册成功的。整批跑完后它就是「最后一个已用掉额度的
+		// 出口」，调用方下一批把它作为 SpentIP 传回来，好让下一批第一个号先换出口。
+		// 这里不回写 carriedIP：批内的重复由尾部轮换负责，见上面 carriedIP 的注释。
+		if mode == "phone" {
+			if ip := strings.TrimSpace(item.IP); ip != "" {
+				report.LastIP = ip
+			}
+		}
 
 		// 先联网过 CF、提交注册并写入本地账密，确认成功后再换出口，
 		// 给下一个号用。开着飞行模式是过不了 Turnstile 的。
@@ -473,16 +573,22 @@ func (s *Server) runRegister(ctx context.Context, manager *nativePanelManager, r
 					fmt.Sprintf("第 %d 号之后换出口未生效：%s；后续账号可能仍从同一 IP 注册", num, detail))
 			}
 			if rotateErr != nil {
-				for j := i + 1; j < count; j++ {
-					nextNum := start + j
-					nextUser := fmt.Sprintf("%s%d", strings.TrimSpace(cfg.Register.EmailPrefix), nextNum)
-					nextEmail := nextUser + "@" + strings.TrimSpace(cfg.Register.EmailDomain)
-					report.Failed++
-					report.Accounts = append(report.Accounts, panelRegisterAccount{
-						Num: nextNum, Email: nextEmail, Status: "failed",
-						Detail: "上一号已写入本地，但换 IP 失败: " + rotateErr.Error(),
-					})
-				}
+				// 换不了出口就到此为止，但**不能**给剩下的号伪造 failed 记录。
+				//
+				// 原先是那样做的：为 i+1..count-1 每个号各写一条 failed，然后返回
+				// err == nil。调用方看到没出错就按 num += count 推进，于是这些一次都没
+				// 尝试过的号被永久跳过。触发条件只是 adb 抖一下（USB 掉一下、adb server
+				// 重启、手机重启导致 toggleAirplane 报错），一批 20 个里就有 19 个被判死，
+				// 号段照样往前走 —— 持续抖动时 2000 个号能只建出 100 个账号。
+				//
+				// 现在如实报断点：这些号没试过，NextNum 指向第一个没试的号，调用方从那里
+				// 接着跑。已经成功的号仍然留在 report 里，不因为中断而丢掉。
+				report.Stopped = true
+				report.NextNum = start + i + 1
+				remaining := count - i - 1
+				report.Notes = append(report.Notes,
+					fmt.Sprintf("第 %d 号之后换出口失败，本批就此中断：%v；%d 个号（%d-%d）尚未尝试，请从 %d 继续",
+						num, rotateErr, remaining, start+i+1, start+count-1, start+i+1))
 				break
 			}
 		}

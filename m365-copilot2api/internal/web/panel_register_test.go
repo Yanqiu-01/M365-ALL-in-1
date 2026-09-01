@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httputil"
 	"os"
 	"path/filepath"
 	"strings"
@@ -24,12 +25,30 @@ func stubRotate(t *testing.T) {
 	}
 }
 
+// stubExitProxy 起一个本地 HTTP 正向代理，把收到的请求原样转出去。
+//
+// 注册请求必须经由出口发出（runRegister 用 outbound.New(proxyURL) 构造 client），所以
+// 测试也得有一个真的出口。没有它的时候，phone 模式会用默认地址
+// socks5://127.0.0.1:1081 —— 那个端口在开发机上往往真的有手机隧道在听，于是测试的
+// POST 被丢进手机出口、结果取决于手机插没插。给测试一个自己的出口就与本机状态无关了，
+// 顺带真的覆盖了「请求确实走代理」这条路径。
+func stubExitProxy(t *testing.T) string {
+	t.Helper()
+	proxy := httptest.NewServer(&httputil.ReverseProxy{
+		// 代理式请求的 r.URL 是绝对地址，Scheme/Host 都已就位，照原样转发即可。
+		Director: func(*http.Request) {},
+	})
+	t.Cleanup(proxy.Close)
+	return proxy.URL
+}
+
 func writePanelConfig(t *testing.T, root, siteURL string) {
 	t.Helper()
 	config := map[string]any{
 		"gateway": map[string]any{"host": "127.0.0.1", "port": 4141},
 		"register": map[string]any{
 			"site_url":        siteURL,
+			"phone_socks":     stubExitProxy(t),
 			"email_domain":    "office.example.test",
 			"email_prefix":    "24s05",
 			"password":        "Passw0rd!",

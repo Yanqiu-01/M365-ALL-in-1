@@ -141,6 +141,35 @@
     <div id="regState" class="hint"></div>
   </section>
 
+  <section>
+    <h2>批量注册（长跑）</h2>
+    <p class="hint">任务跑在网关进程里,关掉页面或换个浏览器都不影响它继续跑;重新打开本页会自动接上当前进度。同一时间只允许一个批量任务,每批最多 20 个号,一批跑完才会开下一批。</p>
+    <div class="row">
+      <select id="jobMode">
+        <option value="phone">手机换IP</option>
+        <option value="clash">Clash 节点</option>
+        <option value="proxy">当前代理</option>
+      </select>
+      <input id="jobStartNum" type="number" min="1" placeholder="起始编号">
+      <input id="jobTarget" type="number" min="1" placeholder="目标编号">
+      <label class="hint">每批</label>
+      <input id="jobBatchSize" type="number" min="1" max="20" value="20">
+      <label class="hint" style="display:flex;align-items:center;gap:8px"><input id="jobSkipOAuth" type="checkbox"> 跳过 OAuth 补齐</label>
+      <button class="btn" id="jobStartBtn" onclick="startRegisterJob()">启动长跑</button>
+      <button class="btn gray" id="jobStopBtn" onclick="stopRegisterJob()" disabled>停止</button>
+    </div>
+    <div id="jobMsg" class="hint"></div>
+    <div class="row" style="margin-top:10px;margin-bottom:6px">
+      <span id="jobPill" class="pill mut">空闲</span>
+      <span id="jobDetail" class="hint"></span>
+    </div>
+    <div class="progress"><i id="jobBar"></i></div>
+    <div id="jobProgress" class="hint" style="margin-top:9px"></div>
+    <div id="jobStats" class="hint" style="margin-top:5px"></div>
+    <div id="jobMeta" class="hint" style="margin-top:5px"></div>
+    <pre class="log" id="jobNotes">暂无日志</pre>
+  </section>
+
   <section><h2>网关在线账号</h2><div id="gwList" class="mut">–</div></section>
 </main>
 <footer>M365 本地控制面板 · 所有凭据仅本机处理</footer>
@@ -273,6 +302,126 @@ async function startRegister(){
     setBusy('regBtn',false);
   }
 }
+let registerJobTimer = 0;
+// 任务在网关里跑,页面只是观察者:startedAt 是权威起点,页面自己不记时。
+function jobElapsed(startedAt){
+  const start=new Date(startedAt).getTime();
+  if(!startedAt||Number.isNaN(start)||start<=0) return '–';
+  const total=Math.max(0,Math.round((Date.now()-start)/1000));
+  const h=Math.floor(total/3600),m=Math.floor((total%3600)/60),s=total%60;
+  return h?`${h}h${String(m).padStart(2,'0')}m`:(m?`${m}m${String(s).padStart(2,'0')}s`:`${s}s`);
+}
+// finishedAt 在跑的时候是零值时间,不能当成「已完成于 1 年」显示出去。
+function jobTime(value){
+  if(!value) return '–';
+  const t=new Date(value).getTime();
+  if(Number.isNaN(t)||t<=0) return '–';
+  return new Date(value).toLocaleTimeString();
+}
+function renderRegisterJob(job){
+  const j=job||{};
+  const running=!!j.running;
+  const startNum=Number(j.startNum||0),target=Number(j.target||0),nextNum=Number(j.nextNum||0);
+  const pillEl=document.getElementById('jobPill');
+  pillEl.className='pill '+(running?'on':'mut');
+  pillEl.textContent=running?'运行中':(startNum?'已停止':'空闲');
+  document.getElementById('jobDetail').textContent=j.detail||'';
+  // nextNum 是下一个要注册的号,已推进的量就是它减去起点。
+  const span=target-startNum+1;
+  const done=Math.max(0,Math.min(span,nextNum-startNum));
+  const percent=span>0?Math.round(done/span*100):0;
+  document.getElementById('jobBar').style.width=(span>0?percent:0)+'%';
+  document.getElementById('jobProgress').textContent=startNum
+    ?`${j.mode||'-'} · ${startNum} → ${target} · 下一个 ${nextNum} · 已推进 ${done}/${span}（${percent}%）`
+    :'尚未启动过批量注册任务。';
+  document.getElementById('jobStats').textContent=startNum
+    ?`成功 ${Number(j.success||0)} · 失败 ${Number(j.failed||0)} · 跳过 ${Number(j.skipped||0)} · 批次 ${Number(j.batches||0)} · OAuth 补齐 ${Number(j.oauthImported||0)} · 每批 ${Number(j.batchSize||0)}`
+    :'';
+  document.getElementById('jobMeta').textContent=startNum
+    ?`出口 IP ${j.lastIp||'–'} · 已跑 ${jobElapsed(j.startedAt)} · 更新 ${jobTime(j.updatedAt)}${running?'':' · 结束 '+jobTime(j.finishedAt)}`
+    :'';
+  const notes=Array.isArray(j.notes)?j.notes:[];
+  const notesEl=document.getElementById('jobNotes');
+  // 新的在上:固定高度的框里不用手动滚到底就能看到最新一条。
+  //
+  // 用 textContent 而不是 innerHTML+esc():这里要放的是纯文本(日志里含站点原样回传的
+  // 报错和运营商下发的 IP),没有任何标记要生成。走 innerHTML 就等于把正确性押在 esc()
+  // 覆盖完整上,而 textContent 在这个位置不可能出错。
+  notesEl.textContent=notes.length?notes.slice().reverse().join('\n'):'暂无日志';
+  setBusy('jobStartBtn',running);
+  setBusy('jobStopBtn',!running);
+}
+async function pollRegisterJob(){
+  clearTimeout(registerJobTimer);
+  try{
+    const response=await fetch('/api/admin/panel/job/register/status');
+    if(!response.ok) throw new Error('HTTP '+response.status);
+    const result=await response.json();
+    renderRegisterJob(result.job);
+    // 跑完就停轮询,但上面这次渲染已经把终态和最后几条日志留在页面上了。
+    if(!result.job||!result.job.running) return;
+  }catch(e){
+    document.getElementById('jobMsg').textContent='批量注册状态暂不可用: '+e.message;
+    document.getElementById('jobMsg').classList.add('bad');
+    // 网关只是抽了一下,任务可能还在跑;退避后继续看,不擅自判它结束。
+    registerJobTimer=setTimeout(pollRegisterJob,8000);
+    return;
+  }
+  registerJobTimer=setTimeout(pollRegisterJob,4000);
+}
+async function startRegisterJob(){
+  const mode=document.getElementById('jobMode').value;
+  const startNum=parseInt(document.getElementById('jobStartNum').value||'0',10);
+  const target=parseInt(document.getElementById('jobTarget').value||'0',10);
+  const batchSize=parseInt(document.getElementById('jobBatchSize').value||'20',10);
+  const skipOAuth=document.getElementById('jobSkipOAuth').checked;
+  const el=document.getElementById('jobMsg');
+  setBusy('jobStartBtn',true);
+  el.classList.remove('bad');
+  el.textContent='正在启动…';
+  try{
+    const response=await fetch('/api/admin/panel/job/register',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode,startNum,target,batchSize,skipOAuth})});
+    const result=await response.json().catch(()=>({}));
+    if(!response.ok){
+      // 409 的正文写清了是哪个任务占着,原样显示,不换成笼统的「启动失败」。
+      el.textContent=result?.error?.message||result.error||('启动失败: HTTP '+response.status);
+      el.classList.add('bad');
+      pollRegisterJob();
+      return;
+    }
+    el.textContent='任务已启动,可以关页面了。';
+    renderRegisterJob(result.job);
+    pollRegisterJob();
+  }catch(e){
+    el.textContent='启动请求失败: '+e.message;
+    el.classList.add('bad');
+    setBusy('jobStartBtn',false);
+  }
+}
+async function stopRegisterJob(){
+  const el=document.getElementById('jobMsg');
+  setBusy('jobStopBtn',true);
+  el.classList.remove('bad');
+  el.textContent='正在请求停止…';
+  try{
+    const response=await fetch('/api/admin/panel/job/register/stop',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+    const result=await response.json().catch(()=>({}));
+    if(!response.ok){
+      el.textContent=result?.error?.message||result.error||('停止失败: HTTP '+response.status);
+      el.classList.add('bad');
+      setBusy('jobStopBtn',false);
+      return;
+    }
+    // detail 说明当前这批要跑完才退出,照它说的讲,别报告成「已经停了」。
+    el.textContent=result.detail||(result.stopped?'已请求停止。':'当前没有在跑的批量注册任务。');
+    renderRegisterJob(result.job);
+    pollRegisterJob();
+  }catch(e){
+    el.textContent='停止请求失败: '+e.message;
+    el.classList.add('bad');
+    setBusy('jobStopBtn',false);
+  }
+}
 async function refreshResources(){
   try{
     const [statusResponse,ledgerResponse]=await Promise.all([
@@ -336,6 +485,8 @@ async function poll(){
 }
 setInterval(poll, 5000);
 poll();
+// 任务活得比页面久:开页面先问一次,别人在另一个标签页起的任务也能立刻显示。
+pollRegisterJob();
 </script>
 </body>
 </html>

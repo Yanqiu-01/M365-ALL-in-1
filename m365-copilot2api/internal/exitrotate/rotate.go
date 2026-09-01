@@ -164,9 +164,17 @@ func rotateGo(ctx context.Context, req Request) (Result, error) {
 	}
 }
 
+// DefaultPhoneSOCKS 是手机出口在没有显式配置时的地址。
+//
+// 这个字面量原先散在三处：这里、EnsureTunnel 的本地端口拼接、以及注册侧压根没有
+// 默认值（phone_socks 空着时会静默回落到代理池，从别的 IP 注册并烧掉它的当日额度）。
+// 三处对「手机出口是什么」的理解一旦分叉就是静默错号，所以收成一个导出常量，
+// 让注册、轮换、建隧道引用同一个答案。
+const DefaultPhoneSOCKS = "socks5://127.0.0.1:1081"
+
 func rotatePhone(ctx context.Context, req Request) (Result, error) {
 	prev := strings.TrimSpace(req.PrevIP)
-	socks := firstNonEmpty(req.PhoneSOCKS, "socks5://127.0.0.1:1081")
+	socks := firstNonEmpty(req.PhoneSOCKS, DefaultPhoneSOCKS)
 	ip, err := probeIP(ctx, socks)
 	// 只有确实知道上一个 IP 时，「当前出口已经不同」这个判断才成立。
 	//
