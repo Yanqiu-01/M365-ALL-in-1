@@ -100,6 +100,41 @@ func TestPreferProvenExitsRanksMemoryAboveScheme(t *testing.T) {
 	}
 }
 
+// 配额用尽的出口要排到最后 —— 但必须仍然在候选里。
+//
+// 它是好出口（过了 CF），只是今天不能再注册。排最前面会让整批号都先撞一次必然失败的
+// 注册；直接删掉则会在池子全用完时得出「没有可用出口」这种自己编的结论。
+func TestPreferProvenExitsSinksQuotaUsedExitsToTheEnd(t *testing.T) {
+	ResetExitMemory()
+	in := []string{"http://used:1", "http://failed:2", "http://unknown:3", "http://ok:4"}
+	NoteExitTurnstileOK("http://used:1")
+	NoteExitQuotaUsed("http://used:1")
+	NoteExitTurnstileFailed("http://failed:2")
+	NoteExitTurnstileOK("http://ok:4")
+
+	out := PreferProvenExits(in)
+	want := []string{"http://ok:4", "http://unknown:3", "http://failed:2", "http://used:1"}
+	if !reflect.DeepEqual(out, want) {
+		t.Fatalf("PreferProvenExits = %v, want %v", out, want)
+	}
+	if len(out) != len(in) {
+		t.Fatalf("配额用尽的出口被移出了候选：%v", out)
+	}
+}
+
+// 配额优先于「刚过 CF」：成功注册会同时记两条，排序必须听配额那条。
+func TestQuotaUsedOutranksRecentSuccess(t *testing.T) {
+	ResetExitMemory()
+	NoteExitTurnstileOK("http://x:1")
+	if got := exitRank("http://x:1"); got != 0 {
+		t.Fatalf("成功后 rank=%d, want 0", got)
+	}
+	NoteExitQuotaUsed("http://x:1")
+	if got := exitRank("http://x:1"); got != 3 {
+		t.Fatalf("配额用尽后 rank=%d, want 3", got)
+	}
+}
+
 func TestExitMemoryIgnoresBlankAndShortLists(t *testing.T) {
 	ResetExitMemory()
 	NoteExitTurnstileOK("   ")

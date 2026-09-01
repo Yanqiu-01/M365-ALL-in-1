@@ -22,11 +22,18 @@ import (
 const (
 	exitMemoryTTL      = 30 * time.Minute
 	exitMemoryMaxItems = 512
+	// exitQuotaTTL 对齐站点的 ipRules 窗口（windowSeconds: 86400，每 IP 每天 1 次）。
+	//
+	// 用掉配额的出口和「过不了 CF」的出口性质不同：它其实是好出口，只是今天不能再注册
+	// 了。所以它既不该排在最前面（会把重试额度浪费在必然失败的注册上），也不该只压 30
+	// 分钟就放回来 —— 那样一整批号会反复撞同一批已用完的出口。
+	exitQuotaTTL = 24 * time.Hour
 )
 
 type exitOutcome struct {
-	okAt     time.Time
-	failedAt time.Time
+	okAt        time.Time
+	failedAt    time.Time
+	quotaUsedAt time.Time
 }
 
 var exitMemory struct {
@@ -60,10 +67,24 @@ func exitMemoryEntry(raw string) *exitOutcome {
 
 func pruneExitMemoryLocked() {
 	cutoff := time.Now().Add(-exitMemoryTTL)
+	quotaCutoff := time.Now().Add(-exitQuotaTTL)
 	for k, v := range exitMemory.byExit {
-		if v.okAt.Before(cutoff) && v.failedAt.Before(cutoff) {
+		if v.okAt.Before(cutoff) && v.failedAt.Before(cutoff) && v.quotaUsedAt.Before(quotaCutoff) {
 			delete(exitMemory.byExit, k)
 		}
+	}
+}
+
+// NoteExitQuotaUsed 记下这个出口今天的注册配额已经用掉了。
+//
+// 成功注册之后要调这个：出口本身是好的（它刚过了 CF），但站点的 ipRules 是每 IP 每天
+// 1 次，再拿它注册必然回「已达上限」。不记的话，PreferProvenExits 会把它当成「刚验证过
+// 的好出口」排在最前面，于是整批号都会先撞一次必然失败的注册。
+func NoteExitQuotaUsed(raw string) {
+	exitMemory.Lock()
+	defer exitMemory.Unlock()
+	if entry := exitMemoryEntry(raw); entry != nil {
+		entry.quotaUsedAt = time.Now()
 	}
 }
 
@@ -102,7 +123,15 @@ func exitSchemeRank(raw string) int {
 	return 0
 }
 
-// exitRank 越小越先试：0 = 近期过过 CF，1 = 没记录，2 = 近期失败过。
+// exitRank 越小越先试：
+//
+//	0 = 近期过过 CF 且今天还有配额（最该先用）
+//	1 = 没记录
+//	2 = 近期在 CF 这一关失败过
+//	3 = 今天的注册配额已经用掉（好出口，但今天再试必然回「已达上限」）
+//
+// 配额用尽排在最后而不是直接排除：万一整个池子都用完了，它仍然要出现在候选里，让调用方
+// 得到站点的真实回复，而不是「没有可用出口」这种自己编的结论。
 func exitRank(raw string) int {
 	exitMemory.Lock()
 	defer exitMemory.Unlock()
@@ -110,7 +139,11 @@ func exitRank(raw string) int {
 	if entry == nil {
 		return 1
 	}
-	cutoff := time.Now().Add(-exitMemoryTTL)
+	now := time.Now()
+	if entry.quotaUsedAt.After(now.Add(-exitQuotaTTL)) {
+		return 3
+	}
+	cutoff := now.Add(-exitMemoryTTL)
 	if entry.okAt.After(cutoff) {
 		return 0
 	}

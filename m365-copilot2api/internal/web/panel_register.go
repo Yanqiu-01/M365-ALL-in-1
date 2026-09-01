@@ -182,8 +182,12 @@ func (s *Server) runRegister(ctx context.Context, manager *nativePanelManager, r
 			fmt.Sprintf("出口 %s 求解器用不了（容器里的 FlareSolverr 连不上回环地址和 socks5 出口），Turnstile 可能解不出来", redactExitForNote(p)))
 	}
 	rotateReq := exitrotate.Request{
-		Mode:        mode,
-		PhoneSOCKS:  cfg.Register.PhoneSOCKS,
+		Mode:       mode,
+		PhoneSOCKS: cfg.Register.PhoneSOCKS,
+		// adb 的路径必须带上：exitrotate 拿不到配置就只执行 PATH 上的 "adb"，而
+		// Windows 上它通常装在 WinGet 包目录里、并不在 PATH，于是 phone 模式每次
+		// 换 IP 都以「adb 找不到」失败，整批注册从第二个号起全部报错。
+		ADB:         cfg.Register.ADB,
 		ClashAPI:    cfg.Register.ClashAPI,
 		ClashSecret: cfg.Register.ClashSecret,
 		ClashGroup:  cfg.Register.ClashGroup,
@@ -267,40 +271,90 @@ func (s *Server) runRegister(ctx context.Context, manager *nativePanelManager, r
 			if ip, err := probeRegisterIP(probeCtx, proxyURL); err == nil {
 				item.IP = ip
 				lastIP = ip
+			} else {
+				// 探测失败就必须把 lastIP 清掉，不能留着上一个号的地址。
+				//
+				// 它会作为 PrevIP 交给 exitrotate，而 rotatePhone 有一条捷径：当前 IP
+				// 与 PrevIP 不同就直接判定「出口已经变了」，连飞行模式都不切。留着过期
+				// 的地址，这条捷径就会在「其实没换」的时候成立 —— 实测 5856 号探测失败、
+				// lastIP 停在上一个号的 IP，于是 5857 号复用了 5856 刚用掉配额的那个 IP，
+				// 直接撞上「当前 IP 在 1 天内注册次数已达上限」。
+				//
+				// 清成空串反而是安全的：PrevIP 为空时 rotatePhone 不走捷径，一定真的切一次。
+				lastIP = ""
 			}
 			probeCancel()
-			if p := strings.TrimSpace(proxyURL); p != "" {
+			// phone 模式记的是实际出口 IP，不是代理地址：本机 SOCKS 地址每轮都一样，
+			// 记它只会得到「已换 3 个出口：127.0.0.1:1081、127.0.0.1:1081、…」这种
+			// 看不出任何信息的报告。真正变的是运营商下发的地址。
+			if mode == "phone" {
+				if ip := strings.TrimSpace(item.IP); ip != "" {
+					triedExits = append(triedExits, ip)
+				}
+			} else if p := strings.TrimSpace(proxyURL); p != "" {
 				triedExits = append(triedExits, redactExitForNote(p))
 			}
 			outcome, outcomeErr = completeRegister(ctx, cfg, request.TurnstileToken, proxyURL, display, username)
 			// 记下这个出口在 Turnstile 这一关的表现，只用来决定下一次先试谁。
 			// 出口是否可用由代理池自己判断，这里不碰它的状态，也不动用户的列表。
 			if p := strings.TrimSpace(proxyURL); p != "" {
-				if outcomeErr == nil || !turnstile.ExitAttributable(outcomeErr) {
-					// 走到站点侧回话（成功，或「邮箱已注册」这类业务错误）就说明这个出口
+				switch {
+				case outcomeErr == nil:
+					// 成功了：这个出口确实过了 CF，但它今天的注册配额也用掉了
+					// （站点 ipRules 每 IP 每天 1 次），下一个号不该再从它开始。
+					turnstile.NoteExitTurnstileOK(p)
+					turnstile.NoteExitQuotaUsed(p)
+				case turnstile.ExitQuotaExhausted(outcomeErr):
+					// 站点亲口说这个 IP 今天用完了。它过了 CF，所以不是坏出口，
+					// 只是今天不能再用。
+					turnstile.NoteExitTurnstileOK(p)
+					turnstile.NoteExitQuotaUsed(p)
+				case !turnstile.ExitAttributable(outcomeErr):
+					// 走到站点侧回话（例如「邮箱已注册」这类业务错误）就说明这个出口
 					// 确实过了 CF —— 那正是下一个号该优先用的出口。
 					turnstile.NoteExitTurnstileOK(p)
-				} else {
+				default:
 					turnstile.NoteExitTurnstileFailed(p)
 				}
 			}
 			if outcomeErr == nil {
 				break
 			}
-			// 换出口只对 proxy 模式有意义：phone/clash 模式的出口由外部设备或 Clash
-			// 控制，这里手上没有可切换的候选列表。
-			if mode != "proxy" || !turnstile.ExitAttributable(outcomeErr) {
+			if !turnstile.ExitAttributable(outcomeErr) || attempts >= registerExitAttempts || ctx.Err() != nil {
 				break
 			}
-			next := nextExitAfter(poolURLs, proxyURL)
-			if next == "" || attempts >= registerExitAttempts {
+			// 怎么换出口按模式分：
+			//
+			// phone  手机自己就是一个可无限轮换的出口 —— 切一次飞行模式运营商就下发新
+			//        地址（实测整段 /64 都变）。所以这个号不必判死，换个 IP 再试一次。
+			//        本机 SOCKS 地址不变，proxyURL 保持原样。
+			// proxy  按池子里的顺序推进到下一个出口。
+			// clash  节点由 Clash 侧控制，这里不介入，保持原有的「立即返回」。
+			retried := false
+			switch mode {
+			case "phone":
+				rotateReq.PrevIP = lastIP
+				rotated, rotateErr := rotateExit(ctx, rotateReq)
+				report.Rotate = &rotated
+				if rotated.IP != "" {
+					lastIP = rotated.IP
+				}
+				// 只有确实换到新 IP 才值得重试：IP 没变就是在同一个出口上撞同一面墙。
+				retried = rotateErr == nil && rotated.Changed
+				if rotateErr != nil {
+					report.Notes = append(report.Notes,
+						fmt.Sprintf("第 %d 号重试前换手机 IP 失败：%v", num, rotateErr))
+				}
+			case "proxy":
+				if next := nextExitAfter(poolURLs, proxyURL); next != "" {
+					proxyURL = next
+					exitTurn++
+					retried = true
+				}
+			}
+			if !retried {
 				break
 			}
-			if ctx.Err() != nil {
-				break
-			}
-			proxyURL = next
-			exitTurn++
 		}
 		if outcomeErr != nil {
 			item.Status = "failed"
@@ -320,6 +374,26 @@ func (s *Server) runRegister(ctx context.Context, manager *nativePanelManager, r
 				if next := nextExitAfter(poolURLs, proxyURL); next != "" {
 					proxyURL = next
 					exitTurn++
+				}
+			}
+			// phone 模式同理，但只在错误确实指向出口时才换。
+			//
+			// 循环退出前的最后一步一定是一次失败的尝试（换 IP 之后必然还会再试一次），
+			// 所以这里换一次不会和重试循环重复；不换的话下一个号会从刚刚失败的那个运营
+			// 商 IP 开始。
+			//
+			// 反过来，「该邮箱已被注册」这类站点侧业务错误跟出口无关：这个 IP 又好又没用
+			// 掉当天额度，为它切一次飞行模式要白等十几秒，还把一个能用的出口换掉了。
+			if mode == "phone" && i < count-1 && turnstile.ExitAttributable(outcomeErr) {
+				rotateReq.PrevIP = lastIP
+				if rotated, rotateErr := rotateExit(ctx, rotateReq); rotateErr == nil {
+					report.Rotate = &rotated
+					if rotated.IP != "" {
+						lastIP = rotated.IP
+					}
+				} else {
+					report.Notes = append(report.Notes,
+						fmt.Sprintf("第 %d 号失败后换手机 IP 失败：%v；下一个号可能仍从同一 IP 注册", num, rotateErr))
 				}
 			}
 			continue

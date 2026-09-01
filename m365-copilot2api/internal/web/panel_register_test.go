@@ -3,6 +3,7 @@ package web
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -251,6 +252,47 @@ func TestRunRegisterRotatesOnlyAfterSuccessfulWrite(t *testing.T) {
 	}
 }
 
+// 探测失败时不能把上一个号的 IP 当成 PrevIP 交出去。
+//
+// rotatePhone 有一条捷径：当前 IP 与 PrevIP 不同就直接认为「出口已经换了」，连飞行模式都
+// 不切。所以 PrevIP 一旦是过期的地址，这条捷径会在其实没换的时候成立。实测就是这样丢掉一
+// 个号的：5856 号探测失败、lastIP 停在上一个号的地址，5857 号于是复用了 5856 刚刚用掉当日
+// 配额的那个 IP，直接撞上「当前 IP 在 1 天内注册次数已达上限」。
+func TestRunRegisterClearsPrevIPWhenProbeFails(t *testing.T) {
+	var phonePrevIPs []string
+	site := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "upn": "ok"})
+	}))
+	defer site.Close()
+	old := rotateExit
+	t.Cleanup(func() { rotateExit = old })
+	rotateExit = func(ctx context.Context, req exitrotate.Request) (exitrotate.Result, error) {
+		if req.Mode == "proxy" {
+			// 探测这一路失败：手机刚切完飞行模式、网络还没接回来就是这个形态。
+			return exitrotate.Result{}, errors.New("probe failed")
+		}
+		phonePrevIPs = append(phonePrevIPs, req.PrevIP)
+		return exitrotate.Result{OK: true, Mode: req.Mode, IP: "2409:895a:1::1", Changed: true}, nil
+	}
+	root := t.TempDir()
+	writePanelConfig(t, root, site.URL)
+	if _, err := (&Server{}).runRegister(context.Background(), newNativePanelManager(nativePanelConfig{Root: root}), panelRegisterRequest{
+		Mode: "phone", Count: 2, StartNum: 5026, TurnstileToken: "token-from-browser",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(phonePrevIPs) == 0 {
+		t.Fatal("phone rotation never ran")
+	}
+	for i, prev := range phonePrevIPs {
+		if prev != "" {
+			t.Fatalf("rotation %d got stale PrevIP %q, want empty so rotatePhone really switches", i, prev)
+		}
+	}
+}
+
+// 站点回「taken」这类业务错误跟出口无关：这个 IP 既过得了 CF，又没用掉当天的注册额度。
+// 为它切一次飞行模式要白等十几秒，还把一个好出口换掉，所以一次都不该换。
 func TestRunRegisterDoesNotRotateAfterFailure(t *testing.T) {
 	var events []string
 	site := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

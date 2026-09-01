@@ -63,13 +63,25 @@ type Request struct {
 
 var (
 	errUnsupportedMode = errors.New("unsupported exit-rotate mode")
-	ipEndpoints        = []string{
-		"https://api.ipify.org",
+	// icanhazip 放第一个：实测 api.ipify.org 在中国移动的手机出口上连不通（curl 直接
+	// 000），排在前面等于每次探测都先白等一个超时。手机出口是注册的主力，顺序按它来。
+	ipEndpoints = []string{
 		"https://icanhazip.com",
 		"https://ifconfig.me/ip",
+		"https://api.ipify.org",
 	}
 	clashSettle = 3 * time.Second
 	phoneSettle = 3 * time.Second
+	// phoneProbeBudget 是切完飞行模式后等运营商把网络接回来的预算。
+	//
+	// 实测中国移动重新附着要好几秒，phoneSettle(3s) 之后立刻探测基本都超时。而
+	// rotatePhone 把探测失败当成「这一轮没换成」，六轮全失败就返回 Changed=false，
+	// 调用方于是认为换 IP 没生效 —— 而 IP 其实每次都换了。这个预算就是为了别把
+	// 「换成了但还没连上」误判成「没换成」。
+	phoneProbeBudget = 30 * time.Second
+	phoneProbeStep   = 2 * time.Second
+	// probeAttemptTimeout 给单次探测一个上限，否则一次卡死的请求会吃掉整个预算。
+	probeAttemptTimeout = 8 * time.Second
 )
 
 // Rotate 先尝试 Rust CLI，失败再走 Go 实现。
@@ -173,7 +185,8 @@ func rotatePhone(ctx context.Context, req Request) (Result, error) {
 		if err := toggleAirplane(ctx, req.ADB); err != nil {
 			return Result{Mode: "phone", PrevIP: prev, Detail: err.Error()}, err
 		}
-		ip, err = probeIP(ctx, socks)
+		// 关掉飞行模式不等于网络已经回来，要给运营商重新附着的时间再探测。
+		ip, err = probeIPSettled(ctx, socks, phoneProbeBudget)
 		if err != nil {
 			last = err.Error()
 			continue
@@ -322,6 +335,36 @@ func rotateClash(ctx context.Context, req Request) (Result, error) {
 	return Result{OK: true, Mode: "clash", IP: ip, PrevIP: req.PrevIP, Changed: ip != req.PrevIP}, nil
 }
 
+// probeIPSettled 在预算内反复探测，直到拿到出口 IP。
+//
+// 单次探测不够用：手机刚关掉飞行模式时网络还没接回来，这时探测必然失败，而调用方会把
+// 「探测不到」读成「IP 没换」。给每次探测单独的超时，一次卡死的请求就不会吃掉整个预算。
+func probeIPSettled(ctx context.Context, proxyURL string, budget time.Duration) (string, error) {
+	deadline := time.Now().Add(budget)
+	var last error
+	for {
+		attemptCtx, cancel := context.WithTimeout(ctx, probeAttemptTimeout)
+		ip, err := probeIP(attemptCtx, proxyURL)
+		cancel()
+		if err == nil && ip != "" {
+			return ip, nil
+		}
+		if err != nil {
+			last = err
+		}
+		if ctx.Err() != nil || !time.Now().Before(deadline) {
+			break
+		}
+		if werr := wait(ctx, phoneProbeStep); werr != nil {
+			return "", werr
+		}
+	}
+	if last == nil {
+		last = errors.New("exit IP probe failed")
+	}
+	return "", last
+}
+
 func probeIP(ctx context.Context, proxyURL string) (string, error) {
 	client := outbound.HTTPClient()
 	if strings.TrimSpace(proxyURL) != "" {
@@ -351,10 +394,10 @@ func probeIP(ctx context.Context, proxyURL string) (string, error) {
 			last = err
 			continue
 		}
-		if ip := cleanIPv4(string(body)); ip != "" {
+		if ip := cleanExitIP(string(body)); ip != "" {
 			return ip, nil
 		}
-		last = fmt.Errorf("no IPv4 in %s response", endpoint)
+		last = fmt.Errorf("no exit IP in %s response", endpoint)
 	}
 	if last == nil {
 		last = errors.New("exit IP probe failed")
@@ -362,13 +405,19 @@ func probeIP(ctx context.Context, proxyURL string) (string, error) {
 	return "", last
 }
 
-func cleanIPv4(text string) string {
+// cleanExitIP 从探测服务的响应里取出出口地址，IPv4 和 IPv6 都要认。
+//
+// 原先只认 IPv4，这在手机出口上是错的：中国移动的移动网络下发的是 IPv6（实测
+// 2409:895a:… ，中国广东深圳移动）。于是 probeIP 永远返回空，rotatePhone 切了 6 次飞行
+// 模式仍然判定「探测失败」，最后报 OK:false —— 而 IP 其实每次都换了。手机出口是绕开站点
+// 「每 IP 每天 1 次」限制的关键，不能因为地址族判错而报废。
+func cleanExitIP(text string) string {
 	text = strings.TrimSpace(text)
 	if i := strings.IndexAny(text, "\r\n \t"); i > 0 {
 		text = text[:i]
 	}
 	ip := net.ParseIP(text)
-	if ip == nil || ip.To4() == nil {
+	if ip == nil {
 		return ""
 	}
 	return ip.String()

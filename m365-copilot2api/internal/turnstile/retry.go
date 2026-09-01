@@ -23,6 +23,33 @@ func ExitAttributable(err error) bool {
 	return exitAttributableText(err.Error())
 }
 
+// ExitQuotaExhausted 判断站点是不是在说「这个 IP 今天的注册配额用完了」。
+//
+// 和 ExitAttributable 分开：两者都要换出口，但含义不同。配额用尽说明这个出口其实是好的
+// （它过了 CF、走到了站点侧），只是今天不能再注册 —— 调用方应该把它记成「今天别再用」，
+// 而不是记成「过不了 CF」。记错了，明天它会被无谓地排到最后。
+func ExitQuotaExhausted(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "已达上限") || strings.Contains(msg, "注册次数") {
+		return true
+	}
+	lower := strings.ToLower(msg)
+	if !strings.Contains(lower, "ip") {
+		return false
+	}
+	// 「已注册」「今日」只在外层已经确认文案里有 IP 时才参与判断，所以不会把
+	// 「该邮箱地址已被注册」误判成配额问题 —— 那条里没有 IP。
+	for _, k := range []string{"上限", "次数", "限制", "频繁", "太快", "已注册", "今日", "limit", "quota", "too many", "rate"} {
+		if strings.Contains(msg, k) || strings.Contains(lower, k) {
+			return true
+		}
+	}
+	return false
+}
+
 func exitAttributableText(msg string) bool {
 	if strings.TrimSpace(msg) == "" {
 		return false
@@ -54,6 +81,21 @@ func exitAttributableText(msg string) bool {
 		"没能通过当前出口加载", // challenges.cloudflare.com 起不来
 		"换一个出口",      // 求解器自己就在建议换出口
 		"求解器用不了",     // 出口类型后端不支持
+		// 站点侧按 IP 判的规则，全都是「换个 IP 就可能过」：
+		//
+		// 「当前 IP 在 1 天 内注册次数已达上限」—— ipRules 是每 IP 每天 1 次。这条原先
+		// 匹配不上：关键词写的是「限制」，而站点文案是「已达上限」，于是四个号（5834、
+		// 5840、5847、5853）一次都没换出口就判死了。
+		//
+		// 「当前地区暂不支持注册」—— geoip 只放行 CN/HK/MO/TW。换出口就是换地区，这条
+		// 原先完全没匹配上，同样白白判死。
+		"已达上限",
+		"注册次数",
+		"地区暂不支持",
+		"暂不支持注册",
+		// 站点连 sitekey 都没下发，通常就是这个出口被站点或 CF 拒了。
+		"没有下发 Turnstile sitekey",
+		"该出口被拒",
 	} {
 		if strings.Contains(msg, retry) {
 			return true
@@ -81,7 +123,7 @@ func exitAttributableText(msg string) bool {
 	// 只在同时出现 ip/频繁/太快 这类信号时才认，避免把「用户名已被注册」误判成
 	// 可以换出口解决 —— 那个换出口没有用。
 	if strings.Contains(lower, "ip") || strings.Contains(msg, "频繁") || strings.Contains(msg, "太快") {
-		for _, limit := range []string{"限制", "已注册", "超出", "过于", "频繁", "太快", "limit", "rate", "too many", "quota"} {
+		for _, limit := range []string{"限制", "上限", "次数", "已注册", "超出", "过于", "频繁", "太快", "limit", "rate", "too many", "quota"} {
 			if strings.Contains(msg, limit) || strings.Contains(lower, limit) {
 				return true
 			}

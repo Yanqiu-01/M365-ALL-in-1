@@ -10,12 +10,20 @@ import (
 	"testing"
 )
 
-func TestCleanIPv4(t *testing.T) {
-	if got := cleanIPv4(" 1.2.3.4\n"); got != "1.2.3.4" {
+func TestCleanExitIP(t *testing.T) {
+	if got := cleanExitIP(" 1.2.3.4\n"); got != "1.2.3.4" {
 		t.Fatalf("got %q", got)
 	}
-	if got := cleanIPv4("<html>429</html>"); got != "" {
+	if got := cleanExitIP("<html>429</html>"); got != "" {
 		t.Fatalf("garbage should be empty, got %q", got)
+	}
+	// 手机出口实测下发的就是 IPv6。只认 IPv4 会让 rotatePhone 永远判定「探测失败」，
+	// 即使飞行模式其实已经把 IP 换掉了。
+	if got := cleanExitIP("2409:895a:3074:8126:7522:24e8:691d:9fc9\n"); got != "2409:895a:3074:8126:7522:24e8:691d:9fc9" {
+		t.Fatalf("IPv6 出口地址被丢掉了，got %q", got)
+	}
+	if got := cleanExitIP("::1"); got != "::1" {
+		t.Fatalf("got %q", got)
 	}
 }
 

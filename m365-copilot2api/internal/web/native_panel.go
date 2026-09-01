@@ -170,6 +170,11 @@ type nativePanelFileConfig struct {
 		DisplayBase    int               `json:"display_base"`
 		CredentialFile string            `json:"cred_file"`
 		PhoneSOCKS     string            `json:"phone_socks"`
+		// ADB 是 adb 可执行文件的路径。phone 模式靠它切飞行模式换运营商 IP，而
+		// exitrotate 在找不到配置时只会执行 PATH 上的 "adb" —— Windows 上 adb 通常
+		// 装在 WinGet 的包目录里并不在 PATH，于是每次换 IP 都以「adb 找不到」失败，
+		// 整批注册在第二个号就断掉。配置里必须能钉住绝对路径。
+		ADB            string            `json:"adb"`
 		ClashAPI       string            `json:"clash_api"`
 		ClashSecret    string            `json:"clash_secret"`
 		ClashGroup     string            `json:"clash_group"`
@@ -236,6 +241,7 @@ type nativePanelRegisterConfigRequest struct {
 	EmailStartNum   int    `json:"emailStartNum"`
 	FlareSolverrURL string `json:"flaresolverrUrl"`
 	PhoneSOCKS      string `json:"phoneSocks"`
+	ADB             string `json:"adb"`
 	ClashAPI        string `json:"clashApi"`
 	ClashSecret     string `json:"clashSecret"`
 	ClashGroup      string `json:"clashGroup"`
@@ -278,6 +284,9 @@ func (m *nativePanelManager) saveRegisterConfig(req nativePanelRegisterConfigReq
 	}
 	if v := strings.TrimSpace(req.PhoneSOCKS); v != "" {
 		cfg.Register.PhoneSOCKS = v
+	}
+	if v := strings.TrimSpace(req.ADB); v != "" {
+		cfg.Register.ADB = v
 	}
 	if v := strings.TrimSpace(req.ClashAPI); v != "" {
 		cfg.Register.ClashAPI = strings.TrimRight(v, "/")
@@ -538,6 +547,7 @@ func (m *nativePanelManager) state(server *Server) map[string]any {
 	// 「clash api, group and node are required」失败，第二个账号起全部报「上一号
 	// 已写入本地，但换 IP 失败」，而用户在界面上找不到任何能填这些值的地方。
 	state["phone_socks"] = strings.TrimSpace(cfg.Register.PhoneSOCKS)
+	state["adb"] = strings.TrimSpace(cfg.Register.ADB)
 	state["clash_api"] = strings.TrimSpace(cfg.Register.ClashAPI)
 	state["clash_group"] = strings.TrimSpace(cfg.Register.ClashGroup)
 	state["clash_proxy"] = strings.TrimSpace(cfg.Register.ClashProxy)
