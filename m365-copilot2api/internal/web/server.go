@@ -2126,6 +2126,8 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	// Ask the upstream model to select and validate the next tool. The gateway
 	// remains tool-agnostic; it only validates and serializes the decision.
 	if planningMode == "router" && len(toolMaps) > 0 && fmt.Sprint(body.ToolChoice) != "none" {
+		routerIntent := toolIntentLikely(latestUserIntent(body.Messages, prompt), toolMaps)
+		routerOutcome := newRouterOutcome(requestID, "router", len(toolMaps), body.ToolChoice, routerIntent)
 		routePrompt := modelToolRouterPrompt(routerPromptMessages(body.Messages)+"\n"+ledger.RouterContext(), toolMaps, body.ToolChoice)
 		// routerChatWithFailover already retries a connect-stage transport
 		// failure on a different healthy account and a different outbound exit.
@@ -2141,6 +2143,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		// 账号健康度由 routerChatWithFailover 内部按尝试逐次记账。
 		recordRouterFrames(routerFrameInput{RequestID: requestID, Stage: "router", Prompt: routePrompt, Text: routeRes.Text, Reasoning: routeRes.Reasoning, Events: routeRes.Events, Err: routeErr})
 		if routeErr != nil {
+			routerOutcome.record("initial", "router_error")
 			// 带阶段标注，便于区分握手被拒 / 读超时 / 中途断流。
 			msg := upstreamStageError("router", routeErr)
 			if IsRateLimited(routeErr) {
@@ -2151,11 +2154,13 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		calls, parsed = parseModelToolDecision(routeRes.Text, toolMaps, body.ToolChoice)
+		routerOutcome.observeParsed(parsed, len(calls))
 		if !parsed {
 			repairRes, repairErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: `Repair this tool routing output into JSON only with shape {"calls":[{"name":"function_name","arguments":{}}]}. Do not invent calls; use {"calls":[]} if unrecoverable. OUTPUT:
 ` + compactToolResult(routeRes.Text, 6000), Tone: tone, Attachments: body.Attachments})
 			if repairErr == nil {
 				calls, parsed = parseModelToolDecision(repairRes.Text, toolMaps, body.ToolChoice)
+				routerOutcome.observeParsed(parsed, len(calls))
 			}
 			if !parsed {
 				// 路由器没能给出可解析的决策，这不等于请求失败。
@@ -2168,17 +2173,23 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				// 一次散文回复就把整条对话打死。仅当客户端明确要求必须调用
 				// 工具时，无法给出决策才是真正的失败。
 				if toolChoiceRequiresToolCall(body.ToolChoice) {
+					routerOutcome.record("repair", "parser_failure")
 					log.Printf("[req-trace] id=%s stage=router_undecidable choice=required", requestID)
 					writeOpenAIError(w, http.StatusBadGateway, "router_error", "model did not return a parsable tool decision while tool_choice required a call")
 					return
 				}
 				log.Printf("[req-trace] id=%s stage=router_undecidable fallback=answer text_len=%d", requestID, len(routeRes.Text))
+				routerOutcome.record("repair", "parser_failure")
 				calls, parsed = nil, true
+				routerOutcome.observeParsed(true, 0)
 			}
 		}
 		calls = filterCompletedCalls(calls, ledger)
-		calls, _ = validateCalls("router", calls)
+		postLedger := len(calls)
+		calls, rejected := validateCalls("router", calls)
+		routerOutcome.observeValidated(postLedger, len(calls), rejected)
 		if len(calls) > 0 {
+			routerOutcome.record("validated", "emitted_tool_calls")
 			scope := fmt.Sprintf("%d:%v", len(body.Messages), completedCallIDs(ledger))
 			for i := range calls {
 				calls[i].ID = scopedCallID(calls[i].Name, string(calls[i].Arguments), i, scope)
@@ -2199,7 +2210,8 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			s.bindConversation(acc, &body, r, bindRes, prompt, startedAt)
 			return
 		}
-		if len(calls) == 0 && normalizedToolChoiceMode(body.ToolChoice) == "auto" && toolIntentLikely(latestUserIntent(body.Messages, prompt), toolMaps) {
+		if len(calls) == 0 && normalizedToolChoiceMode(body.ToolChoice) == "auto" && routerIntent {
+			routerOutcome.record("validated", "intent_retry")
 			// A concrete action request deserves one constrained retry even in auto
 			// mode. This is the narrow repair path that avoids forcing tools for
 			// ordinary informational questions.
@@ -2211,9 +2223,13 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			}
 			if retryErr == nil {
 				calls, parsed = parseModelToolDecision(retryRes.Text, toolMaps, "required")
+				routerOutcome.observeParsed(parsed, len(calls))
 				calls = filterCompletedCalls(calls, ledger)
-				calls, _ = validateCalls("router-intent-retry", calls)
+				postLedger := len(calls)
+				calls, rejected := validateCalls("router-intent-retry", calls)
+				routerOutcome.observeValidated(postLedger, len(calls), rejected)
 				if parsed && len(calls) > 0 {
+					routerOutcome.record("intent_retry", "emitted_tool_calls")
 					scope := fmt.Sprintf("%d:%v:intent-retry", len(body.Messages), completedCallIDs(ledger))
 					for i := range calls {
 						calls[i].ID = scopedCallID(calls[i].Name, string(calls[i].Arguments), i, scope)
@@ -2231,6 +2247,11 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 			}
+		}
+		if normalizedToolChoiceMode(body.ToolChoice) == "auto" && routerIntent {
+			routerOutcome.record("intent_retry", "retry_exhausted")
+		} else if !toolChoiceRequiresToolCall(body.ToolChoice) {
+			routerOutcome.record("validated", "ordinary_answer_fallback")
 		}
 		if fmt.Sprint(body.ToolChoice) == "required" {
 			defs, _ := json.Marshal(toolMaps)
@@ -2268,6 +2289,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 			// 给出了可用的文字答案，直接失败会把整轮对话丢掉。降级为普通回答，
 			// 让客户端自行决定是否重试，比返回 502 更接近 OpenAI 的语义。
 			log.Printf("[req-trace] id=%s stage=router_required_exhausted fallback=answer", requestID)
+			routerOutcome.record("required_retry", "retry_exhausted")
 		}
 	}
 	answerReq := buildAnswerRequest(answerPrompt, tone, body, ledger, planningMode)
