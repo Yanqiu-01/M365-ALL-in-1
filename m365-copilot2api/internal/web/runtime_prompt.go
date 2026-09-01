@@ -76,8 +76,9 @@ func describeRuntimeHost(goos, goarch string) string {
 			"treat it as the project root and write there directly.", goarch)
 	case "windows":
 		return fmt.Sprintf("Host: Windows/%s, the user's own PC. "+
-			"The shell is PowerShell, so POSIX-only commands are unavailable: use Get-ChildItem instead of ls, "+
-			"Get-Content instead of cat, Get-Location instead of pwd, and $env:NAME instead of $NAME.", goarch)
+			"The shell is PowerShell, and local or mapped paths such as C:\\ and E:\\ refer to the caller's real filesystem. "+
+			"POSIX-only commands are unavailable: use Get-ChildItem instead of ls, Get-Content instead of cat, "+
+			"Get-Location instead of pwd, and $env:NAME instead of $NAME.", goarch)
 	case "linux":
 		return fmt.Sprintf("Host: Linux/%s. This may be a PC or a phone running RikkaHub under proot; "+
 			"either way it is a real filesystem with a POSIX shell.", goarch)
@@ -101,17 +102,43 @@ func probeInstructions(goos string) string {
 		"- `test -e <path>` before assuming a file or directory exists"
 }
 
-// ensureRuntimeWorkspaceInstruction 把环境说明放在消息列表最前。已有同一条
-// marker 时不重复插入,避免 previous_response_id / 多轮工具调用把提示词堆叠。
+// ensureRuntimeWorkspaceInstruction 把当前运行时环境说明放在消息列表最前。
+// previous_response_id、目标 continuation 和子代理历史可能带有旧版环境说明,
+// 因此命中 marker 时刷新该说明,不能沿用声称 Linux /mnt/data 的旧文本。
 func ensureRuntimeWorkspaceInstruction(messages []oaiMsg) []oaiMsg {
 	instruction := runtimeWorkspaceInstruction()
+	out := make([]oaiMsg, 0, len(messages)+1)
+	out = append(out, oaiMsg{Role: "system", Content: instruction})
 	for _, message := range messages {
 		if strings.EqualFold(strings.TrimSpace(message.Role), "system") &&
 			strings.Contains(fmt.Sprint(message.Content), runtimeWorkspaceMarker) {
-			return messages
+			continue
 		}
+		out = append(out, message)
 	}
-	out := make([]oaiMsg, 0, len(messages)+1)
-	out = append(out, oaiMsg{Role: "system", Content: instruction})
-	return append(out, messages...)
+	return out
+}
+
+// attachRuntimeIdentityToIncrement re-prepends the runtime-marker system message
+// onto an incremental answer prompt. Session Bind stores the injected system at
+// index 0, so HistoryLen slices it off on turn 2+; without this, ChatHub only
+// sees the new user/tool turn and the cloud identity (Linux sandbox) reasserts.
+// Only the gateway runtime marker is re-attached — not the caller's full harness.
+func attachRuntimeIdentityToIncrement(answerPrompt string) string {
+	answerPrompt = strings.TrimSpace(answerPrompt)
+	if answerPrompt == "" {
+		return answerPrompt
+	}
+	if strings.Contains(answerPrompt, runtimeWorkspaceMarker) {
+		return answerPrompt
+	}
+	identity, _ := flattenPromptMessages([]oaiMsg{{
+		Role:    "system",
+		Content: runtimeWorkspaceInstruction(),
+	}}, nil)
+	identity = strings.TrimSpace(identity)
+	if identity == "" {
+		return answerPrompt
+	}
+	return identity + "\n\n" + answerPrompt
 }

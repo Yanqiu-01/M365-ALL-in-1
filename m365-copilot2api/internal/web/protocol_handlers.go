@@ -1,9 +1,9 @@
 package web
 
 import (
-	"context"
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -86,14 +86,50 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 	emit("response.created", map[string]any{"type": "response.created", "response": map[string]any{"id": id, "object": "response", "status": "in_progress", "model": model, "output": []any{}}})
 
 	var text strings.Builder
+	var reasoning strings.Builder
 	messageID := "msg_" + uuid.NewString()
 	contentID := "txt_" + uuid.NewString()
-	textStarted := false
+	reasoningID := "rs_" + uuid.NewString()
 	type tcState struct {
 		ID, Name, Args, Type string
 		ItemID               string
+		OutputIndex          int
 	}
+	type outputEntry struct {
+		Kind      string
+		CallIndex int
+		Index     int
+	}
+	entries := make([]outputEntry, 0, 2)
+	nextOutputIndex := 0
+	addEntry := func(kind string, callIndex int) outputEntry {
+		entry := outputEntry{Kind: kind, CallIndex: callIndex, Index: nextOutputIndex}
+		nextOutputIndex++
+		entries = append(entries, entry)
+		return entry
+	}
+	reasoningEntry := outputEntry{Index: -1}
+	messageEntry := outputEntry{Index: -1}
 	calls := map[int]*tcState{}
+	ensureReasoning := func() outputEntry {
+		if reasoningEntry.Index >= 0 {
+			return reasoningEntry
+		}
+		reasoningEntry = addEntry("reasoning", -1)
+		_ = emit("response.output_item.added", map[string]any{
+			"type": "response.output_item.added", "output_index": reasoningEntry.Index,
+			"item": map[string]any{
+				"type": "reasoning", "id": reasoningID, "status": "in_progress",
+				"summary": []any{map[string]any{"type": "summary_text", "text": ""}},
+			},
+		})
+		_ = emit("response.reasoning_summary_part.added", map[string]any{
+			"type": "response.reasoning_summary_part.added", "output_index": reasoningEntry.Index,
+			"summary_index": 0, "item_id": reasoningID,
+			"part": map[string]any{"type": "summary_text", "text": ""},
+		})
+		return reasoningEntry
+	}
 	scanner := bufio.NewScanner(pr)
 	scanner.Buffer(make([]byte, 4096), 2<<20)
 	for scanner.Scan() {
@@ -114,13 +150,24 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 		}
 		choice, _ := choices[0].(map[string]any)
 		delta, _ := choice["delta"].(map[string]any)
+		if reasoningDelta, ok := delta["reasoning_content"].(string); ok && reasoningDelta != "" {
+			reasoning.WriteString(reasoningDelta)
+			entry := ensureReasoning()
+			// Emit this at the moment the upstream delta arrives. Codex derives
+			// thinking time from the real spacing between reasoning events; waiting
+			// until response.completed makes that duration indistinguishable from 0.
+			_ = emit("response.reasoning_summary_text.delta", map[string]any{
+				"type": "response.reasoning_summary_text.delta", "output_index": entry.Index,
+				"summary_index": 0, "item_id": reasoningID, "delta": reasoningDelta,
+			})
+		}
 		if content, ok := delta["content"].(string); ok && content != "" {
 			text.WriteString(content)
-			if !textStarted {
-				textStarted = true
-				emit("response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": 0, "item": map[string]any{"type": "message", "id": messageID, "role": "assistant", "status": "in_progress", "content": []any{map[string]any{"type": "output_text", "id": contentID, "text": "", "annotations": []any{}}}}})
+			if messageEntry.Index < 0 {
+				messageEntry = addEntry("message", -1)
+				_ = emit("response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": messageEntry.Index, "item": map[string]any{"type": "message", "id": messageID, "role": "assistant", "status": "in_progress", "content": []any{map[string]any{"type": "output_text", "id": contentID, "text": "", "annotations": []any{}}}}})
 			}
-			emit("response.output_text.delta", map[string]any{"type": "response.output_text.delta", "output_index": 0, "content_index": 0, "item_id": messageID, "delta": content})
+			_ = emit("response.output_text.delta", map[string]any{"type": "response.output_text.delta", "output_index": messageEntry.Index, "content_index": 0, "item_id": messageID, "delta": content})
 		}
 		if rawCalls, ok := delta["tool_calls"].([]any); ok {
 			for _, raw := range rawCalls {
@@ -146,10 +193,11 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 						prefix = "ctc_"
 						item = map[string]any{"type": "custom_tool_call", "call_id": "", "name": "", "input": "", "status": "in_progress"}
 					}
-					st = &tcState{ItemID: prefix + uuid.NewString(), Type: typ}
+					entry := addEntry("tool", idx)
+					st = &tcState{ItemID: prefix + uuid.NewString(), Type: typ, OutputIndex: entry.Index}
 					calls[idx] = st
 					item["id"] = st.ItemID
-					emit("response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": idx, "item": item})
+					_ = emit("response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": st.OutputIndex, "item": item})
 				}
 				if v, ok := tc["id"].(string); ok {
 					st.ID = v
@@ -161,7 +209,7 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 				if v, ok := fn["arguments"].(string); ok {
 					st.Args += v
 					if st.Type != "custom" {
-						emit("response.function_call_arguments.delta", map[string]any{"type": "response.function_call_arguments.delta", "output_index": idx, "item_id": st.ItemID, "delta": v})
+						_ = emit("response.function_call_arguments.delta", map[string]any{"type": "response.function_call_arguments.delta", "output_index": st.OutputIndex, "item_id": st.ItemID, "delta": v})
 					}
 				}
 			}
@@ -202,38 +250,39 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 		})
 		return
 	}
-	output := []any{}
-	if len(calls) > 0 {
-		for i := 0; i < len(calls); i++ {
-			st := calls[i]
+	output := make([]any, nextOutputIndex)
+	for _, entry := range entries {
+		switch entry.Kind {
+		case "reasoning":
+			item := map[string]any{"type": "reasoning", "id": reasoningID, "status": "completed", "summary": []any{map[string]any{"type": "summary_text", "text": reasoning.String()}}}
+			output[entry.Index] = item
+			_ = emit("response.reasoning_summary_text.done", map[string]any{"type": "response.reasoning_summary_text.done", "output_index": entry.Index, "summary_index": 0, "item_id": reasoningID, "text": reasoning.String()})
+			_ = emit("response.reasoning_summary_part.done", map[string]any{"type": "response.reasoning_summary_part.done", "output_index": entry.Index, "summary_index": 0, "item_id": reasoningID, "part": map[string]any{"type": "summary_text", "text": reasoning.String()}})
+			_ = emit("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": entry.Index, "item": item})
+		case "message":
+			item := map[string]any{"type": "message", "id": messageID, "role": "assistant", "status": "completed", "content": []any{map[string]any{"type": "output_text", "id": contentID, "text": text.String(), "annotations": []any{}}}}
+			output[entry.Index] = item
+			_ = emit("response.output_text.done", map[string]any{"type": "response.output_text.done", "output_index": entry.Index, "content_index": 0, "item_id": messageID, "text": text.String()})
+			_ = emit("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": entry.Index, "item": item})
+		case "tool":
+			st := calls[entry.CallIndex]
 			if st == nil {
 				continue
 			}
 			if st.Type == "custom" {
 				input := customToolInput(st.Args)
 				item := map[string]any{"type": "custom_tool_call", "id": st.ItemID, "call_id": st.ID, "name": st.Name, "input": input, "status": "completed"}
-				output = append(output, item)
-				emit("response.custom_tool_call_input.delta", map[string]any{"type": "response.custom_tool_call_input.delta", "output_index": i, "item_id": item["id"], "delta": input})
-				emit("response.custom_tool_call_input.done", map[string]any{"type": "response.custom_tool_call_input.done", "output_index": i, "item_id": item["id"], "input": input})
-				emit("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": i, "item": item})
+				output[entry.Index] = item
+				_ = emit("response.custom_tool_call_input.delta", map[string]any{"type": "response.custom_tool_call_input.delta", "output_index": entry.Index, "item_id": item["id"], "delta": input})
+				_ = emit("response.custom_tool_call_input.done", map[string]any{"type": "response.custom_tool_call_input.done", "output_index": entry.Index, "item_id": item["id"], "input": input})
+				_ = emit("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": entry.Index, "item": item})
 				continue
 			}
 			item := map[string]any{"type": "function_call", "id": st.ItemID, "call_id": st.ID, "name": st.Name, "arguments": st.Args, "status": "completed"}
-			output = append(output, item)
-			emit("response.function_call_arguments.done", map[string]any{"type": "response.function_call_arguments.done", "output_index": i, "item_id": st.ItemID, "arguments": st.Args})
-			emit("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": i, "item": item})
+			output[entry.Index] = item
+			_ = emit("response.function_call_arguments.done", map[string]any{"type": "response.function_call_arguments.done", "output_index": entry.Index, "item_id": st.ItemID, "arguments": st.Args})
+			_ = emit("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": entry.Index, "item": item})
 		}
-	} else {
-		item := map[string]any{"type": "message", "id": messageID, "role": "assistant", "status": "in_progress", "content": []any{map[string]any{"type": "output_text", "id": contentID, "text": "", "annotations": []any{}}}}
-		output = append(output, item)
-		if !textStarted {
-			emit("response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": 0, "item": item})
-			emit("response.output_text.delta", map[string]any{"type": "response.output_text.delta", "output_index": 0, "content_index": 0, "item_id": messageID, "delta": text.String()})
-		}
-		emit("response.output_text.done", map[string]any{"type": "response.output_text.done", "output_index": 0, "content_index": 0, "item_id": messageID, "text": text.String()})
-		item["status"] = "completed"
-		item["content"] = []any{map[string]any{"type": "output_text", "id": contentID, "text": text.String(), "annotations": []any{}}}
-		emit("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": 0, "item": item})
 	}
 	usageOutput := text.String()
 	for _, call := range calls {
@@ -241,7 +290,26 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 	}
 	estimate := estimateResponsesUsage(model, o.Messages, o.Tools, o.ToolChoice, usageOutput)
 	resp := map[string]any{"id": id, "object": "response", "created_at": created, "status": "completed", "model": model, "output": output, "usage": estimate.Values, "m365": localUsageMetadata(estimate.Source)}
-	emit("response.completed", map[string]any{"type": "response.completed", "response": resp})
+	_ = emit("response.completed", map[string]any{"type": "response.completed", "response": resp})
+
+	stored := cloneResponseMessages(o.Messages)
+	if len(calls) > 0 {
+		converted := make([]map[string]any, 0, len(calls))
+		for _, entry := range entries {
+			if entry.Kind != "tool" {
+				continue
+			}
+			st := calls[entry.CallIndex]
+			if st == nil {
+				continue
+			}
+			converted = append(converted, map[string]any{"id": st.ID, "type": st.Type, "function": map[string]any{"name": st.Name, "arguments": st.Args}})
+		}
+		stored = append(stored, oaiMsg{Role: "assistant", ToolCalls: converted, ReasoningContent: reasoning.String()})
+	} else {
+		stored = append(stored, oaiMsg{Role: "assistant", Content: text.String(), ReasoningContent: reasoning.String()})
+	}
+	s.rememberResponse(extractAPIKey(r), id, stored)
 
 	// 流式 Responses 此前完全不记账：内层被 innerAdapterHeader 挡掉，外层这条
 	// 路径又没有 usage.record，于是走流式的 Codex 请求在用量表里根本不存在。
@@ -358,10 +426,7 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 	}
 	tenant := extractAPIKey(r)
 	if body.PreviousResponseID != "" {
-		s.responseMu.Lock()
-		prior, ok := s.responseMessages[tenant][body.PreviousResponseID]
-		messages := append([]oaiMsg(nil), prior.Messages...)
-		s.responseMu.Unlock()
+		messages, ok := s.loadResponseHistory(tenant, body.PreviousResponseID)
 		if !ok || len(messages) == 0 {
 			writeResponsesError(w, 400, "invalid_request_error", "unknown previous_response_id")
 			return
@@ -409,12 +474,13 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 		Status:      200,
 	})
 	// Retain the normalized history so a subsequent previous_response_id can
-	// validate its function_call_output against the original tool call.
-	if _, ok := out["id"].(string); ok {
-		// Use the same public response id that writeResponsesResult exposes.
+	// validate its function_call_output against the original tool call. Keep
+	// this path identical to streaming Responses, including reasoning content
+	// and the shared retention/eviction policy.
+	if _, ok := out["choices"]; ok {
 		publicID := "resp_" + uuid.NewString()
 		out["m365_response_id"] = publicID
-		stored := append([]oaiMsg(nil), o.Messages...)
+		stored := cloneResponseMessages(o.Messages)
 		if msg, _ := openAIChoice(out); msg != nil {
 			if calls, ok := msg["tool_calls"].([]any); ok && len(calls) > 0 {
 				converted := make([]map[string]any, 0, len(calls))
@@ -423,36 +489,22 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 						converted = append(converted, m)
 					}
 				}
-				stored = append(stored, oaiMsg{Role: "assistant", ToolCalls: converted})
+				stored = append(stored, oaiMsg{
+					Role:             "assistant",
+					ToolCalls:        converted,
+					ReasoningContent: reasoningContent(msg),
+				})
 			} else {
-				if text, _ := msg["content"].(string); text != "" {
-					stored = append(stored, oaiMsg{Role: "assistant", Content: text})
+				if text, _ := msg["content"].(string); text != "" || reasoningContent(msg) != "" {
+					stored = append(stored, oaiMsg{
+						Role:             "assistant",
+						Content:          text,
+						ReasoningContent: reasoningContent(msg),
+					})
 				}
 			}
 		}
-		s.responseMu.Lock()
-		bucket := s.responseMessages[tenant]
-		if bucket == nil {
-			bucket = map[string]respHistory{}
-			s.responseMessages[tenant] = bucket
-		}
-		for k, h := range bucket {
-			if time.Since(h.At) > time.Hour {
-				delete(bucket, k)
-			}
-		}
-		if len(bucket) >= maxResponsesPerTenant {
-			var oldestKey string
-			var oldestAt time.Time
-			for k, h := range bucket {
-				if oldestKey == "" || h.At.Before(oldestAt) {
-					oldestKey, oldestAt = k, h.At
-				}
-			}
-			delete(bucket, oldestKey)
-		}
-		bucket[publicID] = respHistory{At: time.Now(), Messages: stored}
-		s.responseMu.Unlock()
+		s.rememberResponse(tenant, publicID, stored)
 	}
 	writeResponsesResult(w, firstNonEmpty(body.Model, "m365-copilot"), body.Stream, out)
 }

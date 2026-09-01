@@ -1,6 +1,7 @@
 package web
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -107,5 +108,28 @@ func TestEnsureRuntimeWorkspaceInstructionIsIdempotent(t *testing.T) {
 	second := ensureRuntimeWorkspaceInstruction(first)
 	if len(second) != len(first) {
 		t.Errorf("instruction inserted twice: len went %d -> %d", len(first), len(second))
+	}
+}
+
+func TestEnsureRuntimeWorkspaceInstructionRefreshesStaleContinuationContext(t *testing.T) {
+	stale := oaiMsg{Role: "system", Content: "[M365-gateway-runtime] only an isolated Linux workspace /mnt/data is available"}
+	messages := ensureRuntimeWorkspaceInstruction([]oaiMsg{
+		stale,
+		{Role: "user", Content: "continue the active goal in E:\\download"},
+	})
+	if len(messages) != 2 {
+		t.Fatalf("len(messages) = %d, want 2 after replacing stale runtime context", len(messages))
+	}
+	got := fmt.Sprint(messages[0].Content)
+	for _, want := range []string{"M365-gateway-runtime", "user's own PC", "Windows/amd64", "PowerShell", "C:\\", "E:\\"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("refreshed continuation context missing %q", want)
+		}
+	}
+	if strings.Contains(got, "only an isolated Linux workspace") {
+		t.Fatal("stale Linux workspace assertion survived refresh")
+	}
+	if strings.Count(got, "/mnt/data") != 1 || !strings.Contains(got, "uploaded") {
+		t.Fatal("/mnt/data must only be explained as the Copilot upload location")
 	}
 }
