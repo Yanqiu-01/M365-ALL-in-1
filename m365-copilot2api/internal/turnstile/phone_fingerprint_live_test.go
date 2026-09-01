@@ -2,12 +2,15 @@ package turnstile
 
 import (
 	"context"
+	"fmt"
 	"os"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
 
 	"m365-copilot2api/internal/phonecdp"
+	"m365-copilot2api/internal/procwin"
 )
 
 // TestPhoneFingerprintNoiseLive 查 Cromite 是不是在给指纹加噪。
@@ -23,6 +26,39 @@ import (
 //
 //	$env:M365_PHONE_LIVE=1; $env:M365_PHONE_ADB='<adb.exe 绝对路径>'
 //	go test -C <repo> ./internal/turnstile -run TestPhoneFingerprintNoiseLive -v -count=1
+// wipePhoneBrowser 把手机浏览器的数据整个擦掉再拉起来。
+//
+// pm clear 会连 cookie、localStorage、IndexedDB、缓存和各种偏好一起清掉，是「真正干净的
+// profile」唯一可靠的做法 —— CDP 那几个 clear* 命令只能按来源清，永远盖不全。
+// /data/local/tmp/chrome-command-line 不在应用数据里，pm clear 不会动它（实测确认）。
+func wipePhoneBrowser(ctx context.Context, adb string) error {
+	run := func(args ...string) error {
+		cmd := exec.CommandContext(ctx, adb, args...)
+		procwin.HideWindow(cmd)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("%s: %w (%s)", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+		}
+		return nil
+	}
+	if err := run("shell", "pm", "clear", phonecdp.DefaultPackage); err != nil {
+		return err
+	}
+	if err := run("shell", "am", "start", "-n",
+		phonecdp.DefaultPackage+"/"+phonecdp.DefaultActivity,
+		"-a", "android.intent.action.VIEW", "-d", "about:blank"); err != nil {
+		return err
+	}
+	// pm clear 之后浏览器是冷启动，调试 socket 要过几秒才在。EnsureCromite 自己会重试，但
+	// 冷启动比它的预算慢，这里先等一等，省掉一次没必要的失败。
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(12 * time.Second):
+	}
+	return nil
+}
+
 func TestPhoneFingerprintNoiseLive(t *testing.T) {
 	if os.Getenv("M365_PHONE_LIVE") == "" {
 		t.Skip("需要真机；设置 M365_PHONE_LIVE=1 再跑")

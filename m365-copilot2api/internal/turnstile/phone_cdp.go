@@ -102,12 +102,28 @@ func (s *chromeSession) clearProfileState(ctx context.Context, origin string) er
 	_, _ = s.call(ctx, s.sessionID, "Network.clearBrowserCache", map[string]any{})
 	// localStorage/sessionStorage/IndexedDB。origin 为空就跳过 —— 这个命令必须指定来源，
 	// 没有来源可清时不该编一个。
-	if strings.TrimSpace(origin) != "" {
+	//
+	// 除了站点自己，还必须清 challenges.cloudflare.com：Turnstile 把状态存在**它自己的**
+	// 来源下，只清站点等于一次都没清过它。漏掉这一条时，同一个 profile 连着解六次挑战，
+	// 前面失败的痕迹全留着，第七次照样不给 token —— 而现象和「这个出口被判高风险」一模一
+	// 样，会把排查引到代理池上去。
+	//
+	// 站点 origin 清失败只降级（缓存和存储不像 cookie 那样直接把身份带过去），所以这里沿用
+	// 忽略错误的处置；但两个来源都要清。
+	origins := []string{strings.TrimSpace(origin), challengeOrigin}
+	for _, o := range origins {
+		if o == "" {
+			continue
+		}
 		_, _ = s.call(ctx, "", "Storage.clearDataForOrigin",
-			map[string]any{"origin": origin, "storageTypes": "all"})
+			map[string]any{"origin": o, "storageTypes": "all"})
 	}
 	return nil
 }
+
+// challengeOrigin 是 Turnstile 自己的来源。它和注册站点的 origin 是两回事，清状态时两个
+// 都要清 —— 见 clearProfileState。
+const challengeOrigin = "https://challenges.cloudflare.com"
 
 // closeRemote 把接管模式在手机上留下的东西销毁掉。
 //

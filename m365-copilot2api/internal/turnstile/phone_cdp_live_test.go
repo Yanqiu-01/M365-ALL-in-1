@@ -120,8 +120,21 @@ func TestPhoneTurnstileTokenLive(t *testing.T) {
 	}
 	// 比 90 秒宽：awaitTurnstileToken 自己的预算就有一分钟量级，再加接管和首屏，卡到超时
 	// 的话得让它以自己的错误收场，而不是被外层 ctx 掐断成一句无信息的 context deadline。
-	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 240*time.Second)
 	defer cancel()
+
+	// M365_PHONE_WIPE=1 时先把 Cromite 的数据整个擦掉再跑。
+	//
+	// 这不是洁癖，是这个用例可信的前提。手机上只有一个长驻 profile，同一个 profile 连着解
+	// 挑战会累积状态；早先我在一个已经失败过六次的 profile 上反复重试，把「解不出来」记到了
+	// 浏览器头上，而对照用的 PC Chrome 每次都是全新的 user-data-dir —— 两边的干净程度根本
+	// 不一样，那个对比不成立。要判断「这个浏览器能不能解」，就得从和 PC 一样干净的状态出发。
+	if os.Getenv("M365_PHONE_WIPE") == "1" {
+		if err := wipePhoneBrowser(ctx, adb); err != nil {
+			t.Fatalf("擦除手机浏览器数据失败：%v", err)
+		}
+		t.Log("已 pm clear 手机浏览器并重启（本次从全新 profile 开始）")
+	}
 
 	page := strings.TrimSpace(os.Getenv("M365_PHONE_PAGE"))
 	if page == "" {

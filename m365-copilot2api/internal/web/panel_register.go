@@ -286,9 +286,7 @@ func (s *Server) runRegister(ctx context.Context, manager *nativePanelManager, r
 	phoneBrowser := phoneBrowserConfig(cfg, mode)
 	if phoneBrowser != nil {
 		report.Notes = append(report.Notes,
-			"注册页在手机上的浏览器里打开（出口为手机自身运营商 IP），本机不起浏览器。"+
-				"注意：手机上装的若是 Cromite，Turnstile 解不出来（canvas 加噪，且关不掉），"+
-				"把配置里的 phone_browser_on 去掉即可退回「本机 Chrome 走手机 SOCKS 隧道」")
+			"注册页在手机上的 Cromite 里打开（出口为手机自身运营商 IP），本机不起浏览器；要退回旧路径把配置里的 phone_browser_off 设成 true")
 	}
 	// carriedIP 是上一批最后一个号用掉的出口 IP，只对 phone 模式有意义：其余模式的
 	// 「出口」是代理地址，换出口靠换代理、由 poolURLs 推进，不需要这条信息。
@@ -719,7 +717,7 @@ type registerOutcome struct {
 // 只有 phone 模式才可能返回非 nil：其余模式的出口是代理地址，页面必须从本机带着那个代理
 // 发出去，跑到手机上就完全绕开了配置里的出口。
 func phoneBrowserConfig(cfg nativePanelFileConfig, mode string) *phonecdp.Config {
-	if mode != "phone" || !cfg.Register.PhoneBrowserOn {
+	if mode != "phone" || cfg.Register.PhoneBrowserOff {
 		return nil
 	}
 	return &phonecdp.Config{ADB: strings.TrimSpace(cfg.Register.ADB)}
