@@ -685,6 +685,47 @@ func (c *nativePanelController) ServeHTTP(w http.ResponseWriter, r *http.Request
 			return
 		}
 		jsonOut(w, report)
+	case "/api/admin/panel/job/register":
+		// 长跑批量注册。单次 /panel/register 上限 20 个号，几千个号只能靠反复调用；
+		// 放在网关里跑，进度可查、可停，也不再需要一个外部脚本进程。
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", http.MethodPost)
+			writeOpenAIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "POST required")
+			return
+		}
+		var body registerJobRequest
+		if !nativePanelDecodeJSON(w, r, &body, false) {
+			return
+		}
+		state, err := c.server.startRegisterJob(c.manager, body)
+		if err != nil {
+			writeOpenAIError(w, http.StatusConflict, "invalid_request_error", err.Error())
+			return
+		}
+		jsonOut(w, map[string]any{"ok": true, "job": state})
+	case "/api/admin/panel/job/register/status":
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", http.MethodGet)
+			writeOpenAIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "GET required")
+			return
+		}
+		jsonOut(w, map[string]any{"ok": true, "job": c.server.registerJob().snapshot()})
+	case "/api/admin/panel/job/register/stop":
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", http.MethodPost)
+			writeOpenAIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "POST required")
+			return
+		}
+		// 如实回报有没有任务被停掉，不假装停了什么。当前批次要等它自己结束 ——
+		// 注册中途硬断会留下站点侧已建号、本地没有密码的孤号。
+		stopped := c.server.registerJob().stop()
+		out := map[string]any{"ok": true, "stopped": stopped, "job": c.server.registerJob().snapshot()}
+		if !stopped {
+			out["detail"] = "当前没有在跑的批量注册任务"
+		} else {
+			out["detail"] = "已请求停止，当前这一批会跑完再退出"
+		}
+		jsonOut(w, out)
 	case "/api/admin/panel/oauth/batch":
 		if r.Method != http.MethodPost {
 			w.Header().Set("Allow", http.MethodPost)
@@ -766,6 +807,9 @@ func (s *Server) RegisterNativePanelRoutes(mux *http.ServeMux) {
 		"/api/admin/panel/register",
 		"/api/admin/panel/config",
 		"/api/admin/panel/job/stop",
+		"/api/admin/panel/job/register",
+		"/api/admin/panel/job/register/status",
+		"/api/admin/panel/job/register/stop",
 	}
 	for path := range nativePanelRemovedRoutes {
 		paths = append(paths, path)

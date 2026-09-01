@@ -227,6 +227,23 @@ type Server struct {
 	usage               *usageLog
 	benchmark           *benchmarkStore
 	generatedImages     map[string]generatedImage
+	// regJob 是批量注册长跑任务。归服务端所有，因为它必须活得比发起它的 HTTP 请求长 ——
+	// 目标是几千个号，而单次注册接口上限 20 个。
+	regJob   *registerJob
+	regJobMu sync.Mutex
+}
+
+// registerJob 惰性取批量注册任务的持有者。
+//
+// 惰性是必要的：Server 在测试里常用 &Server{} 直接构造，构造函数里初始化的字段在那些
+// 用例里是零值。
+func (s *Server) registerJob() *registerJob {
+	s.regJobMu.Lock()
+	defer s.regJobMu.Unlock()
+	if s.regJob == nil {
+		s.regJob = &registerJob{}
+	}
+	return s.regJob
 }
 
 const maxResponsesPerTenant = 256
