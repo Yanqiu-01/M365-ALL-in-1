@@ -30,6 +30,8 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+
+	"m365-copilot2api/internal/procwin"
 )
 
 // chromeCandidates 列出本机可能的浏览器位置。M365_CHROME_PATH 优先，方便用户指定。
@@ -117,6 +119,11 @@ type chromeSession struct {
 	conn      *websocket.Conn
 	sessionID string
 
+	// remoteTargetID 只在「接管一个长驻浏览器」时用到（手机上的 Cromite，见 phone_cdp.go）：
+	// 那种模式下 Close 不能杀进程，只能把自己开的这个标签页关掉。漏掉的话每个号都会在手机
+	// 上留一个空白页，跑几百个号之后手机会被拖垮。
+	remoteTargetID string
+
 	mu      sync.Mutex
 	nextID  int64
 	pending map[int64]chan cdpReply
@@ -186,6 +193,10 @@ func launchChrome(ctx context.Context, proxyURL string, headless bool) (*chromeS
 	args = append(args, "about:blank")
 
 	cmd := exec.Command(bin, args...)
+	// Chrome 是 GUI 子系统程序，本来不会有控制台窗口，这里是为了统一：起子进程就调用它，
+	// 不用每次去判断这个程序会不会弹框。它不影响 Chrome 自己的窗口（有头模式靠
+	// --window-position 挪到屏幕外，见 chromeHeadless 的注释）。
+	procwin.HideWindow(cmd)
 	cmd.Stdout, cmd.Stderr = nil, nil
 	if err := cmd.Start(); err != nil {
 		os.RemoveAll(userDir)
@@ -496,8 +507,20 @@ func (s *chromeSession) eval(ctx context.Context, expression string, out any) er
 
 // navigate 打开页面并等到 document.readyState 为 complete。
 func (s *chromeSession) navigate(ctx context.Context, page string) error {
-	if _, err := s.call(ctx, s.sessionID, "Page.navigate", map[string]any{"url": page}); err != nil {
+	raw, err := s.call(ctx, s.sessionID, "Page.navigate", map[string]any{"url": page})
+	if err != nil {
 		return err
+	}
+	// 导航失败不是 CDP 错误：Page.navigate 照样成功返回，把失败写在结果的 errorText 里，
+	// 浏览器则停在 chrome-error://chromewebdata/ 上。那个错误页的 readyState 也是
+	// complete，所以下面的等待会「成功」，真正的原因（DNS、连不上、证书）就被丢掉，最后
+	// 以「注册表单没有出现」收场 —— 一条把人指向站点和页面脚本、而与实际原因无关的消息。
+	var nav struct {
+		ErrorText string `json:"errorText"`
+	}
+	_ = json.Unmarshal(raw, &nav)
+	if txt := strings.TrimSpace(nav.ErrorText); txt != "" {
+		return fmt.Errorf("打开 %s 失败：%s", page, txt)
 	}
 	deadline := time.Now().Add(45 * time.Second)
 	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
@@ -626,10 +649,14 @@ func findChallengeIframe(raw json.RawMessage, inWidget bool) (int, bool) {
 }
 
 // Close 关掉浏览器并清掉一次性 profile。
+//
+// 接管模式（手机上的长驻 Cromite）走的是另一半：不杀进程、没有 profile 目录可删，改为
+// 先把远端的 target 和浏览器上下文销毁掉。两半互不干扰 —— 各自的字段在另一种模式下是零值。
 func (s *chromeSession) Close() {
 	if s == nil {
 		return
 	}
+	s.closeRemote()
 	if s.conn != nil {
 		s.writeMu.Lock()
 		_ = s.conn.WriteControl(websocket.CloseMessage,

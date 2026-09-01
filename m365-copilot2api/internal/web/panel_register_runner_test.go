@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -252,11 +253,73 @@ func TestRegisterJobStopsWhenPhoneTunnelNeverComesBack(t *testing.T) {
 		t.Fatalf("隧道不通却注册了 %d 个号", got)
 	}
 	state := server.registerJob().snapshot()
-	if state.Detail != "等手机隧道恢复" {
-		t.Fatalf("detail = %q，想要 等手机隧道恢复", state.Detail)
+	// 进行中的措辞要带重试进度：静态的一句「等手机隧道恢复」和放弃之后长得一样。
+	if !strings.HasPrefix(state.Detail, "等手机隧道恢复（重试 ") {
+		t.Fatalf("detail = %q，想要「等手机隧道恢复（重试 n/m）」", state.Detail)
+	}
+	if strings.Contains(state.Detail, "已停止") {
+		t.Fatalf("detail = %q，还在重试却写了「已停止」", state.Detail)
+	}
+	if !state.Running {
+		t.Fatalf("还在重试却报 running=false：%#v", state)
 	}
 	server.registerJob().stop()
 	waitForJob(t, server, func(st registerJobState) bool { return !st.Running })
+}
+
+// 隧道彻底不可用而任务已经返回时，面板必须能看出「不是还在重试，是停了」，并且要说清
+// 从哪个号接着跑。
+//
+// 这两种处境原先共用一句「等手机隧道恢复」：还在重试是它，goroutine 已经返回也是它。
+// 操作者盯着面板看不出区别，会以为任务还活着而一直等 —— 而站点每个 IP 一天只放行一次
+// 注册，等掉的每一天都是白等的额度，号段就停在那里不动。
+//
+// 用「配置读不出来」来触发：ensurePhoneTunnel 开头的 panelData 失败会直接返回错误，
+// 一次重试都不做，于是这条终止路径能在毫秒级走到，不用等满 30 分钟的重试预算。
+// 顺带也覆盖了另一半：错误跟隧道无关时，措辞不能硬说是隧道在等恢复。
+func TestRegisterJobTerminalTunnelFailureIsDistinguishableFromRetrying(t *testing.T) {
+	stubRotate(t)
+	stubTunnel(t, "2409:895a:1::1", nil)
+	root := t.TempDir()
+	writeRunnerPanelConfig(t, root, okSite(t).URL)
+	manager := newNativePanelManager(nativePanelConfig{Root: root})
+
+	const start = 5026
+	server := &Server{}
+	// 起跑之后再弄坏配置会撞上「第一批已经在跑」；显式给了 BatchSize 时 startRegisterJob
+	// 不读配置，所以起跑前弄坏它不会被入参校验挡掉。
+	if err := os.WriteFile(filepath.Join(root, "config.json"), []byte("{ 这不是 json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.startRegisterJob(manager, registerJobRequest{
+		Mode: "phone", StartNum: start, Target: 5030, BatchSize: 1, SkipOAuth: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	final := waitForJob(t, server, func(st registerJobState) bool { return !st.Running })
+
+	if !strings.Contains(final.Detail, "已停止") {
+		t.Fatalf("detail = %q：任务已经返回了，面板上必须写「已停止」，否则看着还像在重试", final.Detail)
+	}
+	if strings.Contains(final.Detail, "等手机隧道恢复") {
+		t.Fatalf("detail = %q：终止态不能沿用「等手机隧道恢复」—— 那是重试中的措辞", final.Detail)
+	}
+	if !strings.Contains(final.Detail, strconv.Itoa(start)) {
+		t.Fatalf("detail = %q：终止态要带上下一个未尝试的号 %d，否则续跑点只能靠对账翻",
+			final.Detail, start)
+	}
+	// 落盘日志是事后唯一的信息源（内存里只有最近 40 条，nextNum 也不落盘），续跑点必须在里面。
+	joined := strings.Join(final.Notes, "\n")
+	if !strings.Contains(joined, "任务已停止") || !strings.Contains(joined, strconv.Itoa(start)) {
+		t.Fatalf("日志里没有「任务已停止」和续跑点 %d：%q", start, joined)
+	}
+	// running 和 Detail 不能互相打架。
+	if final.Running {
+		t.Fatalf("goroutine 已经返回却仍报 running=true：%#v", final)
+	}
+	if final.NextNum != start {
+		t.Fatalf("nextNum = %d，第一批就死了，续跑点应当还是 %d", final.NextNum, start)
+	}
 }
 
 func TestStartRegisterJobRejectsBadInput(t *testing.T) {

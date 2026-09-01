@@ -133,6 +133,7 @@ func rotateCLI(ctx context.Context, bin string, req Request) (Result, error) {
 		return Result{}, err
 	}
 	cmd := exec.CommandContext(ctx, bin, "--json")
+	hideChildWindow(cmd)
 	cmd.Stdin = bytes.NewReader(payload)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
@@ -433,6 +434,7 @@ func cleanExitIP(text string) string {
 
 func runCmd(ctx context.Context, name string, args ...string) error {
 	cmd := exec.CommandContext(ctx, name, args...)
+	hideChildWindow(cmd)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("%s: %w (%s)", name, err, strings.TrimSpace(string(out)))

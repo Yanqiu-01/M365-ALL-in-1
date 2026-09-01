@@ -55,6 +55,12 @@ type Solution struct {
 	Token     string `json:"token"`
 	UserAgent string `json:"userAgent,omitempty"`
 	Clearance string `json:"clearance,omitempty"`
+	// Exit 一句话说明这一轮的页面是在哪儿加载的（本机浏览器还是手机上的 Cromite）。
+	//
+	// 值得回给调用方：手机模式下「出口」不再是某个代理地址，而是手机自己的运营商 IP，
+	// 日志里只看代理字段会看不出区别 —— 而「以为在手机上跑、其实在本机跑」正是会把家里
+	// 的 IP 暴露给站点的那种错，必须能一眼看出来。失败时也要带上，不然最需要它的时候没有。
+	Exit string `json:"exit,omitempty"`
 }
 
 type flareCookie struct {

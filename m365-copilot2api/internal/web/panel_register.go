@@ -16,6 +16,7 @@ import (
 
 	"m365-copilot2api/internal/exitrotate"
 	"m365-copilot2api/internal/outbound"
+	"m365-copilot2api/internal/phonecdp"
 	"m365-copilot2api/internal/turnstile"
 )
 
@@ -277,6 +278,16 @@ func (s *Server) runRegister(ctx context.Context, manager *nativePanelManager, r
 	poolURLs = turnstile.PreferProvenExits(poolURLs)
 	exitTurn := 0
 	var lastIP string
+	// phoneBrowser 非 nil 时注册页在手机上的 Cromite 里打开，本机不起浏览器。
+	//
+	// 这条要写进 Notes：手机模式下 proxyURL 仍然是那个 SOCKS 地址（隧道还要用来实测出口 IP、
+	// 确认轮换真的换了），但页面已经不走它了。日志里只看代理字段的话，两条路线长得一模一样，
+	// 而它们暴露给站点的 IP 完全不同。
+	phoneBrowser := phoneBrowserConfig(cfg, mode)
+	if phoneBrowser != nil {
+		report.Notes = append(report.Notes,
+			"注册页在手机上的 Cromite 里打开（出口为手机自身运营商 IP），本机不起浏览器；要退回旧路径把配置里的 phone_browser_off 设成 true")
+	}
 	// carriedIP 是上一批最后一个号用掉的出口 IP，只对 phone 模式有意义：其余模式的
 	// 「出口」是代理地址，换出口靠换代理、由 poolURLs 推进，不需要这条信息。
 	//
@@ -384,7 +395,7 @@ func (s *Server) runRegister(ctx context.Context, manager *nativePanelManager, r
 			} else if p := strings.TrimSpace(proxyURL); p != "" {
 				triedExits = append(triedExits, redactExitForNote(p))
 			}
-			outcome, outcomeErr = completeRegister(ctx, cfg, request.TurnstileToken, proxyURL, display, username)
+			outcome, outcomeErr = completeRegister(ctx, cfg, request.TurnstileToken, proxyURL, display, username, phoneBrowser)
 			// 记下这个出口在 Turnstile 这一关的表现，只用来决定下一次先试谁。
 			// 出口是否可用由代理池自己判断，这里不碰它的状态，也不动用户的列表。
 			if p := strings.TrimSpace(proxyURL); p != "" {
@@ -701,7 +712,18 @@ type registerOutcome struct {
 	UPN string
 }
 
-func completeRegister(ctx context.Context, cfg nativePanelFileConfig, supplied, proxyURL, display, username string) (registerOutcome, error) {
+// phoneBrowserConfig 决定这一轮要不要用手机上的浏览器，以及用哪台。
+//
+// 只有 phone 模式才可能返回非 nil：其余模式的出口是代理地址，页面必须从本机带着那个代理
+// 发出去，跑到手机上就完全绕开了配置里的出口。
+func phoneBrowserConfig(cfg nativePanelFileConfig, mode string) *phonecdp.Config {
+	if mode != "phone" || cfg.Register.PhoneBrowserOff {
+		return nil
+	}
+	return &phonecdp.Config{ADB: strings.TrimSpace(cfg.Register.ADB)}
+}
+
+func completeRegister(ctx context.Context, cfg nativePanelFileConfig, supplied, proxyURL, display, username string, phone *phonecdp.Config) (registerOutcome, error) {
 	token := strings.TrimSpace(supplied)
 	if token == "" {
 		page := strings.TrimRight(strings.TrimSpace(cfg.Register.SiteURL), "/")
@@ -722,6 +744,8 @@ func completeRegister(ctx context.Context, cfg nativePanelFileConfig, supplied, 
 				Password:    cfg.Register.Password,
 				PlanID:      strings.TrimSpace(cfg.Register.PlanID),
 				DomainID:    strings.TrimSpace(cfg.Register.DomainID),
+				// 非空时页面在手机上加载，Proxy 这一轮不起作用（见 ChromeRequest.Phone）。
+				Phone: phone,
 			})
 			if err != nil {
 				return registerOutcome{}, err

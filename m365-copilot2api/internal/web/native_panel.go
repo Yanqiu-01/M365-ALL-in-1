@@ -182,6 +182,17 @@ type nativePanelFileConfig struct {
 		// 装在 WinGet 的包目录里并不在 PATH，于是每次换 IP 都以「adb 找不到」失败，
 		// 整批注册在第二个号就断掉。配置里必须能钉住绝对路径。
 		ADB string `json:"adb"`
+		// PhoneBrowserOff 关掉「用手机上的 Cromite 打开注册页」，退回到「本机 Chrome
+		// 经 SOCKS 隧道从手机出口发出」的老路。
+		//
+		// 默认（零值）是用手机浏览器：页面在手机上加载，出口天然就是运营商 IP，不再需要
+		// 把流量绕回 PC 再转出去，本机也不起浏览器进程。
+		//
+		// 刻意做成反向开关，就为了让零值等于「开」—— 正向的 phone_browser 会让所有还没
+		// 加这个键的旧配置默认退回老路，那和改动的意图正好相反。留这个开关是因为站点每个
+		// IP 一天只放行一次：万一手机浏览器这条路在某天出问题，要能立刻回退而不用重新
+		// 编译部署。
+		PhoneBrowserOff bool `json:"phone_browser_off"`
 		// RegisterBatch 是长跑任务不指定 batchSize 时每批注册多少个号。
 		//
 		// 一批越大，中途停止的粒度越粗；越小，每批之间的隧道检查越频繁。跑一天的任务
@@ -763,14 +774,32 @@ func (c *nativePanelController) ServeHTTP(w http.ResponseWriter, r *http.Request
 			writeOpenAIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "POST required")
 			return
 		}
-		// 如实回报有没有任务被停掉，不假装停了什么。当前批次要等它自己结束 ——
-		// 注册中途硬断会留下站点侧已建号、本地没有密码的孤号。
-		stopped := c.server.registerJob().stop()
-		out := map[string]any{"ok": true, "stopped": stopped, "job": c.server.registerJob().snapshot()}
+		// 如实回报有没有任务被停掉，不假装停了什么。
+		job := c.server.registerJob()
+		stopped := job.stop()
+		if stopped {
+			// 续跑点必须落到日志里。内存里只留最近 40 条 note，会被后面的批次挤掉，
+			// 而操作者要靠它决定从哪个号接着跑 —— 写不清楚就等于让人自己猜。
+			job.note("收到停止请求：取消在号与号之间生效，本批剩余的号不会注册；下一次从 %d 起跑",
+				job.snapshot().NextNum)
+		}
+		state := job.snapshot()
+		out := map[string]any{"ok": true, "stopped": stopped, "job": state}
 		if !stopped {
 			out["detail"] = "当前没有在跑的批量注册任务"
 		} else {
-			out["detail"] = "已请求停止，当前这一批会跑完再退出"
+			// 不能说「这一批会跑完再退出」。取消是在号与号之间检查的（runRegister 的
+			// 循环开头就有 select ctx.Done()），本批剩下的号一个都不会注册。说反了操作者
+			// 就会当这批已完整、从状态里的进度之后接着跑，中间那些号被永久跳过 ——
+			// 而它们可能已经建在站点上、密码没写进账密清单，再也拿不回来（已经有
+			// 5831/5832/5881 三个这样的孤号）。
+			detail := fmt.Sprintf("已请求停止：取消在号与号之间生效，本批剩余的号不会注册。"+
+				"下一次从 %d 起跑 —— 这是本批的起点，其中已写进账密清单的号会自动跳过；"+
+				"不要按进度条或成功数往后推，本批实际跑到哪个号只有日志说得准。", state.NextNum)
+			if state.LogPath != "" {
+				detail += "日志：" + state.LogPath
+			}
+			out["detail"] = detail
 		}
 		jsonOut(w, out)
 	case "/api/admin/panel/oauth/batch":

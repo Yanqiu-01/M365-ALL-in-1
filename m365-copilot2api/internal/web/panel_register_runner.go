@@ -39,6 +39,19 @@ type registerJobState struct {
 	StartedAt  time.Time `json:"startedAt,omitempty"`
 	UpdatedAt  time.Time `json:"updatedAt,omitempty"`
 	FinishedAt time.Time `json:"finishedAt,omitempty"`
+	// OAuthMissing 是补齐跑完之后仍然没有 token 的号数（report 里的 pending + failed）。
+	//
+	// 为什么不能只有 Imported：健康的一批里每个号都在注册时内联授权过，补齐会把它们全部
+	// 判成 skipped，Imported 加 0；而全军覆没的一批 Imported 也是 0。两种情况在面板上长
+	// 得一模一样，操作者没有任何办法区分。pending 尤其容易被当成正常 —— 它意味着 ROPC 被
+	// 拒、退到了设备码或 PKCE，这两条都要人去另一台设备上点，而长跑是无人值守的，没人会
+	// 点，所以 pending 等价于「号建在站点上了，但 token 永远拿不到」。
+	OAuthMissing int `json:"oauthMissing"`
+	// OAuthErrors 是整批补齐调用直接出错的次数。
+	//
+	// 只记次数不记号数：调用失败时 report 是空的，这一批里几个号本来就有 token、几个号
+	// 没有，无从得知，不能编一个号数出来。
+	OAuthErrors int `json:"oauthErrors"`
 	// LastIP 是最近一次实测到的手机出口地址，用来一眼看出轮换还在动。
 	LastIP string `json:"lastIp,omitempty"`
 	// Detail 说明任务当前在做什么，或者为什么停了。
@@ -310,6 +323,11 @@ func (s *Server) runRegisterJob(ctx context.Context, job *registerJob, manager *
 			if st.Detail == "" || st.Detail == "启动中" {
 				st.Detail = "已结束"
 			}
+			// 「有多少号没拿到 token」拼在这里，而不是各个出口分别拼：出口有五处（跑完、
+			// 收到停止、隧道没恢复、连续失败、批次中被取消），漏一处就等于这条信息在那条
+			// 路径上不存在。而它是最坏结果的唯一线索 —— 号已经建在站点上、token 却拿不到，
+			// 不像失败的号那样能重跑一遍。
+			st.Detail += registerJobOAuthSuffix(st)
 		})
 	}()
 
@@ -328,7 +346,9 @@ func (s *Server) runRegisterJob(ctx context.Context, job *registerJob, manager *
 
 	for num <= request.Target {
 		if ctx.Err() != nil {
-			job.note("收到停止请求，停在 %d", num)
+			// 「停在 %d」有两种读法：这个号做完了，还是没做。说成「下一个未尝试的号」
+			// 就只有一种读法 —— 读错一次就是一段被永久跳过的号。
+			job.note("收到停止请求：停在批次边界上，下一个未尝试的号是 %d", num)
 			job.update(func(st *registerJobState) { st.Detail = "已停止" })
 			return
 		}
@@ -345,8 +365,17 @@ func (s *Server) runRegisterJob(ctx context.Context, job *registerJob, manager *
 					job.update(func(st *registerJobState) { st.Detail = "已停止" })
 					return
 				}
-				job.note("手机隧道不可用：%v", err)
-				job.update(func(st *registerJobState) { st.Detail = "等手机隧道恢复" })
+				// 这里是终止态：重试预算用光了，goroutine 就此返回，号段停在 num 不动。
+				// 原先它和 ensurePhoneTunnel 里「还在重试」用的是同一句「等手机隧道恢复」，
+				// 面板上两种处境长得一模一样，操作者会以为还在重试而一直等下去 —— 而站点
+				// 每个 IP 一天只放行一次，等掉的每一天都是白等的额度。
+				//
+				// 起跑点要写进 note：面板有 nextNum 字段，落盘日志只有 note，而事后翻日志
+				// 恰恰是唯一能确定「从哪个号接着跑」的地方。丢了它就只能靠对账翻缺口。
+				job.note("手机隧道不可用，任务已停止：%v；下一个未尝试的号是 %d", err, num)
+				job.update(func(st *registerJobState) {
+					st.Detail = fmt.Sprintf("已停止：手机隧道不可用，下一个未尝试的号 %d", num)
+				})
 				return
 			}
 			job.update(func(st *registerJobState) {
@@ -368,7 +397,20 @@ func (s *Server) runRegisterJob(ctx context.Context, job *registerJob, manager *
 			SpentIP: spentIP,
 		})
 		if ctx.Err() != nil {
-			job.note("停止请求在批次 %d-%d 中生效", num, num+count-1)
+			// 这一批是从中间断的，不是跑完的：runRegister 在每个号之前查一次取消，所以
+			// untried 之后的号一次都没尝试过。两件事都要写出来 —— 断在哪儿，以及下一次
+			// 从哪儿起跑；只报「已停止」的话操作者只能按批长自己算，算错就是永久缺口。
+			//
+			// 起跑点给 num（本批起点）而不是 untried：已经写进清单的号下一轮会被跳过，
+			// 代价只是几条 skipped；而「注册成功但写入账密失败」的号只有重跑到它才会
+			// 暴露出来，从 untried 起跑就再也追不回来了。
+			untried := report.NextNum
+			if untried < num {
+				// report 没填断点（比如 runRegister 在进循环前就返回了）时别报出 0。
+				untried = num
+			}
+			job.note("停止请求在批次 %d-%d 中生效：本批未尝试的第一个号是 %d，其后的号一个都没注册；下一次从 %d 起跑（本批起点，已写进清单的号会自动跳过）",
+				num, num+count-1, untried, num)
 			job.update(func(st *registerJobState) { st.Detail = "已停止" })
 			return
 		}
@@ -376,8 +418,13 @@ func (s *Server) runRegisterJob(ctx context.Context, job *registerJob, manager *
 			deadBatches++
 			job.note("批次 %d-%d 出错：%v", num, num+count-1, err)
 			if deadBatches >= registerJobMaxDeadBatches {
-				job.note("连续 %d 批失败，停下等人看", deadBatches)
-				job.update(func(st *registerJobState) { st.Detail = "连续失败已停止" })
+				// 这一批整个报错，report 被丢掉，所以 num 仍然是第一个没成功注册的号。
+				// 终止态一律带上它：只报「已停止」的话操作者得自己按批长算续跑点，算错
+				// 一次就是一段被永久跳过的号。
+				job.note("连续 %d 批失败，任务已停止，等人看；下一个未尝试的号是 %d", deadBatches, num)
+				job.update(func(st *registerJobState) {
+					st.Detail = fmt.Sprintf("已停止：连续 %d 批失败，下一个未尝试的号 %d", deadBatches, num)
+				})
 				return
 			}
 			if wErr := waitCtx(ctx, 30*time.Second); wErr != nil {
@@ -414,8 +461,13 @@ func (s *Server) runRegisterJob(ctx context.Context, job *registerJob, manager *
 		if report.Success == 0 && skipped < count {
 			deadBatches++
 			if deadBatches >= registerJobMaxDeadBatches {
-				job.note("连续 %d 批一个都没成，停下等人看", deadBatches)
-				job.update(func(st *registerJobState) { st.Detail = "连续失败已停止" })
+				// 续跑点取 num（本批起点）而不是 report.NextNum：st.NextNum 要到下面才推进，
+				// 此刻面板上显示的就是 num，两处必须说同一个数，否则又多一处让人误判的地方。
+				// 偏保守也无害 —— 已经写进清单的号下一轮会被跳过，只多几条 skipped。
+				job.note("连续 %d 批一个都没成，任务已停止，等人看；下一个未尝试的号是 %d", deadBatches, num)
+				job.update(func(st *registerJobState) {
+					st.Detail = fmt.Sprintf("已停止：连续 %d 批一个都没成，下一个未尝试的号 %d", deadBatches, num)
+				})
 				return
 			}
 		} else {
@@ -485,8 +537,18 @@ func (s *Server) ensurePhoneTunnel(ctx context.Context, manager *nativePanelMana
 		last = err
 		if attempt == 0 {
 			job.note("手机隧道不通，重试中：%v", err)
-			job.update(func(st *registerJobState) { st.Detail = "等手机隧道恢复" })
 		}
+		// 每一轮都刷 Detail，而 note 只写第一次。
+		//
+		// 刷 Detail：这是面板上「还在重试」和「已经放弃」唯一能一眼分开的东西 —— 看到
+		// 次数在往上爬就知道任务还活着，停住不动才是出事了。它顺带把 UpdatedAt 顶起来，
+		// 否则半小时的等待期里面板的「更新」时间一直是死的，看着就像任务已经僵住。
+		//
+		// note 不跟着刷：内存里只留最近 40 条，30 轮重试足够把批次进度全挤空 —— 那正是
+		// 事后要读的东西。
+		job.update(func(st *registerJobState) {
+			st.Detail = fmt.Sprintf("等手机隧道恢复（重试 %d/%d）", attempt+1, registerJobMaxTunnelWait)
+		})
 		if wErr := waitCtx(ctx, registerJobTunnelInterval); wErr != nil {
 			return "", wErr
 		}
@@ -507,13 +569,52 @@ func (s *Server) backfillOAuth(ctx context.Context, manager *nativePanelManager,
 	})
 	if err != nil {
 		if ctx.Err() == nil {
-			job.note("  oauth 补齐失败：%v", err)
+			// 计数进状态，不能只记一条 note：note 只留最近 40 条，几个批次之后就被挤掉，
+			// 任务终态上只剩「已完成」——补齐从头到尾一次都没成也看不出来。号段带上，
+			// 否则事后拿着日志也不知道该补哪一段。
+			job.update(func(st *registerJobState) { st.OAuthErrors++ })
+			job.note("  oauth 补齐失败（%d-%d，这一段有多少号没 token 未知）：%v", from, to, err)
 		}
 		return
 	}
-	job.update(func(st *registerJobState) { st.Imported += report.Imported })
+	// pending 和 failed 都是「号已经建好、token 没拿到」，合起来才是操作者要看的那个数。
+	// 单独记 Imported 不够：健康的一批全被 skipped，Imported 加 0，和全军覆没长得一样。
+	missing := report.Pending + report.Failed
+	job.update(func(st *registerJobState) {
+		st.Imported += report.Imported
+		st.OAuthMissing += missing
+	})
 	job.note("  oauth：imported %d pending %d skipped %d failed %d",
 		report.Imported, report.Pending, report.Skipped, report.Failed)
+	// 逐个把原因写下来。只有计数的话，事后翻日志也不知道该重授权哪些号、为什么没成 ——
+	// 而「翻出哪些号要重试」正是这份日志唯一的用途。skipped 不记：那是「已经有 token」，
+	// 一批 20 条全是它，只会把窗口里真正要看的行挤掉。
+	for _, account := range report.Accounts {
+		switch account.Status {
+		case "pending", "failed":
+			job.note("    oauth %s %s：%s", account.Status, account.Email, account.Detail)
+		}
+	}
+}
+
+// registerJobOAuthSuffix 把「有多少号最终没拿到 token」拼到终态说明后面。
+//
+// 为什么必须进 Detail 而不是只落日志：内存里只有最近 40 条 note，一批 20 个号，跑完时窗口
+// 里全是最后两批的行，前面几百个 pending 一条不剩；而面板上原先只有 oauthImported 一个数，
+// 它在健康的一批里也是 0（号在注册时已内联授权，补齐全部 skipped）。终态是操作者唯一会看
+// 的地方，这条信息得在那里。
+func registerJobOAuthSuffix(st *registerJobState) string {
+	if st == nil || (st.OAuthMissing == 0 && st.OAuthErrors == 0) {
+		return ""
+	}
+	parts := make([]string, 0, 2)
+	if st.OAuthMissing > 0 {
+		parts = append(parts, fmt.Sprintf("%d 个号没拿到 token", st.OAuthMissing))
+	}
+	if st.OAuthErrors > 0 {
+		parts = append(parts, fmt.Sprintf("%d 批补齐调用出错", st.OAuthErrors))
+	}
+	return "（" + strings.Join(parts, "，") + "，去日志里搜 oauth）"
 }
 
 func waitCtx(ctx context.Context, d time.Duration) error {

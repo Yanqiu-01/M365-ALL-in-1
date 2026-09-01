@@ -5,8 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"strings"
 	"time"
+
+	"m365-copilot2api/internal/phonecdp"
 )
 
 // ChromeRequest 描述一次「本机浏览器打开注册页、填表、过 Turnstile、提交」。
@@ -26,6 +29,18 @@ type ChromeRequest struct {
 	// Headless 强制无界面。默认有头（窗口挪到屏幕外）—— headless 下 Turnstile 会一直
 	// 转圈，见 chromeHeadless 的注释。零值就是「按环境变量决定」，也就是默认有头。
 	Headless bool
+	// Phone 非空时，这一轮不在本机开浏览器，而是接管手机上已经在跑的 Cromite（见
+	// phone_cdp.go）。
+	//
+	// 它和 Proxy 是互斥的，而且必须是互斥的：页面在手机上加载，出口就是手机的运营商 IP，
+	// 此时 Proxy 里的代理地址对这一轮毫无作用 —— 真正危险的是反过来被误读成「已经在走
+	// 代理了」。所以下面 SolveWithChrome 里 Phone 优先，并且不去碰 Proxy。
+	//
+	// 给的是配置而不是一个已经建好的会话：接管要和 launchChrome 一样每号一次，这样每个号
+	// 拿到的是全新的浏览器上下文（cookie/storage 独立）。共用一个会话能省一两秒，但要用
+	// 上一个号的 cookie 去解下一个号的 Turnstile，那正是本机模式用「一次性 profile」在
+	// 避免的事。EnsureCromite 是幂等的，重复调用只多一次 forward --list 和一次探测。
+	Phone *phonecdp.Config
 }
 
 // ChromeDefaultTimeout 是一个号的总预算：开浏览器、过 CF、填表、提交、读结果。
@@ -84,7 +99,20 @@ func SolveWithChrome(ctx context.Context, request ChromeRequest) (Solution, erro
 	runCtx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
 
-	session, err := launchChrome(runCtx, request.Proxy, request.Headless || chromeHeadless())
+	var (
+		session *chromeSession
+		exit    string
+		err     error
+	)
+	if request.Phone != nil {
+		var phone *PhoneSession
+		phone, err = AttachPhone(runCtx, *request.Phone, originOf(page))
+		if err == nil {
+			session, exit = phone.sess, phone.Describe()
+		}
+	} else {
+		session, err = launchChrome(runCtx, request.Proxy, request.Headless || chromeHeadless())
+	}
 	if err != nil {
 		return Solution{}, err
 	}
@@ -92,32 +120,47 @@ func SolveWithChrome(ctx context.Context, request ChromeRequest) (Solution, erro
 
 	var userAgent string
 	_ = session.eval(runCtx, "navigator.userAgent", &userAgent)
+	// 每条返回都盖上 UA 和出口说明。手工写的话，早退分支会漏 —— 之前 navigate/waitForForm
+	// 那三条就漏了 UA，而失败时这两条信息恰恰是最该看的。
+	out := func(token string) Solution {
+		return Solution{Token: token, UserAgent: userAgent, Exit: exit}
+	}
 
 	if err := session.navigate(runCtx, page); err != nil {
-		return Solution{}, err
+		return out(""), err
 	}
 	if err := session.waitForForm(runCtx); err != nil {
-		return Solution{}, err
+		return out(""), err
 	}
 	if err := session.fillRegisterForm(runCtx, request); err != nil {
-		return Solution{}, err
+		return out(""), err
 	}
 	if err := session.waitWidgetLaidOut(runCtx); err != nil {
-		return Solution{UserAgent: userAgent}, err
+		return out(""), err
 	}
 	token, err := session.awaitTurnstileToken(runCtx)
 	if err != nil {
-		return Solution{UserAgent: userAgent}, err
+		return out(""), err
 	}
 	upn, err := session.submitRegisterForm(runCtx)
 	if err != nil {
-		return Solution{UserAgent: userAgent}, err
+		return out(""), err
 	}
 	if strings.TrimSpace(upn) == "" {
 		upn = "registered-ok"
 	}
 	_ = token // token 已随表单提交出去，调用方不需要它，也不该留副本。
-	return Solution{Token: "SUBMITTED:" + upn, UserAgent: userAgent}, nil
+	return out("SUBMITTED:" + upn), nil
+}
+
+// originOf 从页面地址取出 scheme://host，用来清这个站点的存储。取不出来就返回空串，
+// 让调用方跳过那一步 —— 传一个猜的来源进去只会清错地方。
+func originOf(page string) string {
+	parsed, err := url.Parse(strings.TrimSpace(page))
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return ""
+	}
+	return parsed.Scheme + "://" + parsed.Host
 }
 
 // waitForForm 等 app.js 把注册表单渲染出来。

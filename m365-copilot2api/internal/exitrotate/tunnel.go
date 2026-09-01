@@ -14,6 +14,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -25,11 +26,13 @@ type TunnelRequest struct {
 	// ADB 是 adb 可执行文件路径。空则用 PATH 上的 "adb"。
 	ADB string
 	// LocalPort / RemotePort 是 adb forward 的两端，通常相同。
+	// 两个都留零时端口从 SOCKS 地址里取，见 EnsureTunnel —— 端口只能有一个来源，
+	// 不能再出现「转发建在 1081、注册打在另一个端口」那种各说各话。
 	LocalPort  int
 	RemotePort int
 	// Binary 是手机上 phone-socks 的路径。
 	Binary string
-	// SOCKS 是 PC 侧访问这条隧道的地址，用来实测。
+	// SOCKS 是 PC 侧访问这条隧道的地址，用来实测。也是隧道端口的权威来源。
 	SOCKS string
 }
 
@@ -58,16 +61,28 @@ func EnsureTunnel(ctx context.Context, req TunnelRequest) (TunnelResult, error) 
 		ctx = context.Background()
 	}
 	adb := firstNonEmpty(strings.TrimSpace(req.ADB), "adb")
+	// socks 必须先定下来，端口再从它取：它就是注册和探测实际打的那个地址。
+	//
+	// 原先的顺序是反的 —— local 写死 1081，socks 在没配时按 local 拼出来。两个字面量只是
+	// 碰巧和 DefaultPhoneSOCKS 相同：面板把 phone_socks 换到别的端口后，adb forward 和
+	// phone-socks 仍然建在 1081，而探测和注册走的是配置里的端口。那个端口上要是有别的代理
+	// 在听（1080 之类很常见），这里会报「隧道一切正常」并给出一个出口 IP，注册却是从另一个
+	// 出口发出的：飞行模式照切、切的是没人在用的手机 IP，站点按那个代理的当日额度判重复，
+	// 号可能已经建在站点上而密码没落盘 —— 号段中间又多一个孤号。
+	socks := firstNonEmpty(strings.TrimSpace(req.SOCKS), DefaultPhoneSOCKS)
 	local := req.LocalPort
 	if local <= 0 {
-		local = 1081
+		local = socksPort(socks)
+	}
+	if local <= 0 {
+		// socks 写坏了（解不出端口）才退到默认地址的端口。仍然只有这一个来源。
+		local = socksPort(DefaultPhoneSOCKS)
 	}
 	remote := req.RemotePort
 	if remote <= 0 {
 		remote = local
 	}
 	binary := firstNonEmpty(strings.TrimSpace(req.Binary), defaultPhoneSocksBinary)
-	socks := firstNonEmpty(strings.TrimSpace(req.SOCKS), "socks5://127.0.0.1:"+strconv.Itoa(local))
 
 	var result TunnelResult
 
@@ -79,7 +94,10 @@ func EnsureTunnel(ctx context.Context, req TunnelRequest) (TunnelResult, error) 
 		return result, fmt.Errorf("查手机上的 phone-socks 失败: %w", err)
 	}
 	if !running {
-		if err := startPhoneSocks(ctx, adb, binary, local); err != nil {
+		// 手机上那一头听的是 remote：forward 把 PC 的 local 映到设备的 remote。原先传
+		// local，两者一旦不同就是「转发建好了、设备上却没人听」——连接立刻被拒，报错完全
+		// 看不出根因。
+		if err := startPhoneSocks(ctx, adb, binary, remote); err != nil {
 			result.Detail = err.Error()
 			return result, err
 		}
@@ -151,6 +169,7 @@ func startPhoneSocks(ctx context.Context, adb, binary string, port int) error {
 
 func adbForwardPresent(ctx context.Context, adb string, local int) (bool, error) {
 	cmd := exec.CommandContext(ctx, adb, "forward", "--list")
+	hideChildWindow(cmd)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return false, fmt.Errorf("adb forward --list: %w (%s)", err, strings.TrimSpace(string(out)))
@@ -160,8 +179,33 @@ func adbForwardPresent(ctx context.Context, adb string, local int) (bool, error)
 
 func adbShellOutput(ctx context.Context, adb, script string) (string, error) {
 	cmd := exec.CommandContext(ctx, adb, "shell", script)
+	hideChildWindow(cmd)
 	out, err := cmd.CombinedOutput()
 	return string(out), err
+}
+
+// socksPort 取出 SOCKS 地址里的端口，取不到返回 0。
+//
+// 手机隧道的端口只能有一个权威来源：注册和探测用的那个 SOCKS 地址。adb forward 在 PC 侧
+// 监听的端口必须等于它，否则「转发探测通过」和「注册打得通」说的是两个端口。
+func socksPort(raw string) int {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0
+	}
+	if !strings.Contains(raw, "://") {
+		// 配置里只写 host:port 也要认：不补 scheme，url.Parse 会把整段当成路径，端口取空。
+		raw = "socks5://" + raw
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return 0
+	}
+	port, err := strconv.Atoi(u.Port())
+	if err != nil || port <= 0 || port > 65535 {
+		return 0
+	}
+	return port
 }
 
 func isExitCode(err error, code int) bool {
