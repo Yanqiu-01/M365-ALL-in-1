@@ -36,10 +36,11 @@ func TestEveryTurnCarriesEnvironmentStatement(t *testing.T) {
 	nameless := envTestTool(t, map[string]any{"description": "no name field"})
 
 	cases := []struct {
-		name    string
-		tools   []Tool
-		choice  any
-		plugins bool
+		name        string
+		tools       []Tool
+		choice      any
+		plugins     bool
+		toolsInText bool
 	}{
 		{name: "no tools", tools: nil, choice: "auto"},
 		{name: "tool choice none", tools: []Tool{tool}, choice: "none"},
@@ -50,7 +51,7 @@ func TestEveryTurnCarriesEnvironmentStatement(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := toolProtocolPrompt("read E:\\work\\notes.txt", tc.tools, tc.choice, tc.plugins)
+			got := toolProtocolPrompt("read E:\\work\\notes.txt", tc.tools, tc.choice, tc.plugins, tc.toolsInText)
 
 			if !strings.Contains(got, "Runtime: the caller's own") {
 				t.Errorf("prompt does not state where execution happens:\n%s", got)
@@ -79,7 +80,7 @@ func TestToolProtocolPromptDoesNotRaiseTheCloudPaths(t *testing.T) {
 	})
 
 	for _, plugins := range []bool{false, true} {
-		got := toolProtocolPrompt("list the directory", []Tool{tool}, "auto", plugins)
+		got := toolProtocolPrompt("list the directory", []Tool{tool}, "auto", plugins, false)
 		for _, salient := range []string{"/mnt/data", "Linux", "container"} {
 			if strings.Contains(got, salient) {
 				t.Errorf("plugins=%t branch names %q, which pulls the model toward it:\n%s", plugins, salient, got)
@@ -97,7 +98,7 @@ func TestEnvironmentStatementKeepsToolProtocol(t *testing.T) {
 		"parameters":  map[string]any{"type": "object", "properties": map[string]any{}},
 	})
 
-	got := toolProtocolPrompt("list the directory", []Tool{tool}, "auto", false)
+	got := toolProtocolPrompt("list the directory", []Tool{tool}, "auto", false, false)
 	for _, want := range []string{"<tools>", "bash", "User request:", "list the directory"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("tool protocol lost %q:\n%s", want, got)

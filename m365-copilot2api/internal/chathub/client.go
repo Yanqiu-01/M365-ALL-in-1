@@ -86,6 +86,13 @@ type Request struct {
 	MCPServerURL   string // URL of the MCP HTTP SSE server for tool discovery
 	// Started is true only for the first turn of a ChatHub conversation.
 	Started bool
+	// ToolsInText is set by the gateway's router mode, which carries the tool
+	// schemas inside Text and deliberately leaves Tools empty so ChatHub's own
+	// plugin protocol stays out of the way. Without this the environment prompt
+	// cannot tell "the caller wired up no tools" from "the tools are right there
+	// in the prompt", and offers the model an absent-tool escape hatch on a turn
+	// that has tools.
+	ToolsInText bool
 }
 
 // StreamEvent is the protocol-neutral event exposed while ChatHub is still
@@ -369,7 +376,7 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 		}
 	}
 
-	payload := chatPayload(req.Text, req.SessionID, req.ConversationID, requestID, req.Tone, firstTurn, req.Attachments, req.Tools, req.ToolChoice, req.MCPServerURL)
+	payload := chatPayload(req.Text, req.SessionID, req.ConversationID, requestID, req.Tone, firstTurn, req.Attachments, req.Tools, req.ToolChoice, req.MCPServerURL, req.ToolsInText)
 	log.Printf("chathub prompt-trace text=%d tools=%d payload=%d", len(req.Text), len(req.Tools), len(payload))
 	if c.Trace != nil {
 		meta := map[string]any{"stage": "chathub_payload", "attachment_count": len(req.Attachments), "payload_has_attachments": strings.Contains(payload, `"attachments"`), "attachments": []map[string]any{}}
@@ -782,9 +789,9 @@ func (c *Client) uploadAttachments(ctx context.Context, acc Account, conversatio
 	return nil
 }
 
-func chatPayload(text, sessionID, conversationID, requestID, tone string, firstTurn bool, attachments []Attachment, tools []Tool, toolChoice any, mcpServerURL string) string {
+func chatPayload(text, sessionID, conversationID, requestID, tone string, firstTurn bool, attachments []Attachment, tools []Tool, toolChoice any, mcpServerURL string, toolsInText bool) string {
 	identity := identityFor()
-	text = toolProtocolPrompt(text, tools, toolChoice, len(clientPlugins(tools, mcpServerURL)) > 0)
+	text = toolProtocolPrompt(text, tools, toolChoice, len(clientPlugins(tools, mcpServerURL)) > 0, toolsInText)
 	message := map[string]any{
 		"author":                "user",
 		"attachments":           attachments,
