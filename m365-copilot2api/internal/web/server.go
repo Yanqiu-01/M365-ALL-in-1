@@ -2179,6 +2179,14 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		}
 		finishChunk := map[string]any{"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []any{map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": "stop"}}}
 		_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(finishChunk)+"\n\n")
+		// 这条主流式回答路径此前不发 usage，而另外三条流式出口都发
+		// （server.go:2479、:2652、tool_response.go:49）。于是同一个客户端
+		// 拿到工具轮有 usage、拿到普通文字回答就没有 —— 靠 usage 记账的客户端
+		// 会把这一轮当成零消耗。text 是本轮真正发出的正文，与 emitText 同源。
+		streamPT := EstimateTokens(answerPrompt)
+		streamCT := EstimateTokens(text.String())
+		usageChunk := map[string]any{"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []any{map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": "stop"}}, "usage": map[string]any{"prompt_tokens": streamPT, "completion_tokens": streamCT, "total_tokens": streamPT + streamCT}}
+		_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(usageChunk)+"\n\n")
 		_ = sseRaw(r.Context(), w, flusher, "data: [DONE]\n\n")
 		if body.User != "" && res.ConversationID != "" {
 			s.userSessions.Put(body.User, res.ConversationID, res.SessionID, acc.ID)
