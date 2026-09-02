@@ -38,9 +38,12 @@ func walkNative(v any, allowed map[string]bool, out *[]detectedToolCall) {
 	case map[string]any:
 		name := ""
 		for _, k := range []string{"name", "toolName", "pluginName", "functionName", "id"} {
-			if s, ok := x[k].(string); ok && allowed[s] {
-				name = s
-				break
+			// 取声明拼写：回给客户端的名字必须和它声明的一致。
+			if s, ok := x[k].(string); ok {
+				if declared, hit := resolveDeclaredTool(allowed, s); hit {
+					name = declared
+					break
+				}
 			}
 		}
 		if name != "" {

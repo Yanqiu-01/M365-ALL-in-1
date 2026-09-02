@@ -93,12 +93,18 @@ func declaredFenceStart(text string, tools []map[string]any, choice any) int {
 			offset = index + 3
 			continue
 		}
-		name := strings.ToLower(strings.TrimSpace(after[:lineEnd]))
-		if name != "" && toolChoiceAllows(choice, name) && allowed[name] {
+		// 不要拿小写名字直接查 allowed —— 那张表按声明拼写建，声明 Bash 时
+		// 恒不命中，这个函数就恒返回 -1：流式路径既不缓冲未完成的围栏，也不
+		// 剥离已经取走的围栏，模型写对的调用会作为可见正文漏给客户端。
+		name := strings.TrimSpace(after[:lineEnd])
+		if declared, ok := resolveDeclaredTool(allowed, name); ok && toolChoiceAllows(choice, declared) {
 			return index
 		}
-		if (name == "bash" || name == "sh" || name == "shell" || name == "powershell" || name == "cmd") && shell != "" {
-			return index
+		switch strings.ToLower(name) {
+		case "bash", "sh", "shell", "powershell", "cmd":
+			if shell != "" {
+				return index
+			}
 		}
 		offset = index + 3
 	}
@@ -108,8 +114,9 @@ func declaredFencePrefix(partial string, allowed map[string]bool, shell string) 
 	if partial == "" {
 		return true
 	}
+	// partial 已经小写，allowed 按声明拼写建表，所以两边都要归一化再比前缀。
 	for name := range allowed {
-		if strings.HasPrefix(name, partial) {
+		if strings.HasPrefix(strings.ToLower(name), partial) {
 			return true
 		}
 	}

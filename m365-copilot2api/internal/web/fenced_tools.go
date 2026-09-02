@@ -12,10 +12,12 @@ var fencedToolCall = regexp.MustCompile("(?s)```([A-Za-z0-9_-]+)\\s*\\n(.*?)\\n`
 // declared (bash/sh/shell/powershell/cmd), or "" if none. Forcing an
 // undeclared bash call on clients that don't support it (issue #12) makes
 // them error out and loop, so conversion only happens for declared tools.
+// 返回声明拼写而不是小写字面量：忽略大小写匹配，声明成 Bash 时也要认出来，
+// 否则 shell 特例与下面以 shell != "" 为门槛的裸 JSON 兜底会一起失效。
 func declaredShell(allowed map[string]bool) string {
 	for _, n := range []string{"bash", "sh", "shell", "powershell", "cmd"} {
-		if allowed[n] {
-			return n
+		if declared, ok := resolveDeclaredTool(allowed, n); ok {
+			return declared
 		}
 	}
 	return ""
@@ -32,9 +34,11 @@ func fencedToolCalls(text string, tools []map[string]any, choice any) []detected
 		_ = json.Unmarshal([]byte(args), &v)
 		// Auto-convert bash/shell code blocks to tool calls, but only when
 		// the client declared the tool.
-		if name == "bash" || name == "sh" || name == "shell" || name == "powershell" || name == "cmd" {
-			converted := name
-			if !allowed[name] {
+		if lower := strings.ToLower(name); lower == "bash" || lower == "sh" || lower == "shell" || lower == "powershell" || lower == "cmd" {
+			// 声明拼写优先：客户端声明 Bash 而模型写 ```bash 时，派发的名字
+			// 必须是 Bash，否则客户端认不出来。
+			converted, ok := resolveDeclaredTool(allowed, name)
+			if !ok {
 				if shell == "" {
 					continue
 				}
@@ -54,14 +58,17 @@ func fencedToolCalls(text string, tools []map[string]any, choice any) []detected
 			}
 			continue
 		}
-		if !allowed[name] || !toolChoiceAllows(choice, name) {
+		// 忽略大小写解析，并且之后一律用声明拼写：tool_choice 判定、callID、
+		// toolType、派发出去的 Name 都必须是客户端声明的那个名字。
+		declared, ok := resolveDeclaredTool(allowed, name)
+		if !ok || !toolChoiceAllows(choice, declared) {
 			continue
 		}
 		if v == nil {
 			continue
 		}
 		b, _ := json.Marshal(v)
-		out = append(out, detectedToolCall{ID: callID(name, string(b), len(out)), Type: toolType(name, tools), Name: name, Arguments: b})
+		out = append(out, detectedToolCall{ID: callID(declared, string(b), len(out)), Type: toolType(declared, tools), Name: declared, Arguments: b})
 	}
 	// Also check for plain JSON objects with a "command" field (not in fenced blocks)
 	if len(out) == 0 && shell != "" {

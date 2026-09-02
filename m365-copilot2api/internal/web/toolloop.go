@@ -27,6 +27,11 @@ func toolType(name string, tools []map[string]any) string {
 	return "function"
 }
 
+// allowedToolNames 按客户端声明时的原始拼写建表。键就是声明拼写 ——
+// tool_calls 帧必须回这个拼写，客户端是按自己声明的名字派发的。
+//
+// 因此查表一律走 resolveDeclaredTool，不要直接 allowed[name]：模型写出的
+// 大小写和声明拼写经常不一致，直接查会漏。
 func allowedToolNames(tools []map[string]any) map[string]bool {
 	out := map[string]bool{}
 	for _, t := range tools {
@@ -37,6 +42,43 @@ func allowedToolNames(tools []map[string]any) map[string]bool {
 		}
 	}
 	return out
+}
+
+// resolveDeclaredTool 把模型写出的工具名解析成客户端声明的那个拼写：
+// 先精确匹配，再忽略大小写匹配。返回声明拼写与是否命中。
+//
+// 加这层是因为大小写不一致曾让真实调用整条丢掉。Claude Code 声明的是
+// Bash、Read、Edit、Write、Glob、Grep —— 全部首字母大写；而模型写围栏时
+// 最自然的形态是 ```bash（提示词里也是这么说的：call the bash tool）。
+// 三处消费方各自假设了不同的大小写，同一张表给出三种答案：
+//
+//   - declaredShell 查小写字面量 "bash"，声明成 Bash 时返回 ""，
+//     于是 shell 特例、以及 fenced_tools.go 里以 shell != "" 为门槛的
+//     裸 JSON 兜底，一起失效；
+//   - fencedToolCalls 的 shell 分支撞上 allowed["bash"]==false 且
+//     shell=="" 就 continue，```bash 的调用被静默丢弃；
+//   - declaredFenceStart 先 ToLower 再查这张按声明拼写建的表，恒返回 -1，
+//     流式路径既不缓冲未完成的围栏，也不剥离已经取走的围栏。
+//
+// 实测（工具集取真实的 Bash/Read/Edit/Write/Glob/Grep）：只有大小写完全
+// 一致的 ```Bash 能出调用，```bash、```bash+裸命令、```sh 全部 0 候选。
+// 既有围栏测试全部把工具声明成小写（"bash"、"read_file"），所以一直是绿的 ——
+// 夹具没用真实客户端发的拼写。
+func resolveDeclaredTool(allowed map[string]bool, name string) (string, bool) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "", false
+	}
+	if allowed[name] {
+		return name, true
+	}
+	lower := strings.ToLower(name)
+	for declared := range allowed {
+		if strings.ToLower(declared) == lower {
+			return declared, true
+		}
+	}
+	return "", false
 }
 
 type rejectedToolCall struct {
