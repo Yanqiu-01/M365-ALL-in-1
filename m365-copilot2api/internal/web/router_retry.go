@@ -99,6 +99,48 @@ func retryUpstream(ctx context.Context, stage string, operation func(attempt int
 	return last
 }
 
+// retryTransportOnly retries a failed upstream attempt when, and only when, the
+// failure is a transport-level one: an abnormal websocket close, a read that
+// ended before the completion frame, a reset connection.
+//
+// It deliberately does NOT retry rate-limit or auth failures, which is the one
+// thing that separates it from retryUpstream. Those two need a DIFFERENT account,
+// not another attempt on the same one, and the callers of this helper already have
+// an account-failover branch sitting right after them. Sending a rate-limited
+// account through four more attempts here would just spend the backoff before
+// reaching the failover that actually fixes it.
+//
+// The account and conversation binding are left untouched between attempts: a
+// dropped socket says nothing about the account's health, and re-running the same
+// turn on the same conversation is what makes the retry invisible to the caller.
+func retryTransportOnly(ctx context.Context, stage string, operation func(attempt int) error) error {
+	if operation == nil {
+		return fmt.Errorf("%s: nil upstream operation", stage)
+	}
+	attempts := routerRetryAttempts()
+	var last error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		last = operation(attempt)
+		if last == nil || attempt == attempts {
+			return last
+		}
+		if !isRetryableUpstream(ctx, last) || IsRateLimited(last) || IsAuthFailure(last) {
+			return last
+		}
+		delay := time.Duration(attempt) * 750 * time.Millisecond
+		if delay > 12*time.Second {
+			delay = 12 * time.Second
+		}
+		if err := sleepUnlessDone(ctx, delay); err != nil {
+			return err
+		}
+	}
+	return last
+}
+
 // sleepUnlessDone performs cancellation-aware waiting. A 100ms ticker mirrors
 // the APK helper's periodic context check while avoiding a goroutine leak.
 func sleepUnlessDone(ctx context.Context, delay time.Duration) error {

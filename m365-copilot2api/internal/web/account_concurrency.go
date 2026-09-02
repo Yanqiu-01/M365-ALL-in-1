@@ -172,6 +172,16 @@ var routerFailoverChat = func(ctx context.Context, s *Server, accountID string, 
 	return s.chatWithAccount(ctx, accountID, account, request)
 }
 
+// answerChat is the same kind of seam for the NON-STREAMING answer turn. That
+// call had no seam, so the one thing a test could not reach was whether a
+// transport failure there is retried -- which is exactly the defect that turned a
+// dropped socket into a hard 502. Server.chat is a concrete *chathub.Client, so a
+// fake cannot be injected through the struct; this mirrors routerFailoverChat and
+// correctionChat rather than inventing a second mechanism.
+var answerChat = func(ctx context.Context, s *Server, accountID string, account chathub.Account, request chathub.Request) (chathub.Result, error) {
+	return s.chatWithAccount(ctx, accountID, account, request)
+}
+
 func (s *Server) routerChatWithFailover(ctx context.Context, stage string, acc auth.AccountToken, request chathub.Request) (chathub.Result, auth.AccountToken, error) {
 	current := acc
 	var result chathub.Result

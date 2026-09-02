@@ -2540,7 +2540,30 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 			_ = sseRaw(r.Context(), w, flusher, "data: [DONE]\n\n")
 		}
 	} else {
-		res, err = s.chatWithAccount(ctx, acc.ID, account, answerReq)
+		// A transient upstream websocket drop is already classified retryable by
+		// isRetryableUpstream, and the STREAMING answer path already retries it via
+		// streamChatWithRecovery (:2088). This path had no retry at all, so one
+		// abnormal closure became a hard 502: the failover below only fires on
+		// rate-limit or auth errors, and close 1006 is neither.
+		//
+		// Measured 2026-09-03 against gateway-f70ce9b: two of four probe
+		// conversations died here on ordinary chat turns, log reading
+		// "upstream request failed: ws read before completion: websocket:
+		// close 1006 (abnormal closure): unexpected EOF" after a clean handshake.
+		//
+		// Retrying is strictly safer here than in the streaming path it mirrors:
+		// nothing has reached the client yet, the whole response is still buffered,
+		// so a second attempt cannot duplicate delivered output. Rate-limit and auth
+		// failures are excluded so they still fall through fast to the account
+		// failover, which is what actually resolves them.
+		err = retryTransportOnly(ctx, "answer", func(attempt int) error {
+			if attempt > 1 {
+				log.Printf("[answer-retry] id=%s attempt=%d/%d retrying after transport failure", requestID, attempt, routerRetryAttempts())
+			}
+			var chatErr error
+			res, chatErr = answerChat(ctx, s, acc.ID, account, answerReq)
+			return chatErr
+		})
 		if IsEmptyCompletion(err) && tone != "magic" {
 			log.Printf("[tone-fallback] tone=%q returned empty, retrying with magic", tone)
 			magicReq := answerReq
