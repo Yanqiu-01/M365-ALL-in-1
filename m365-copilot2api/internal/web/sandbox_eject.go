@@ -2,6 +2,7 @@ package web
 
 import (
 	"context"
+	"encoding/json"
 	"log"
 	"m365-copilot2api/internal/chathub"
 	"runtime"
@@ -103,6 +104,13 @@ func (s *Server) correctSandboxDrift(ctx context.Context, req ejectRequest) (cha
 	if len(req.Tools) == 0 || strings.TrimSpace(req.Text) == "" {
 		return chathub.Result{}, false
 	}
+	// tool_choice:"none" 是调用方明确禁止调用工具。此时模型说「这件事需要
+	// 一个我现在不能调的工具」是正确回答，而它恰好会命中 isToolRefusal。
+	// 没有这道门槛，纠正轮会去要求模型调用调用方刚刚禁止的工具，而且一旦
+	// 那轮回来不再命中检测器，还会用它顶掉本来合规的回答。
+	if !toolChoiceAllowsAnyCall(req.ToolChoice) {
+		return chathub.Result{}, false
+	}
 	current := req.Text
 	corrected := chathub.Result{}
 	replaced := false
@@ -119,7 +127,13 @@ func (s *Server) correctSandboxDrift(ctx context.Context, req ejectRequest) (cha
 			log.Printf("[%s] correction round failed: %v", correction.stage, err)
 			continue
 		}
-		if correction.detects(res.Text) {
+		// 先看纠正轮有没有真的发出一次已声明工具的调用。发出了就是成功，
+		// 不管它的散文写成什么样 —— 检测器的模式表里本来就有
+		// "I can run that for you" / "I'll run that" / "let me run that"，
+		// 而这些恰恰是模型「即将调用工具」时最自然的开场白。拿同一张表去
+		// 评判自己的纠正结果，会把带着有效调用的那一轮判成又漂了，然后把
+		// 先前扣住的那句拒绝发给客户端。
+		if len(correctionToolCalls(res.Text, req)) == 0 && correction.detects(res.Text) {
 			log.Printf("[%s] correction round drifted again; keeping the original answer", correction.stage)
 			continue
 		}
@@ -132,6 +146,66 @@ func (s *Server) correctSandboxDrift(ctx context.Context, req ejectRequest) (cha
 		current = res.Text
 	}
 	return corrected, replaced
+}
+
+// ejectDelivery 算出 eject 路径最终发给客户端的正文。rejected 是 schema 校验
+// 淘汰掉的调用数（此时已确定没有一个调用可派发，否则不会走到这里）。
+//
+// 契约：corrected 去掉空白后非空时，返回值一定非空。eject 路径已经额外花了
+// 一轮请求，到这一步再交出一个空的 assistant 轮是最差的结果 —— 客户端既没有
+// tool_calls 帧，也没有正文，连「校验为什么拒了」都看不到。
+//
+// rejected > 0 表示模型确实发出了调用，只是没过 schema（最常见的是参数名写错）。
+// 这时必须原样发：tool_protocol.go 要求「只输出那个围栏块」，所以这段文本往往
+// 整体就是一个围栏，交给 flushStreamText 会被当成已取走的调用剥掉，剥完什么都
+// 不剩。rejected == 0 才是真的散文，走正常的围栏剥离。
+func ejectDelivery(corrected string, rejected int, toolMaps []map[string]any, choice any) string {
+	if strings.TrimSpace(corrected) == "" {
+		return ""
+	}
+	if rejected > 0 {
+		return corrected
+	}
+	var pending strings.Builder
+	pending.WriteString(corrected)
+	var out strings.Builder
+	if err := flushStreamText(&pending, toolMaps, choice, true, func(part string) error {
+		out.WriteString(part)
+		return nil
+	}); err != nil {
+		return corrected
+	}
+	// 剥离把整段都吃掉了（纠正轮其实就是一个围栏，只是它的调用被别处认走了）：
+	// 仍然不能交空轮，原样发。
+	if strings.TrimSpace(out.String()) == "" {
+		return corrected
+	}
+	return out.String()
+}
+
+// correctionToolCalls 取出纠正轮文本里真正发出的已声明工具调用。
+//
+// 走的是派发路径同一个 fencedToolCalls，工具集也按 server.go 的同一种方式
+// 归一化：判据必须和真正派发时一致，否则两边会像 declaredFenceStart 与
+// fencedToolCalls 那样各说一套（那次是大小写，见 resolveDeclaredTool）。
+//
+// 这里只回答「有没有发出调用」。参数对不对由后续的 schema 校验负责，
+// 那是另一条路径的事。
+func correctionToolCalls(text string, req ejectRequest) []detectedToolCall {
+	if strings.TrimSpace(text) == "" || len(req.Tools) == 0 {
+		return nil
+	}
+	toolMaps := make([]map[string]any, 0, len(req.Tools))
+	for _, tool := range req.Tools {
+		var f map[string]any
+		_ = json.Unmarshal(tool.Function, &f)
+		toolMaps = append(toolMaps, map[string]any{"type": tool.Type, "function": f})
+	}
+	choice := req.ToolChoice
+	if choice == nil {
+		choice = "auto"
+	}
+	return fencedToolCalls(text, toolMaps, choice)
 }
 
 // deferredStreamSink decides where streamed prose goes while it is still

@@ -219,7 +219,29 @@ func toolChoiceAllows(choice any, name string) bool {
 		}
 	}
 	if requested := requestedToolChoiceName(choice); requested != "" {
-		return requested == name
+		// 忽略大小写：tool_choice 里的拼写与工具声明的拼写不一定一致，
+		// 精确比较会把模型写对的调用判成「不是你指定的那个工具」。
+		return strings.EqualFold(requested, name)
+	}
+	return true
+}
+
+// toolChoiceAllowsAnyCall 判断调用方是否允许本轮发生任何工具调用。
+// 只有 tool_choice:"none" 是禁止；指名某个工具仍然是允许调用。
+//
+// 与 toolChoiceAllows 分开是因为后者需要一个具体工具名，而有些判断发生在
+// 还没有候选名字的时候（例如是否值得为「模型说它不能调工具」跑一轮纠正）。
+func toolChoiceAllowsAnyCall(choice any) bool {
+	if choice == nil {
+		return true
+	}
+	if s, ok := choice.(string); ok {
+		return strings.ToLower(strings.TrimSpace(s)) != "none"
+	}
+	if m, ok := choice.(map[string]any); ok {
+		if t, ok := m["type"].(string); ok && strings.ToLower(strings.TrimSpace(t)) == "none" {
+			return false
+		}
 	}
 	return true
 }

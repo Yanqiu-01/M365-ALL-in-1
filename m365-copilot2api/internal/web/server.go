@@ -2126,7 +2126,8 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				if len(ejected) == 0 {
 					ejected = nativeToolCalls(corrected.Events, body.Tools)
 				}
-				if ejectedCalls, _ := validateCalls("stream-eject", ejected); len(ejectedCalls) > 0 {
+				ejectedCalls, ejectedRejected := validateCalls("stream-eject", ejected)
+				if len(ejectedCalls) > 0 {
 					ejectedCalls = limitToolCalls(ejectedCalls, adaptiveToolCallLimit(ejectedCalls, configuredToolCallLimit(s.settings)))
 					_ = writeToolResponse(w, id, model, true, ejectedCalls, corrected)
 					if body.User != "" && res.ConversationID != "" {
@@ -2135,12 +2136,15 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 					s.bindConversation(acc, &body, r, res, answerPrompt, startedAt)
 					return
 				}
-				// The correction answered in prose. Discard the denial that was
-				// held back and run the replacement through the same fence strip.
+				// 扣住的那句拒绝作废，换成纠正轮的正文。ejectDelivery 保证
+				// corrected.Text 非空时发出去的东西也非空 —— 发了调用但没过 schema
+				// 的那种情况不能再走围栏剥离，否则整段被剥空，客户端拿到一个空轮。
 				deferred.Reset()
 				pending.Reset()
-				pending.WriteString(corrected.Text)
-				if err := flushStreamText(&pending, toolMaps, body.ToolChoice, true, sink); err != nil {
+				if ejectedRejected > 0 {
+					log.Printf("[req-trace] id=%s stage=stream_eject_rejected rejected=%d keeping_text=1", requestID, ejectedRejected)
+				}
+				if err := sink(ejectDelivery(corrected.Text, ejectedRejected, toolMaps, body.ToolChoice)); err != nil {
 					log.Printf("[req-trace] id=%s stage=stream_write err=%v", requestID, err)
 					return
 				}
