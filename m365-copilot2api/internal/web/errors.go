@@ -71,6 +71,21 @@ func classifyUpstream(err error) string {
 	switch {
 	case contains("handshake send", "handshake recv", "bad handshake", "ws dial"):
 		return "upstream handshake failed"
+	// 出口本身没连通，与上游服务无关。必须排在 403/401 那条前面：代理拒 CONNECT
+	// 时可能就是回一个 403，落到下一条会被说成「上游拒绝了请求」，把运维方向指错。
+	//
+	// 三种形状都见过（2026-09-02 的 m365-gateway.log）：
+	//   proxyconnect tcp: dial tcp …   HTTP 代理连不上
+	//   socks connect tcp …            SOCKS 代理连不上
+	//   裸 "Bad Gateway"               TCP 通了，代理把 CONNECT 拒了（Go 传输层
+	//                                  拿代理的 reason phrase 直接构造 error）
+	// 前两种原本落到下面的 timeout / 空分类，第三种谁都不匹配，于是客户端只看到
+	// 无信息量的「upstream request failed」，而可操作的细节只留在服务端日志里。
+	//
+	// 真正来自上游的 502 文本是 "upstream http 502"（account_health.go:23），
+	// 与裸 "bad gateway" 文本不同，不会被这条误判。
+	case contains("proxyconnect", "socks connect", "bad gateway"):
+		return "outbound exit failed to establish a tunnel"
 	case contains("403", "401", "rejected", "forbidden", "unauthorized"):
 		return "upstream rejected the request"
 	case contains("abnormal closure", "close 1006", "use of closed network connection",

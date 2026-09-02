@@ -159,6 +159,15 @@ const rateLimitCooldown = 3 * time.Minute
 
 const rateLimitProbePrompt = "Reply with exactly: OK"
 
+// maxChatRequestBody 是所有面向模型的端点共用的入口请求体上限。
+//
+// 原先它是 openaiChat 里的函数内常量，于是只有 /v1/chat/completions 受保护；
+// /v1/messages（protocol_handlers.go:531）、/v1/responses（:418）和
+// /v1/messages/count_tokens（anthropic_count_tokens.go:30）都是裸的
+// json.NewDecoder(r.Body)，请求体在被转成内层 oaiReq 之前就已经整个进内存了。
+// 内层那道 MaxBytesReader 拦的是重新 marshal 出来的内层 body，对外层无效。
+const maxChatRequestBody = 10 << 20
+
 // confirmRateLimitNotice verifies a text-channel rate-limit notice with a
 // separate, fresh ChatHub conversation. A single notice is not enough to cool
 // down an account because the upstream can occasionally emit a false positive.
@@ -1222,7 +1231,35 @@ func (s *Server) resolveAccount(accountID string) (auth.AccountToken, error) {
 			}
 			return auth.AccountToken{}, fmt.Errorf("no online authorized account available; complete OAuth callback first")
 		}
-		accountID = acc.ID
+		// 调度器选中的账号，如果刷 token 失败，换下一个健康账号再试一次。
+		//
+		// 2026-09-02 17:44:45 实测的 502（req b291e07b，/v1/messages）就是这么来的：
+		// 调度器选了一个账号，EnsureValid 去 login.microsoftonline.com 兑换 refresh
+		// token，那次 POST 走的出口把 CONNECT 拒了，返回裸 "Bad Gateway"，整个请求
+		// 直接 502。而 7 秒后同样字节数的请求（7ac0ef2c，raw_bytes 一字节不差）换到
+		// 另一个账号就 200 了 —— 说明当时池子里有健康账号，只是这条路径不会去找。
+		// outbound 侧也兜不住：POST 不是幂等方法，safeRetryMethod(pool.go:817) 直接
+		// 返回 false，所以那个 token POST 只有一次机会、一个出口，坏一个就硬 502。
+		//
+		// 换账号和「重试同一个 POST」的安全性是两回事：重试同一个才有 refresh token
+		// 单次使用的问题，换账号是去兑换另一个账号的 refresh token，原来那张没碰过。
+		// 所以这里不需要论证失败是否真的没到达 AAD，无条件安全。
+		//
+		// 只在调度器自己挑账号时才 failover。客户端显式指定了 accountID 就照它的意思
+		// 办，静默换成别的账号等于答非所问。
+		chosenID := acc.ID
+		validated, err := s.tokens.EnsureValid(chosenID)
+		if err == nil {
+			return validated, nil
+		}
+		if next, nextErr := s.nextHealthyAccount(chosenID); nextErr == nil {
+			log.Printf("[account-route] failover after token refresh failed from=%q to=%q err=%v", chosenID, next.ID, err)
+			return next, nil
+		}
+		// failover 也没成，返回原始错误而不是 failover 的错误：原始错误才带着正确的
+		// 状态码映射（429 + Retry-After 之类），换成「没有可用账号」会把客户端应有的
+		// 退避提示弄丢。
+		return auth.AccountToken{}, err
 	}
 	return s.tokens.EnsureValid(accountID)
 }
@@ -1636,7 +1673,6 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	const maxChatRequestBody = 10 << 20
 	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxChatRequestBody))
 	if err != nil {
 		http.Error(w, "read body", http.StatusBadRequest)
