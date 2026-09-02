@@ -395,6 +395,10 @@ func (s *Server) Routes() http.Handler {
 	m.HandleFunc("/v1/models", s.openaiModels)
 	m.HandleFunc("/v1/chat/completions", s.openaiChat)
 	m.HandleFunc("/v1/responses", s.responses)
+	// count_tokens must be registered before /v1/messages is matched: ServeMux
+	// treats a pattern without a trailing slash as an exact path, so
+	// /v1/messages never covered the sub-path and it fell through to "/".
+	m.HandleFunc("/v1/messages/count_tokens", s.anthropicCountTokens)
 	m.HandleFunc("/v1/messages", s.anthropicMessages)
 	m.HandleFunc("/v1/images/generations", s.imageGenerations)
 	m.HandleFunc("/v1/images/edits", s.imageEdits)
