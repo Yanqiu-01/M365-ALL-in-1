@@ -13,7 +13,43 @@ import (
 // 命中（会话复用）自动刷新存活时间，长期闲置或超出数量上限的条目
 // 由后台循环回收，防止滥用/测试把云端对话堆满触发封号。
 
+// startResponseHistorySweep enforces the global ceiling on the in-memory
+// Responses history store (see context_budget.go).
+//
+// It starts before the M365_AUTO_CLEANUP check below on purpose: that switch
+// governs deleting *cloud* conversations, an outbound API side effect an
+// operator may well want off. This sweep only reclaims local process memory,
+// and an operator disabling cloud cleanup is not asking the gateway to grow
+// without bound.
+//
+// Enforcing on a timer is weaker than enforcing at the write site: between two
+// sweeps the store is still unbounded. rememberResponse (response_history.go:137)
+// is the correct place for the check, but response_history.go is outside this
+// change's edit scope, so the interval is the residual exposure window and is
+// kept short by default.
+func (s *Server) startResponseHistorySweep() {
+	interval := responseHistorySweepInterval()
+	log.Printf("[response-history] global cap enabled interval=%s max_entries=%d max_bytes=%d",
+		interval, maxResponseHistoryEntries(), maxResponseHistoryBytes())
+	// 长驻定时任务：一次 panic 会终止整个子进程，必须兜底。
+	safeGo("responseHistory.sweep", func() {
+		for {
+			time.Sleep(interval)
+			// Counts and byte totals only -- never response ids, tenant keys,
+			// or message content. See responseHistorySweep.
+			if report := s.enforceResponseHistoryCaps(); report.changed() {
+				log.Printf("[response-history] swept expired=%d evicted_count=%d evicted_bytes=%d dropped_tenants=%d kept_entries=%d kept_bytes=%d tenants=%d over_budget=%t",
+					report.ExpiredEntries, report.EvictedCount, report.EvictedBytes,
+					report.DroppedTenants, report.KeptEntries, report.KeptBytes,
+					report.Tenants, report.OverBudget)
+			}
+		}
+	})
+}
+
 func (s *Server) StartAutoCleanup() {
+	s.startResponseHistorySweep()
+
 	if strings.EqualFold(os.Getenv("M365_AUTO_CLEANUP"), "0") ||
 		strings.EqualFold(os.Getenv("M365_AUTO_CLEANUP"), "false") ||
 		strings.EqualFold(os.Getenv("M365_AUTO_CLEANUP"), "no") ||
