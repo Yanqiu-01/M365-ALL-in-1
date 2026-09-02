@@ -221,13 +221,22 @@ func canonicalToolArguments(s string) string {
 }
 
 func (l agentLedger) hasCompleted(name, args string) bool {
+	return l.completedEvidence(name, args) != nil
+}
+
+// completedEvidence 返回「同名同参且已应答」的那条证据，没有先例时返回 nil。
+//
+// filterCompletedCalls 需要的不只是「完成过没有」，还要知道那一次是成功还是失败：
+// 一次失败的调用没有留下任何可复用的结果，把它当成「已完成的劳动」而压制重试，
+// 等于让模型无法从一次瞬时错误（文件被占用、命令超时、网络抖动）里恢复。
+func (l agentLedger) completedEvidence(name, args string) *toolEvidence {
 	want := canonicalToolArguments(args)
-	for _, e := range l.Completed {
-		if e.Name == name && canonicalToolArguments(e.Arguments) == want {
-			return true
+	for i := range l.Completed {
+		if l.Completed[i].Name == name && canonicalToolArguments(l.Completed[i].Arguments) == want {
+			return &l.Completed[i]
 		}
 	}
-	return false
+	return nil
 }
 
 // toolLooksObservational 判断工具名是否属于只读/观察类。
@@ -257,6 +266,31 @@ func shouldSuppressCompletedCall(name string) bool {
 	return !toolLooksMutating(strings.ToLower(strings.TrimSpace(name)))
 }
 
+// toolCanRepeatSameArguments 判断「同名同参的重复调用」有可能是必要动作，
+// 而不是一定属于重复劳动。
+//
+// 判据是「不是明确的变更类」，而不是「是观察类」：两张关键字表都不完备，真实
+// 客户端的工具名大量落在两表之外 —— Claude Code 的 Bash / Glob / Task、轮询类的
+// poll_* 既不含 read/list/test 等观察词，也不含 write/exec/run 等变更词。原判据
+// 只放行观察类，这些名字于是被当成变更类无条件剔除：Bash{"command":"go test ./..."}
+// 与评测里的 run_tests({}) 是同一件事，只是名字没被表命中。
+//
+// 实测症状（2026-09-02 网关日志，13:06:13 / 13:06:36 / 13:15:24）：
+// raw_candidates=1 post_ledger=0 valid_calls=0 rejected_calls=0 —— 模型选中的
+// 合法工具（解析阶段已校验过名字已声明且参数合 schema）被 ledger 静默丢空，
+// 该轮退化成散文或 intent_retry。
+//
+// observational 那一半必须保留：run_tests 同时含 "test"（观察）与 "run"（变更），
+// 只按「不是变更类」判定会把它剔掉 —— 那正是要防住的那次回归。
+//
+// 注意：本函数的表达式与上面的 shouldSuppressCompletedCall 恰好同形，但语义相反
+// （那个名字读作「应当压制」）。shouldSuppressCompletedCall 在当前代码里已无生产
+// 调用方，且其注释与命名按相反极性解释同一判据，故不复用、不合并。
+func toolCanRepeatSameArguments(name string) bool {
+	name = strings.ToLower(strings.TrimSpace(name))
+	return toolLooksObservational(name) || !toolLooksMutating(name)
+}
+
 // filterCompletedCalls 剔除「同名同参且已有结果」的调用，避免重复劳动。
 //
 // 但验证/只读类工具是例外：状态被改变之后，重新验证是必要动作而非重复劳动。
@@ -270,7 +304,8 @@ func shouldSuppressCompletedCall(name string) bool {
 func filterCompletedCalls(calls []detectedToolCall, l agentLedger) []detectedToolCall {
 	out := calls[:0]
 	for _, c := range calls {
-		if !l.hasCompleted(c.Name, string(c.Arguments)) {
+		prior := l.completedEvidence(c.Name, string(c.Arguments))
+		if prior == nil {
 			out = append(out, c)
 			continue
 		}
@@ -285,7 +320,23 @@ func filterCompletedCalls(calls []detectedToolCall, l agentLedger) []detectedToo
 		// 因此改为：只要整条 ledger 里存在过变更类调用，验证工具即可重复。
 		// 变更之前的纯观察仍然受限（见 mutatedAfter 的调用点被移除后由
 		// hasAnyMutation 承担），避免无意义的重复读取。
-		if toolLooksObservational(c.Name) && l.hasAnyMutation() {
+		//
+		// 「可重复」的判据由 toolLooksObservational 放宽为
+		// toolCanRepeatSameArguments（不是明确变更类即可）：两表之外的名字
+		// （Bash / Glob / poll_*）原先被无条件剔除，与 hasAnyMutation 用
+		// !toolLooksObservational 把同一个名字算作「变更」自相矛盾 —— 同一份
+		// 名字在相隔十几行的两处被判成相反的类别。实测症状见
+		// toolCanRepeatSameArguments 的注释（post_ledger=0 静默丢空）。
+		if !toolCanRepeatSameArguments(c.Name) {
+			continue
+		}
+		// 失败的先例不构成「已完成的劳动」：那一次没有产出可复用的结果，
+		// 此时压制同参重试等于禁止模型从瞬时错误里恢复，而工作区状态尚未
+		// 改变（hasAnyMutation 为假）时这条路径原本无论如何都会剔除。
+		// 只对非明确变更类放行 —— 失败的写入/执行可能已部分生效，且
+		// toolResultLooksFailed 对非观察类走的是宽匹配（输出里出现 "error"
+		// 就算失败），对变更类放行会把一次成功的执行误判成可重放。
+		if prior.Failed || l.hasAnyMutation() {
 			out = append(out, c)
 		}
 	}
