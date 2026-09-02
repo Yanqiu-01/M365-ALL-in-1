@@ -48,8 +48,13 @@ func TestBenchChatReportsErrorAndElapsed(t *testing.T) {
 			t.Fatal("nil error must come with a parsed response")
 		}
 	}
-	if elapsed <= 0 {
-		t.Fatalf("elapsed must be measured even on failure, got %v", elapsed)
+	// 这里只能断言非负，不能断言 > 0。没有账号时 benchChat 在账号解析处就返回，
+	// 整条路径短于本机单调钟的粒度（实测约 515µs，连续两次 time.Now 相减
+	// 几乎恒为 0），所以 time.Since 合法地返回 0。原来的 elapsed <= 0 在机器
+	// 有负载时会偶发失败：实测 pristine 树上 80 次跑挂 2 次，
+	// req-trace 里对应 total_ms=0。
+	if elapsed < 0 {
+		t.Fatalf("elapsed must never be negative, got %v", elapsed)
 	}
 }
 
