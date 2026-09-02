@@ -1600,6 +1600,13 @@ func buildAnswerRequest(answerPrompt, tone string, body oaiReq, ledger agentLedg
 		req.Tools = body.Tools
 		req.ToolChoice = body.ToolChoice
 	}
+	// Router mode reaches this turn with Tools empty by design, but the caller did
+	// declare tools -- the router simply did not select one. Saying so keeps the
+	// environment prompt from offering an absent-tool escape hatch on the very
+	// turn that produces the visible answer. Measured on a clean Claude CLI run:
+	// with 36 tools declared, the answer turn came back "I don't have a dedicated
+	// file-read tool wired up in this session".
+	req.ToolsDeclared = len(body.Tools) > 0 && fmt.Sprint(body.ToolChoice) != "none"
 	return req
 }
 
@@ -1848,7 +1855,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		// completed assistant turn with the actual call lost.
 		routePrompt := modelToolRouterPrompt(routerPromptMessages(body.Messages)+"\n"+ledger.RouterContext(), toolMaps, body.ToolChoice)
 		log.Printf("[req-trace] id=%s stage=router_start prompt_len=%d", requestID, len(routePrompt))
-		routeRes, routedAccount, routeErr := s.routerChatWithFailover(ctx, "stream-router", acc, chathub.Request{Text: routePrompt, Tone: tone, Attachments: body.Attachments, ToolsInText: true})
+		routeRes, routedAccount, routeErr := s.routerChatWithFailover(ctx, "stream-router", acc, chathub.Request{Text: routePrompt, Tone: tone, Attachments: body.Attachments, ToolsDeclared: true, SchemasInText: true})
 		if routedAccount.ID != "" {
 			acc = routedAccount
 			account = chathub.Account{AccessToken: acc.AccessToken, OID: acc.OID, TID: acc.TID}
@@ -1918,7 +1925,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	if body.Stream {
 		if parsed && len(calls) == 0 && normalizedToolChoiceMode(body.ToolChoice) == "auto" && routerRetry {
 			retryPrompt := modelToolRouterPrompt(routerPromptMessages(body.Messages)+"\n"+ledger.RouterContext(), toolMaps, "required") + "\nINTENT RETRY: Select at least one declared tool for this concrete action request. Do not answer with prose or NO_TOOL_NEEDED."
-			retryRes, retryErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: retryPrompt, Tone: tone, Attachments: body.Attachments, ToolsInText: true})
+			retryRes, retryErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: retryPrompt, Tone: tone, Attachments: body.Attachments, ToolsDeclared: true, SchemasInText: true})
 			recordRouterFrames(routerFrameInput{RequestID: requestID, Stage: "stream-router-intent-retry", Prompt: retryPrompt, Text: retryRes.Text, Reasoning: retryRes.Reasoning, Events: retryRes.Events, Err: retryErr})
 			if retryErr == nil && retryRes.ConversationID != "" {
 				s.dropTransientConversation(retryRes.ConversationID)
@@ -2154,7 +2161,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		// failure on a different healthy account and a different outbound exit.
 		// A rate-limited or auth-failed attempt is swapped the same way, so the
 		// previous single-shot 429/401 failover is folded into it.
-		routeRes, routedAccount, routeErr := s.routerChatWithFailover(ctx, "router", acc, chathub.Request{Text: routePrompt, Tone: tone, Attachments: body.Attachments, ToolsInText: true})
+		routeRes, routedAccount, routeErr := s.routerChatWithFailover(ctx, "router", acc, chathub.Request{Text: routePrompt, Tone: tone, Attachments: body.Attachments, ToolsDeclared: true, SchemasInText: true})
 		if routedAccount.ID != "" {
 			acc = routedAccount
 			account = chathub.Account{AccessToken: acc.AccessToken, OID: acc.OID, TID: acc.TID}
@@ -2237,7 +2244,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			// mode. This is the narrow repair path that avoids forcing tools for
 			// ordinary informational questions.
 			retryText := modelToolRouterPrompt(routerPromptMessages(body.Messages)+"\n"+ledger.RouterContext(), toolMaps, "required") + "\nINTENT RETRY: Select at least one declared tool for this concrete action request. Do not answer with prose or NO_TOOL_NEEDED."
-			retryRes, retryErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: retryText, Tone: tone, Attachments: body.Attachments, ToolsInText: true})
+			retryRes, retryErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: retryText, Tone: tone, Attachments: body.Attachments, ToolsDeclared: true, SchemasInText: true})
 			recordRouterFrames(routerFrameInput{RequestID: requestID, Stage: "router-intent-retry", Prompt: retryText, Text: retryRes.Text, Reasoning: retryRes.Reasoning, Events: retryRes.Events, Err: retryErr})
 			if retryErr == nil && retryRes.ConversationID != "" {
 				s.dropTransientConversation(retryRes.ConversationID)
@@ -2281,7 +2288,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			retryText := `Select at least one required next tool call from FUNCTION_DEFINITIONS. Validate every argument against its schema. Return JSON only as {"calls":[{"name":"function_name","arguments":{}}]}.
 APPLICATION_REQUEST_AND_EVIDENCE:
 ` + prompt + "\n" + ledger.RouterContext() + "\nFUNCTION_DEFINITIONS:\n" + string(defs)
-			retryRes, retryErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: retryText, Tone: tone, Attachments: body.Attachments, ToolsInText: true})
+			retryRes, retryErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: retryText, Tone: tone, Attachments: body.Attachments, ToolsDeclared: true, SchemasInText: true})
 			if retryErr == nil {
 				calls, parsed = parseModelToolDecision(retryRes.Text, toolMaps, body.ToolChoice)
 				calls = filterCompletedCalls(calls, ledger)
@@ -2553,7 +2560,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 	// structured event that failed the declared-name/schema boundary.
 	if (planningMode == "native" || invalidDetectedTool) && len(toolMaps) > 0 && fmt.Sprint(body.ToolChoice) != "none" {
 		routePrompt := modelToolRouterPrompt(routerPromptMessages(body.Messages)+"\n"+ledger.RouterContext(), toolMaps, body.ToolChoice)
-		routeRes, routeErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: routePrompt, Tone: tone, Attachments: body.Attachments, ToolsInText: true})
+		routeRes, routeErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: routePrompt, Tone: tone, Attachments: body.Attachments, ToolsDeclared: true, SchemasInText: true})
 		recordRouterFrames(routerFrameInput{RequestID: requestID, Stage: "native-recovery", Prompt: routePrompt, Text: routeRes.Text, Reasoning: routeRes.Reasoning, Events: routeRes.Events, Err: routeErr})
 		if routeErr == nil {
 			calls, parsed = parseModelToolDecision(routeRes.Text, toolMaps, body.ToolChoice)

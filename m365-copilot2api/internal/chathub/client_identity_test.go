@@ -50,7 +50,7 @@ func TestActiveIdentitySummaryDoesNotExposeUserAgent(t *testing.T) {
 func TestChatPayloadUsesIdentity(t *testing.T) {
 	SetClientProfile("cli")
 	t.Cleanup(func() { SetClientProfile("") })
-	frames := strings.Split(chatPayload("hello", "session", "conversation", "request", "magic", true, nil, nil, nil, "", false), rs)
+	frames := strings.Split(chatPayload("hello", "session", "conversation", "request", "magic", true, nil, nil, nil, "", false, false), rs)
 	var frame map[string]any
 	if err := json.Unmarshal([]byte(frames[0]), &frame); err != nil {
 		t.Fatal(err)

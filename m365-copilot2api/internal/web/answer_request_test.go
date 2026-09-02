@@ -37,6 +37,45 @@ func TestBuildAnswerRequestNativeForwardsTools(t *testing.T) {
 	}
 }
 
+// Router mode must keep Tools empty here (pinned above) while still telling
+// chathub that the caller declared tools. Without that, the environment prompt
+// takes its no-tools branch on the turn that produces the visible answer and
+// offers the model an absent-tool escape hatch. Measured on a clean Claude CLI
+// run with 36 tools declared: "I don't have a dedicated file-read tool wired up
+// in this session".
+func TestBuildAnswerRequestReportsDeclaredToolsWithoutForwardingThem(t *testing.T) {
+	req := buildAnswerRequest("[user]\nhello", "magic", answerRequestTestBody(), agentLedger{}, "router")
+	if len(req.Tools) != 0 {
+		t.Fatalf("router answer must not forward native tools: tools=%d", len(req.Tools))
+	}
+	if !req.ToolsDeclared {
+		t.Errorf("router answer turn must report that the caller declared tools")
+	}
+	if req.SchemasInText {
+		t.Errorf("answer prompt carries no schema list, so SchemasInText must stay false")
+	}
+}
+
+func TestBuildAnswerRequestNoToolsDeclaresNone(t *testing.T) {
+	body := answerRequestTestBody()
+	body.Tools = nil
+	req := buildAnswerRequest("[user]\nhello", "magic", body, agentLedger{}, "router")
+	if req.ToolsDeclared {
+		t.Errorf("a request with no tools must not claim the caller declared any")
+	}
+}
+
+// tool_choice=none is an instruction not to call anything, so the answer turn
+// should not assert the caller's tools are usable.
+func TestBuildAnswerRequestToolChoiceNoneDeclaresNone(t *testing.T) {
+	body := answerRequestTestBody()
+	body.ToolChoice = "none"
+	req := buildAnswerRequest("[user]\nhello", "magic", body, agentLedger{}, "router")
+	if req.ToolsDeclared {
+		t.Errorf("tool_choice=none must not report declared tools")
+	}
+}
+
 func TestBuildAnswerRequestAddsCompletedEvidence(t *testing.T) {
 	ledger := agentLedger{Completed: []toolEvidence{{ID: "call_1", Name: "read_file", Arguments: `{}`, Result: "ok"}}}
 	req := buildAnswerRequest("[user]\nsummarize", "magic", answerRequestTestBody(), ledger, "router")

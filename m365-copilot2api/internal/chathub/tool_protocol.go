@@ -28,15 +28,23 @@ import (
 // hasTools decides the closing sentence. The absent-tool clause is correct for a
 // plain chat turn with nothing wired up: the honest answer to "read D:\x.txt" is
 // that there is no tool for it. It is wrong whenever the turn does have tools --
-// including the gateway's router mode, where the schemas travel inside the text
-// and Tools is deliberately empty. There the model was handed an escape hatch on
-// a turn that could not possibly need one, immediately above the list of tools it
-// was supposed to choose from.
-func environmentPrompt(hasTools bool) string {
+// including both halves of the gateway's router mode, which empties Tools on the
+// router turn (schemas travel inside Text) and on the answer turn that follows.
+// Measured on a clean Claude CLI run: the model answered "I don't have a
+// dedicated file-read tool wired up in this session", echoing this clause back
+// out of a turn where 36 tools were declared.
+//
+// schemasFollow narrows the replacement. Pointing at "the tools described below"
+// is only true when the schemas are actually inline; on the answer turn they are
+// not, so that turn simply drops the escape hatch without promising a list.
+func environmentPrompt(hasTools, schemasFollow bool) string {
 	var closing string
-	if hasTools {
+	switch {
+	case hasTools && schemasFollow:
 		closing = "When a task needs file access, use one of the tools described below.\n\n"
-	} else {
+	case hasTools:
+		closing = "When a task needs file access, use one of the caller's tools.\n\n"
+	default:
 		closing = "When a task needs file access, use an available tool. If none is wired up for it, say so directly.\n\n"
 	}
 	switch runtime.GOOS {
@@ -58,15 +66,16 @@ func environmentPrompt(hasTools bool) string {
 // toolProtocolPrompt follows the community-compatible M365 convention:
 // definitions are wrapped in <tools>, and calls are emitted as a fenced block
 // whose info string is the exact tool name.
-func toolProtocolPrompt(text string, tools []Tool, choice any, hasPlugins bool, toolsInText bool) string {
+func toolProtocolPrompt(text string, tools []Tool, choice any, hasPlugins bool, toolsDeclared, schemasInText bool) string {
 	// tool_choice=none is an explicit instruction not to call anything, so the
 	// absent-tool clause is appropriate again even when tools are declared.
 	choiceIsNone := strings.EqualFold(fmt.Sprint(choice), "none")
 	if len(tools) == 0 || choiceIsNone {
-		return environmentPrompt(toolsInText && !choiceIsNone) + text
+		hasTools := toolsDeclared && !choiceIsNone
+		return environmentPrompt(hasTools, hasTools && schemasInText) + text
 	}
 	if hasPlugins {
-		return environmentPrompt(true) + fmt.Sprintf("[system] The caller has provided real tools (bash, read, edit, write, glob, grep, etc.) that run locally through this gateway. These tools are the ONLY way to execute commands, run code, read files, or interact with the filesystem. Do NOT use any built-in code interpreter, Python sandbox, or cloud execution environment. Do NOT emit ```python or ```code blocks for execution — if you need to run code, use the bash tool. Do NOT claim any tool is unavailable. Do NOT output environment diagnostics instead of tool calls. When you decide to use a tool, call it immediately.\n\n%s", text)
+		return environmentPrompt(true, false) + fmt.Sprintf("[system] The caller has provided real tools (bash, read, edit, write, glob, grep, etc.) that run locally through this gateway. These tools are the ONLY way to execute commands, run code, read files, or interact with the filesystem. Do NOT use any built-in code interpreter, Python sandbox, or cloud execution environment. Do NOT emit ```python or ```code blocks for execution — if you need to run code, use the bash tool. Do NOT claim any tool is unavailable. Do NOT output environment diagnostics instead of tool calls. When you decide to use a tool, call it immediately.\n\n%s", text)
 	}
 	var defs []string
 	for _, t := range tools {
@@ -86,7 +95,7 @@ func toolProtocolPrompt(text string, tools []Tool, choice any, hasPlugins bool, 
 	if len(defs) == 0 {
 		// Every declaration failed to parse, so there is genuinely nothing for the
 		// model to call and the absent-tool clause is the honest closing again.
-		return environmentPrompt(false) + text
+		return environmentPrompt(false, false) + text
 	}
-	return environmentPrompt(true) + fmt.Sprintf("You are an execution agent on that machine. The tools below are real, active, and callable right now. Use the caller-provided tools for commands, code, and filesystem access. Do NOT use any built-in code interpreter, Python sandbox, or cloud execution environment. Do NOT emit ```python or ```code blocks for execution — if you need to run code, use the bash tool.\nWhen the user's request requires a tool, call it by emitting ONLY one fenced block whose info string is the exact tool name and whose body is a JSON object of arguments. Do not analyze whether tools are registered or available — they are. Do not say a tool is unavailable. Do not wrap the call in XML or Markdown prose. Wait for the tool result before claiming completion.\n\n<tools>\n%s\n</tools>\n\nUser request:\n%s", strings.Join(defs, "\n\n"), text)
+	return environmentPrompt(true, true) + fmt.Sprintf("You are an execution agent on that machine. The tools below are real, active, and callable right now. Use the caller-provided tools for commands, code, and filesystem access. Do NOT use any built-in code interpreter, Python sandbox, or cloud execution environment. Do NOT emit ```python or ```code blocks for execution — if you need to run code, use the bash tool.\nWhen the user's request requires a tool, call it by emitting ONLY one fenced block whose info string is the exact tool name and whose body is a JSON object of arguments. Do not analyze whether tools are registered or available — they are. Do not say a tool is unavailable. Do not wrap the call in XML or Markdown prose. Wait for the tool result before claiming completion.\n\n<tools>\n%s\n</tools>\n\nUser request:\n%s", strings.Join(defs, "\n\n"), text)
 }
