@@ -24,7 +24,7 @@ func runtimeWorkspaceInstruction() string {
 		cwd = "(unavailable — run the working-directory probe below before touching files)"
 	}
 	return fmt.Sprintf(`[%s]
-You are running through the M365 Copilot2API gateway, which executes on the user's own machine. This is a real computer with a real filesystem, not a cloud sandbox.
+You are running through the M365 Copilot2API gateway, which executes on the user's own machine: a real computer with a real filesystem.
 
 ## What you can do here
 

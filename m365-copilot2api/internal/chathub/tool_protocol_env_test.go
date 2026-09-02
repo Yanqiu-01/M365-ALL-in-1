@@ -72,6 +72,16 @@ func TestEveryTurnCarriesEnvironmentStatement(t *testing.T) {
 // self-sabotage runtime_prompt.go already documents: it makes the wrong answer
 // the most prominent thing in context. The plugin and tool branches used to do
 // exactly that while trying to forbid it.
+//
+// The banned list has to match the one the correction prompts are held to in
+// web's TestCorrectionPromptsStayFactualAndCarryTheRequest, because it is the
+// same invariant. It did not, and that gap is why these two branches kept a row
+// of prohibitions naming a code interpreter and a Python sandbox long after the
+// corrections were cleaned up: the weaker pin was guarding the prompt that ships
+// on *every* tool-bearing turn, while the stricter one guarded a prompt that only
+// appears after a drift is already detected. Emphatic negatives are pinned here
+// too -- Microsoft's filter has rejected turns for them outright, which loses the
+// whole turn rather than repairing it.
 func TestToolProtocolPromptDoesNotRaiseTheCloudPaths(t *testing.T) {
 	tool := envTestTool(t, map[string]any{
 		"name":        "bash",
@@ -81,10 +91,46 @@ func TestToolProtocolPromptDoesNotRaiseTheCloudPaths(t *testing.T) {
 
 	for _, plugins := range []bool{false, true} {
 		got := toolProtocolPrompt("list the directory", []Tool{tool}, "auto", plugins, false, false)
-		for _, salient := range []string{"/mnt/data", "Linux", "container"} {
+		for _, salient := range []string{"/mnt/data", "Linux", "container", "code interpreter", "Python sandbox", "cloud execution"} {
 			if strings.Contains(got, salient) {
 				t.Errorf("plugins=%t branch names %q, which pulls the model toward it:\n%s", plugins, salient, got)
 			}
+		}
+		for _, emphatic := range []string{"CRITICAL", "You must NOT", "Do NOT", "NEVER", "you are NOT"} {
+			if strings.Contains(got, emphatic) {
+				t.Errorf("plugins=%t branch uses jailbreak-shaped phrasing %q, which the content filter rejects:\n%s", plugins, emphatic, got)
+			}
+		}
+	}
+}
+
+// Dropping the prohibitions must not drop the steering they were reaching for.
+// Each of these is the positive form of a ban that used to be in the same
+// sentence, so this is the test that would catch a rewrite that made the prompt
+// polite and useless.
+func TestToolProtocolPromptKeepsTheSteeringAffirmatively(t *testing.T) {
+	tool := envTestTool(t, map[string]any{
+		"name":        "bash",
+		"description": "run a command",
+		"parameters":  map[string]any{"type": "object"},
+	})
+
+	for _, plugins := range []bool{false, true} {
+		got := toolProtocolPrompt("list the directory", []Tool{tool}, "auto", plugins, false, false)
+		// Replaces "do NOT use a code interpreter / do NOT emit ```python".
+		// Asserted on the tool name alone, not on a verb: the point is that some
+		// route for running code survives, and pinning "call" over "use" would
+		// only pin today's wording.
+		if !strings.Contains(got, "bash tool") {
+			t.Errorf("plugins=%t branch lost the route for running code:\n%s", plugins, got)
+		}
+		// Replaces "do NOT say a tool is unavailable".
+		if !strings.Contains(got, "callable right now") {
+			t.Errorf("plugins=%t branch lost the statement that the tools are live:\n%s", plugins, got)
+		}
+		// Replaces "do NOT output environment diagnostics instead of tool calls".
+		if !strings.Contains(got, "result") {
+			t.Errorf("plugins=%t branch lost the instruction to answer from the tool result:\n%s", plugins, got)
 		}
 	}
 }
