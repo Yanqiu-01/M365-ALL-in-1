@@ -3,6 +3,7 @@ package chathub
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"runtime"
 	"strings"
 )
@@ -93,12 +94,18 @@ func toolProtocolPrompt(text string, tools []Tool, choice any, hasPlugins bool, 
 		return environmentPrompt(true, false) + fmt.Sprintf("[system] The caller has provided real tools (bash, read, edit, write, glob, grep, etc.) that run locally through this gateway. They are active and callable right now, and they are the execution path for commands, code, file reads and every other filesystem operation. To run code, call the bash tool. When you decide to use a tool, call it immediately and answer from its result.\n\n%s", text)
 	}
 	var defs []string
+	var badJSON, noName int
 	for _, t := range tools {
 		var f struct {
 			Name, Description string
 			Parameters        json.RawMessage `json:"parameters"`
 		}
-		if json.Unmarshal(t.Function, &f) != nil || f.Name == "" {
+		if json.Unmarshal(t.Function, &f) != nil {
+			badJSON++
+			continue
+		}
+		if f.Name == "" {
+			noName++
 			continue
 		}
 		params := strings.TrimSpace(string(f.Parameters))
@@ -106,6 +113,13 @@ func toolProtocolPrompt(text string, tools []Tool, choice any, hasPlugins bool, 
 			params = "{}"
 		}
 		defs = append(defs, fmt.Sprintf("%s — %s\n```%s\n%s\n```", f.Name, f.Description, f.Name, params))
+	}
+	// A dropped declaration is silent otherwise: the model simply never sees that
+	// tool, and if every one drops we return the same prompt as a caller who
+	// declared nothing. That made a gateway-side parse bug indistinguishable from
+	// an empty client request. Counts and reasons only -- schemas can carry paths.
+	if dropped := badJSON + noName; dropped > 0 {
+		log.Printf("chathub tool-defs dropped=%d of %d bad_json=%d no_name=%d kept=%d", dropped, len(tools), badJSON, noName, len(defs))
 	}
 	if len(defs) == 0 {
 		// Every declaration failed to parse, so there is genuinely nothing for the
