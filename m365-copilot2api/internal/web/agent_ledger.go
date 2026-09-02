@@ -248,13 +248,63 @@ func normalizeFailure(s string) string {
 	}
 	return s
 }
+
+// routerEvidenceFullResults is how many of the NEWEST completed calls keep
+// their full result text. Older calls keep identity only.
+//
+// Dropping a result body is safe in a way that dropping a call is not:
+// completedEvidence and filterCompletedCalls (agent_ledger.go:291, :396) match
+// on Name plus canonicalised Arguments and never read Result, and every call
+// site passes the real ledger struct rather than this text (server.go:1889,
+// 1901, 1942, 2223, 2263, 2302). So identity is what stops the model redoing
+// work, and identity is what this keeps for every call. The result body only
+// has to be present while it is fresh enough to be quoted into an answer.
+const routerEvidenceFullResults = 8
+
+// routerEvidenceMaxBytes caps the serialised ledger. Identity-only entries run
+// ~120 bytes, so 32KB holds roughly 260 calls' identities plus the newest
+// results -- past that, the OLDEST identities are dropped and counted, never
+// the newest. It sits in the same spirit as routerMaxGroups' 40-group cap on
+// the other half of this prompt (router_history_trim.go:12).
+const routerEvidenceMaxBytes = 32 << 10
+
+// elidedResultMarker replaces an older result body. It says the call completed
+// so the model does not treat the entry as an untried action.
+const elidedResultMarker = "[completed; result body elided to bound prompt size]"
+
+// compactRouterEvidence bounds what RouterContext serialises. It returns the
+// entries to emit and how many were dropped entirely.
+func compactRouterEvidence(completed []toolEvidence) ([]toolEvidence, int) {
+	out := make([]toolEvidence, len(completed))
+	copy(out, completed)
+	// Strip result bodies from all but the newest routerEvidenceFullResults.
+	for i := 0; i < len(out)-routerEvidenceFullResults; i++ {
+		if out[i].Result != "" {
+			out[i].Result = elidedResultMarker
+		}
+	}
+	dropped := 0
+	for len(out) > 1 {
+		b, err := json.Marshal(out)
+		if err != nil || len(b) <= routerEvidenceMaxBytes {
+			break
+		}
+		// Oldest first. The newest evidence is the evidence that stops the model
+		// repeating the step it just took, so it is never the victim.
+		out = out[1:]
+		dropped++
+	}
+	return out, dropped
+}
+
 func (l agentLedger) RouterContext() string {
 	type compact struct {
 		Completed    []toolEvidence `json:"completed"`
 		Pending      []toolEvidence `json:"pending"`
 		RepeatedCall bool           `json:"repeated_call"`
 	}
-	b, _ := json.Marshal(compact{l.Completed, l.Pending, l.RepeatedCall})
+	completed, dropped := compactRouterEvidence(l.Completed)
+	b, _ := json.Marshal(compact{completed, l.Pending, l.RepeatedCall})
 	// 逐字取自原 APK rodata。关键是后半句：read/inspect/check/test 在工作区
 	// 状态变化后允许重复，只禁止「参数完全相同的变更类调用」。
 	//
@@ -266,6 +316,11 @@ func (l agentLedger) RouterContext() string {
 	hint := "Use only this compact evidence. Do not repeat a completed mutating call with identical arguments. Read, inspect, check, and test calls may be repeated after workspace state changes."
 	if l.RepeatedFailure {
 		hint += " The same call failed repeatedly; change strategy instead of retrying unchanged."
+	}
+	if dropped > 0 {
+		// Say so rather than let the list read as exhaustive: a model told the
+		// ledger is complete will re-run early steps it cannot see.
+		hint += fmt.Sprintf(" %d earlier completed calls are omitted from this list; treat this conversation as already having more history than shown.", dropped)
 	}
 	return hint + "\nEVIDENCE_LEDGER: " + string(b)
 }

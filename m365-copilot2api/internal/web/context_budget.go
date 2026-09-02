@@ -29,10 +29,35 @@ func configuredContextBudget() int {
 	return window - output
 }
 
+// toolResultPromptLimit mirrors the truncation the send path applies to every
+// tool result (prompt.go:29). The budget has to charge the same number or it
+// prices bytes that never leave the gateway.
+const toolResultPromptLimit = 4000
+
+// attachmentTokenCost is a nominal charge for one attachment. parseContent
+// moves image/file/audio payloads out of the text (multimodal.go:41-88) and
+// ChatHub uploads them separately, so their base64 never enters the prompt --
+// but they are not free upstream either. A flat, conservative stand-in keeps
+// them accounted without pricing a 200KB base64 blob as 50000 prompt tokens.
+const attachmentTokenCost = 1024
+
+// sendableContentText returns the text the send path would actually emit for
+// this message. It deliberately reuses parseContent and compactToolResult --
+// the very functions flattenPromptMessages calls -- so the estimate cannot
+// drift from the prompt.
+func sendableContentText(message oaiMsg) (string, int) {
+	text, attachments := parseContent(message.Content)
+	if strings.EqualFold(strings.TrimSpace(message.Role), "tool") {
+		text = compactToolResult(text, toolResultPromptLimit)
+	}
+	return text, len(attachments)
+}
+
 func messageTokenCost(message oaiMsg, model string) int {
 	count, _ := tokenEstimator(model)
 	cost := messageProtocolTokens + count(strings.TrimSpace(message.Role))
-	cost += serializedTokenCount(message.Content, count)
+	text, attachments := sendableContentText(message)
+	cost += count(text) + attachments*attachmentTokenCost
 	cost += count(message.Name)
 	cost += count(message.ToolCallID)
 	for _, call := range message.ToolCalls {
@@ -114,6 +139,17 @@ func trimMessagesWithBudget(messages []oaiMsg, tools []chathub.Tool, toolChoice 
 		}
 		used += groups[i].cost
 		keepFrom = i
+	}
+
+	// A conversation that has groups but kept none would send instructions and
+	// tool schemas with no task and no evidence: rules about work the model
+	// cannot see. ensureRuntimeWorkspaceInstruction (runtime_prompt.go:111)
+	// always prepends a system message before this runs (server.go:1682), so
+	// `len(out) == 0` below can never catch that case -- out always holds at
+	// least that instruction. Report the overflow the caller can act on instead
+	// of silently shipping a prompt with the request removed.
+	if keepFrom == len(groups) && len(groups) > 0 {
+		return nil, fmt.Errorf("latest message exceeds context budget (%d > %d tokens)", groups[len(groups)-1].cost, budget)
 	}
 
 	out := make([]oaiMsg, 0, len(instructions)+len(messages))
