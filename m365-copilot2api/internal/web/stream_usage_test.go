@@ -82,6 +82,53 @@ func TestPrimaryStreamUsageCountsTheTextItActuallySent(t *testing.T) {
 	}
 }
 
+// 四条流式出口的 prompt tokens 必须都按同一个变量算，而那个变量必须是 prompt。
+//
+// 2026-09-02 实测：主回答出口按 answerPrompt 算，于是续聊时报的是增量而不是全量。
+// 同一段三轮对话，客户端发出的字节 5232 → 10453 → 15674，报回来的 prompt_tokens
+// 三轮都是 1804（1.00x / 1.00x / 1.00x）；非流式和 /v1/messages 同样三轮是
+// 1804 → 3098 → 4391（1.00x / 1.72x / 2.43x），正常累积。
+//
+// 后果不是数字偏一点。Claude CLI / Codex 每轮重发全部历史，靠 usage 估自己的窗口
+// 占用；按增量算的话客户端永远以为上下文是空的，不触发压缩，直到窗口爆掉。
+//
+// answerPrompt 在续聊时被换成增量（server.go:1827），之后又被换成 answerReq.Text
+// （:2022），两次都不再是客户端那段对话。prompt（:1758）才是 body.Messages 压平后
+// 的全量，server.go:1818 那段注释明确说全量 prompt 保留下来就是给 token accounting
+// 用的。
+func TestAllStreamingExitsCountPromptTokensFromTheFullConversation(t *testing.T) {
+	src, err := os.ReadFile("server.go")
+	if err != nil {
+		t.Fatalf("read server.go: %v", err)
+	}
+	// 抓每个 prompt_tokens 字段所用的变量名：先找赋给它的标识符，再回溯该标识符是
+	// 从哪个变量 EstimateTokens 出来的。直接找 EstimateTokens 会连非 usage 的用法
+	// 一起抓进来（例如 context budget 的估算）。
+	text := string(src)
+	assign := regexp.MustCompile(`"prompt_tokens":\s*(\w+)`)
+	matches := assign.FindAllStringSubmatch(text, -1)
+	if len(matches) < 4 {
+		t.Fatalf("只找到 %d 处 prompt_tokens，流式出口的形状变了，这条测试需要跟着更新",
+			len(matches))
+	}
+	for _, m := range matches {
+		variable := m[1]
+		// 找该变量的赋值：`<v> := EstimateTokens(<src>)`
+		def := regexp.MustCompile(regexp.QuoteMeta(variable) +
+			`\s*:=\s*EstimateTokens\((\w+(?:\.\w+\(\))?)\)`).FindStringSubmatch(text)
+		if def == nil {
+			// 该 usage 的 prompt tokens 不是就地 EstimateTokens 出来的（例如从内层
+			// 统计里带出来的），不在这条测试的判据内。
+			continue
+		}
+		if got := def[1]; got != "prompt" {
+			t.Errorf("prompt_tokens 用的 %s 是按 %s 算的；应当按 prompt（body.Messages 压平后的"+
+				"全量）算，否则续聊时报的是增量，客户端的上下文计数会一直停在第一轮的值",
+				variable, got)
+		}
+	}
+}
+
 // 补 usage 的时候不能另起一帧。2026-09-02 对 gateway-c27dfe0 打一次真实流式请求，
 // 抓到的 SSE 尾部是这样：
 //

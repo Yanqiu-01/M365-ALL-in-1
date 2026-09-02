@@ -2221,7 +2221,20 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		// usage 挂在收尾那一帧上，不另发一帧：另外三条出口都是这个形状，
 		// 而 finish_reason 在一条流里只该出现一次。先发一个裸 finish 再补一个
 		// 带 usage 的同形帧，会让严格客户端把第二帧读成又一次完成。
-		streamPT := EstimateTokens(answerPrompt)
+		// prompt tokens 必须按 prompt 算，不能按 answerPrompt。
+		//
+		// answerPrompt 是「这轮真正发给上游的东西」，续聊时它只是增量（1827 行把它换成
+		// attachRuntimeIdentityToIncrement(incPrompt)），2022 行又会换成 answerReq.Text。
+		// 而 prompt（1758 行）是客户端这次发来的整段对话压平后的结果，会随轮次增长。
+		// 1818 行那段注释已经点明：全量 prompt 仍然构建，正是因为 token accounting 要读它。
+		//
+		// 用错的后果不是数字偏一点，是彻底失效：Claude CLI / Codex 这类客户端每轮都重发
+		// 全部历史，靠 usage 估自己的窗口占用。按增量算的话，三轮实测报的都是 1804
+		// （而客户端发出的字节从 5232 涨到 15674），客户端以为上下文一直是空的，
+		// 不触发压缩，直到窗口直接爆掉。另外三条出口用的都是 prompt，只有这条不是。
+		//
+		// completion 侧仍按 text.String()：那本来就是单轮产出，不该累积。
+		streamPT := EstimateTokens(prompt)
 		streamCT := EstimateTokens(text.String())
 		finishChunk := map[string]any{"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []any{map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": "stop"}}, "usage": map[string]any{"prompt_tokens": streamPT, "completion_tokens": streamCT, "total_tokens": streamPT + streamCT}}
 		_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(finishChunk)+"\n\n")
