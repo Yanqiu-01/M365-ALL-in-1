@@ -271,6 +271,17 @@ func (s *Server) debugMiddleware(next http.Handler) http.Handler {
 		next.ServeHTTP(cw, r)
 		out := cw.body.Bytes()
 		rec := debugRecord{ID: "dbg_" + uuid.NewString(), At: start, Level: debugLevel(cw.status), Path: r.URL.Path, Method: r.Method, Status: cw.status, DurationMS: time.Since(start).Milliseconds(), TokenSource: "unavailable_from_chathub", CacheSource: "not_reported_by_upstream", Client: redactBody(in), Gateway: redactBody(out), Upstream: map[string]any{"captured": false, "reason": "ChatHub transport tracing not yet attached to request context"}}
+		// usage 就在刚抓到的响应体里（网关自己算的，已经发给客户端了）。
+		// 不填的话记录会声明「拿不到 token 计数」，而数字其实一直在手上 ——
+		// 面板和 /debug 因此长期显示不出任何计数。口径写明是网关估算，
+		// 不冒充上游：ChatHub 的确不返回 token 数。
+		if debugPathReportsUsage(r.URL.Path) {
+			if inputTokens, outputTokens, found := usageFromResponseBody(out); found {
+				rec.InputTokens = &inputTokens
+				rec.OutputTokens = &outputTokens
+				rec.TokenSource = usageSourceGatewayEstimate
+			}
+		}
 		s.debug.add(rec)
 	})
 }
