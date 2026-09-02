@@ -296,6 +296,29 @@ var toolRefusalPatterns = []string{
 	"code interpreter",
 	"python sandbox",
 	"sandbox environment",
+	// 2026-09-02: measured on a clean Claude CLI run against /v1/messages (36
+	// tools declared, choice=auto). The answer turn said "I don't have a
+	// dedicated file-read tool wired up in this session that can browse
+	// `E:\Temp\m365-clean-probe\` directly -- the `python_execution` tool runs
+	// in a sandboxed environment and can't reach your local drive paths", then
+	// offered "Paste the file contents here" and "Run this in PowerShell
+	// yourself". It reached the client uncorrected: the list already held
+	// "sandbox environment" and "python sandbox", but the model wrote
+	// "sandboxed environment" and "python_execution", and strings.Contains
+	// bridges neither. Each phrasing below is a span of that sentence, kept
+	// apostrophe-free where possible so a curly-quote variant still matches.
+	"sandboxed environment",
+	"python_execution",
+	"python execution tool",
+	"access the local filesystem path",
+	"reach your local drive",
+	"dedicated file-read tool",
+	"wired up in this session",
+	// The denial's fallback: hand the work back to the caller. Both spans are
+	// long enough that a legitimate answer describing a user's PowerShell
+	// script or pasted file will not contain them.
+	"paste the file contents here",
+	"in powershell yourself",
 }
 
 func isToolRefusal(text string) bool {
@@ -360,6 +383,19 @@ var sandboxHallucinationPatterns = []string{
 	"tools actually provided",
 	"tools provided to me",
 	"isolated container",
+	// 2026-09-02: same measured Claude CLI run against /v1/messages as the batch
+	// in toolRefusalPatterns. Only the half that asserts a hosted runtime
+	// belongs here -- "the `python_execution` tool runs in a sandboxed
+	// environment and can't reach your local drive paths". The existing
+	// "sandbox environment" and "python sandbox" missed it by one word each.
+	// The fallback offers ("paste the file contents here", "run this in
+	// PowerShell yourself") are refusal shapes, not sandbox claims, so they
+	// stay out of this list.
+	"sandboxed environment",
+	"python_execution",
+	"python execution tool",
+	"access the local filesystem path",
+	"reach your local drive",
 }
 
 func isSandboxHallucination(text string) bool {
