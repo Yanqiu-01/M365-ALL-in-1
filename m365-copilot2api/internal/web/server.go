@@ -1835,7 +1835,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	// evidence, and is what gates the constrained retry. Both are declared here
 	// because the streaming intent-retry gate sits outside the router block.
 	routerIntent := toolIntentLikely(latestUserIntent(body.Messages, prompt), toolMaps)
-	routerRetry := routerIntent && !ledgerAnswersIntent(ledger)
+	routerRetry := routerIntent && !ledgerAnswersIntent(latestUserIntent(body.Messages, prompt), ledger)
 
 	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(s.settings.get().ChatTimeoutSeconds)*time.Second)
 	defer cancel()

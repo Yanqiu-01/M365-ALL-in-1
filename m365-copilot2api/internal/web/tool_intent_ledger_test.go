@@ -72,7 +72,7 @@ func TestLedgerAnswersIntentRequiresSettledSuccess(t *testing.T) {
 		},
 	}
 	for _, tc := range cases {
-		if got := ledgerAnswersIntent(tc.ledger); got != tc.want {
+		if got := ledgerAnswersIntent("summarize the result", tc.ledger); got != tc.want {
 			t.Errorf("%s: ledgerAnswersIntent = %t, want %t", tc.name, got, tc.want)
 		}
 	}

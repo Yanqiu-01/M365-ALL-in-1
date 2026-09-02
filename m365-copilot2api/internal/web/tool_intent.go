@@ -157,22 +157,120 @@ func declaredToolNameHit(text string, tools []map[string]any) bool {
 // answerable and the existing behaviour is left untouched. When every completed
 // call failed, a retry can still legitimately change strategy, so the guard
 // stays out of the way there too.
-func ledgerAnswersIntent(l agentLedger) bool {
+//
+// "Some call succeeded" is necessary but not sufficient, and measuring it alone
+// was wrong. On a clean Claude CLI run asking for two files, inventory.txt was
+// read, config.ini was not, and the model answered "I still need to read
+// config.ini -- could you share its contents?" with disposition
+// intent_answered_from_ledger: one success had switched the guard on while half
+// the request was still outstanding. So when the request names concrete targets,
+// every named target must appear in the completed evidence before prose is
+// accepted as the finished answer.
+func ledgerAnswersIntent(prompt string, l agentLedger) bool {
 	if len(l.Pending) > 0 {
 		return false
 	}
+	succeeded := false
 	for _, e := range l.Completed {
 		if !e.Failed {
-			return true
+			succeeded = true
+			break
 		}
 	}
-	return false
+	if !succeeded {
+		return false
+	}
+	return namedTargetsCovered(prompt, l)
+}
+
+// namedTargetsCovered reports whether every concrete target the request names is
+// present in the arguments of a completed, non-failed call.
+//
+// Only unambiguous targets count. A bare word cannot be checked -- "read the
+// config" names nothing a ledger can be compared against -- so the test is
+// restricted to file-like tokens, which is what an agentic client's requests
+// actually carry. A request naming none of them falls back to the plain
+// "something succeeded" reading, preserving the original repair.
+func namedTargetsCovered(prompt string, l agentLedger) bool {
+	targets := namedFileTargets(prompt)
+	if len(targets) == 0 {
+		return true
+	}
+	var evidence strings.Builder
+	for _, e := range l.Completed {
+		if e.Failed {
+			continue
+		}
+		evidence.WriteString(strings.ToLower(e.Arguments))
+		evidence.WriteByte('\n')
+	}
+	haystack := evidence.String()
+	for _, target := range targets {
+		if !strings.Contains(haystack, target) {
+			return false
+		}
+	}
+	return true
+}
+
+// namedFileTargets extracts lowercased file-like tokens from the request.
+//
+// The match is deliberately narrow: a token has to carry a dot followed by a
+// short alphanumeric extension to count. Paths are reduced to their base name so
+// that a request written as E:\dir\config.ini still matches a call recorded as
+// {"path":"config.ini"}, which is how a client that already knows its working
+// directory issues the call.
+func namedFileTargets(prompt string) []string {
+	fields := strings.FieldsFunc(strings.ToLower(prompt), func(r rune) bool {
+		return unicode.IsSpace(r) || r == '"' || r == '\'' || r == '`' ||
+			r == '(' || r == ')' || r == '[' || r == ']' || r == '{' || r == '}' ||
+			r == ',' || r == ';' || r == '<' || r == '>'
+	})
+	seen := map[string]bool{}
+	var out []string
+	for _, field := range fields {
+		token := strings.Trim(field, ".:?!*")
+		if idx := strings.LastIndexAny(token, `/\`); idx >= 0 {
+			token = token[idx+1:]
+		}
+		dot := strings.LastIndex(token, ".")
+		if dot <= 0 || dot == len(token)-1 {
+			continue
+		}
+		ext := token[dot+1:]
+		if len(ext) < 1 || len(ext) > 5 {
+			continue
+		}
+		// An extension is alphanumeric and holds at least one letter. The letter
+		// requirement is what keeps version numbers ("upgrade to 1.24", "python 3.12")
+		// out: no real extension is all digits, so nothing is lost by excluding them.
+		alnum := true
+		hasLetter := false
+		for _, r := range ext {
+			switch {
+			case unicode.IsLetter(r):
+				hasLetter = true
+			case unicode.IsDigit(r):
+			default:
+				alnum = false
+			}
+			if !alnum {
+				break
+			}
+		}
+		if !alnum || !hasLetter || seen[token] {
+			continue
+		}
+		seen[token] = true
+		out = append(out, token)
+	}
+	return out
 }
 
 // shouldRetryForToolIntent is the single gate both router paths use before
 // spending an extra upstream round on a constrained retry.
 func shouldRetryForToolIntent(prompt string, tools []map[string]any, l agentLedger) bool {
-	if ledgerAnswersIntent(l) {
+	if ledgerAnswersIntent(prompt, l) {
 		return false
 	}
 	return toolIntentLikely(prompt, tools)
