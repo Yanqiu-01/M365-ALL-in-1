@@ -155,6 +155,29 @@ func directiveNameSpan(rest string) (string, int) {
 	return rest[start:i], i
 }
 
+// directiveTarget 是「CALL_TOOL 标记之后到底跟没跟一个名字」的唯一判据。
+// rest 是紧跟标记之后的原文。返回名字与名字之后的剩余文本。
+//
+// 抽取（extractDirectiveCandidates）与定位（lastToolDirectiveIndex）必须共用
+// 同一个判据：两处各写一份时会漂移 —— 定位侧曾要求标记后紧跟半角冒号，抽取侧
+// 只要求「装饰之后有名字」，于是 "CALL_TOOL Read({...})" / "CALL_TOOL\nRead(...)"
+// 这类无冒号写法能被抽出候选却在位置上不可见：整段回复退化成 parsed=false，
+// 或者更糟 —— 选中思考里那条带冒号的旧指令。
+func directiveTarget(rest string) (string, string) {
+	// 冒号与强调符可以任意顺序出现：CALL_TOOL:、**CALL_TOOL:**、**CALL_TOOL**:。
+	// 这个集合里只有装饰与冒号，不含任何实义字符，因此不可能越过正文去认名字。
+	// 下划线不在集合里：它是合法的工具名首字符，剥掉会改名字。
+	trimmed := strings.TrimLeft(rest, ": \t*")
+	if strings.HasPrefix(strings.TrimLeft(rest, " \t"), "__") {
+		trimmed = strings.TrimLeft(strings.TrimLeft(strings.TrimLeft(rest, " \t")[2:], "_"), ": \t*")
+	}
+	name, nameEnd := directiveNameSpan(trimmed)
+	if name == "" {
+		return "", ""
+	}
+	return name, trimmed[nameEnd:]
+}
+
 // decorationOnly 判断名字与参数之间的间隔是否只有装饰：空白、围栏反引号、
 // 强调符、以及围栏的 info string（```json）。有实义文字就说明这两段不属于
 // 同一次调用，必须放弃，否则会把后文里无关的 JSON 当成参数。
@@ -175,6 +198,27 @@ func bareDirectiveTail(rest string) bool {
 		line = line[:nl]
 	}
 	return strings.Trim(strings.TrimSpace(line), " \t`*_.。!！;；,，:：)）\"'") == ""
+}
+
+// bareDirectiveHead 判断指令标记是否处在行首（前面只允许装饰：空白、列表符、
+// 引用符、强调符、反引号）。
+//
+// 只有裸名字形态需要这道判据。形态 1、2 自带 JSON 参数体，那本身就是「我在
+// 发起调用」的证据，行内出现也算（TestParseToolDecisionUsesLastDirective 里
+// 复述的那条就在行内）。裸名字没有任何这类证据，它唯一的凭据是规则原文要求
+// 的 "end with EXACTLY one line: CALL_TOOL:" —— 真调用必然独占一行。
+//
+// 少了这道判据，散文里提到标记就会真的派发。实测除句点以外的所有标点、反引号
+// 包裹、以及后面紧跟一个换行的写法，都会让 "Do not output CALL_TOOL: run_tests"
+// 派发 run_tests；句点能逃掉只是因为 '.' 是合法名字字节（点号 MCP 名字需要它），
+// 它被吞进名字变成 run_tests. 从而校验失败，属于偶然。
+//
+// 判据只看位置，不猜语义。不去识别否定词：那既漏（换种说法就绕过）又误伤
+// （"如果测试没过，CALL_TOOL: run_tests" 是真调用）。行内的裸名字改为落空并
+// 触发修复轮，是 fail-closed 的那一侧。
+func bareDirectiveHead(text string, at int) bool {
+	start := strings.LastIndexByte(text[:at], '\n') + 1
+	return strings.Trim(text[start:at], " \t`*_>-+") == ""
 }
 
 // extractDirectiveCandidates 找出所有 CALL_TOOL: name <args> 形式的候选。
@@ -198,14 +242,11 @@ func extractDirectiveCandidates(text string) []toolCandidate {
 		at := offset + idx
 		offset = at + len(directiveMarker)
 
-		rest := text[offset:]
-		// 跳过标记与名字之间的冒号和空白。
-		rest = strings.TrimLeft(rest, ": \t")
-		name, nameEnd := directiveNameSpan(rest)
+		// 跳过标记与名字之间的冒号与装饰。判据与 lastToolDirectiveIndex 共用。
+		name, tail := directiveTarget(text[offset:])
 		if name == "" {
 			continue
 		}
-		tail := rest[nameEnd:]
 
 		// 形态 1：括号参数。要求名字与 "(" 之间只有装饰。
 		if open := strings.IndexByte(tail, '('); open >= 0 && decorationOnly(tail[:open]) {
@@ -225,8 +266,8 @@ func extractDirectiveCandidates(text string) []toolCandidate {
 				continue
 			}
 		}
-		// 形态 3：裸名字，无参数。
-		if bareDirectiveTail(tail) {
+		// 形态 3：裸名字，无参数。必须独占一行：行首 + 名字后无内容。
+		if bareDirectiveHead(text, at) && bareDirectiveTail(tail) {
 			out = append(out, toolCandidate{Name: name, Args: map[string]any{}, At: at})
 		}
 	}
@@ -258,6 +299,28 @@ func extractFencedDecisions(text string, tools []map[string]any) []envelopeDecis
 			continue
 		}
 		args, ok := decodeArguments(text[m[4]:m[5]])
+		// 体解析不出参数时，要分两种情况，不能一律跳过、也不能一律判畸形。
+		//
+		// 体根本不是 JSON：这不是一次调用尝试，而是一段普通代码块。declaredTool
+		// 大小写不敏感，散文里示意用的 ```bash 会命中客户端声明的 Bash，旧代码把
+		// 它判成「畸形决策帧」，于是同一条消息里真正的调用被一起失败关闭（实测
+		// raw_candidates=0 的一条来源）。这种要跳过。
+		//
+		// 体以 { 开头却解析不了：模型确实在写参数，只是写坏了（多余逗号、被截断、
+		// 单引号）。这种必须记成畸形帧失败关闭 —— 跳过会让前面那一帧、也就是模型
+		// 自己已经推翻的旧决策，当成末帧被真的发出去。
+		// 体是合法 JSON 但不合 schema 的那种畸形，仍由下游校验失败关闭。
+		if !ok {
+			if !jsonObjectAttempt(text[m[4]:m[5]]) {
+				continue
+			}
+			if prevEnd < 0 || len(out) == 0 || strings.TrimSpace(text[prevEnd:at]) != "" {
+				out = append(out, envelopeDecision{At: at})
+			}
+			out[len(out)-1].Malformed = true
+			prevEnd = end
+			continue
+		}
 		// 相邻围栏（中间只有空白）属于同一帧，支持一次并行发起多个调用；
 		// 中间有正文说明前一个已被推翻，另起一帧。
 		merge := prevEnd >= 0 && len(out) > 0 && strings.TrimSpace(text[prevEnd:at]) == ""
@@ -265,12 +328,37 @@ func extractFencedDecisions(text string, tools []map[string]any) []envelopeDecis
 			out = append(out, envelopeDecision{At: at})
 		}
 		cur := &out[len(out)-1]
-		if !ok {
-			cur.Malformed = true
-		} else {
-			cur.Calls = append(cur.Calls, toolCandidate{Name: name, Args: args, At: at})
-		}
+		cur.Calls = append(cur.Calls, toolCandidate{Name: name, Args: args, At: at})
 		prevEnd = end
+	}
+	return out
+}
+
+// xmlNamedCall 匹配把名字放在标签属性上的 XML 形态：
+// <tool_call name="Read">{...}</tool_call>（function_call / invoke 同形）。
+// 必须同时出现 name= 属性与闭合标签，散文里提到 <tool_call> 字样不会命中。
+var xmlNamedCall = regexp.MustCompile(`(?is)<\s*(?:tool_call|function_call|invoke|tool)\s[^>]*?\bname\s*=\s*["']([A-Za-z0-9_.-]+)["'][^>]*>(.*?)<\s*/\s*(?:tool_call|function_call|invoke|tool)\s*>`)
+
+// extractXMLNamedDecisions 认「名字在属性里、参数是标签体 JSON」的形态。
+// Hermes 风格的 <tool_call>{"name":..,"arguments":{..}}</tool_call> 走信封那条路
+// 已经能解析；带 name 属性的这一变体此前无人认领，整轮 parsed=false。
+//
+// 名字原样交出，不做存在性判断：与其他抽取器一致，由校验阶段淘汰。
+func extractXMLNamedDecisions(text string) []envelopeDecision {
+	var out []envelopeDecision
+	for _, m := range xmlNamedCall.FindAllStringSubmatchIndex(text, -1) {
+		at := m[0]
+		name := text[m[2]:m[3]]
+		// 标签体只接受 JSON 对象。<arg name="k">v</arg> 这类逐项形态无法在不
+		// 猜测类型的前提下还原参数值（schema 要 number 时字符串会被判非法），
+		// 因此不在这里认，留给修复轮。
+		args, ok := decodeArguments(text[m[4]:m[5]])
+		if !ok {
+			// 标签是显式的调用意图，体不可用即畸形帧，失败关闭去修复轮。
+			out = append(out, envelopeDecision{At: at, Malformed: true})
+			continue
+		}
+		out = append(out, envelopeDecision{At: at, Calls: []toolCandidate{{Name: name, Args: args, At: at}}})
 	}
 	return out
 }
@@ -287,11 +375,24 @@ func extractEnvelopeDecisions(text string) []envelopeDecision {
 		}
 		end := balancedSpan(text, i, '{', '}')
 		if end < 0 {
+			// 未闭合：上游文本被截断（token 上限、流中断）。这仍然是一次决策
+			// 尝试，必须记成畸形帧交给修复轮，否则前面那一帧（已被模型推翻的
+			// 旧决策）会被当成末帧执行。
+			if envelopeShaped(text[i:]) {
+				out = append(out, envelopeDecision{At: i, Malformed: true})
+				break
+			}
 			continue
 		}
 		fragment := text[i : end+1]
 		var raw map[string]json.RawMessage
 		if json.Unmarshal([]byte(fragment), &raw) != nil {
+			// 解析失败但形状像信封（多余逗号、单引号、注释……）同样是畸形帧。
+			// 只有「看起来就是信封」才这样记：散文里随手写的花括号不是决策，
+			// 把它记成末帧会把本来能解析的一轮反过来打成 raw_candidates=0。
+			if envelopeShaped(fragment) {
+				out = append(out, envelopeDecision{At: i, Malformed: true})
+			}
 			i = end
 			continue
 		}
@@ -334,6 +435,33 @@ func extractEnvelopeDecisions(text string) []envelopeDecision {
 		i = end
 	}
 	return out
+}
+
+// jsonObjectAttempt 判断一段围栏体「本来是不是想写一个 JSON 参数对象」。
+//
+// 这是把散文代码块与写坏了的参数分开的唯一信号，而且必须比 json.Unmarshal 宽：
+// 判断的前提正是这段文本解析不了。以 { 开头就算 —— shell、Python、SQL、纯文本
+// 都不这样开头，而多余逗号、单引号、被截断的对象都还留着这个开头。
+func jsonObjectAttempt(body string) bool {
+	return strings.HasPrefix(strings.TrimSpace(body), "{")
+}
+
+// envelopeShapeKey 匹配决策信封的键：calls 系列别名，或 name 与参数键同时在场。
+var envelopeShapeKey = regexp.MustCompile(`"(calls|tool_calls|toolCalls|function_calls|functionCalls)"\s*:`)
+var envelopeShapeName = regexp.MustCompile(`"name"\s*:`)
+var envelopeShapeArgs = regexp.MustCompile(`"(arguments|args|parameters|input|arguments_json)"\s*:`)
+
+// envelopeShaped 判断一段解析失败的花括号文本是否「本来想当一个决策信封」。
+//
+// 这是把「畸形末帧」与「散文里的花括号」分开的唯一信号。不加这层判断而把每一段
+// 解析不了的花括号都记成畸形帧，会让末尾随手一句带花括号的说明反过来把本来
+// 成功的一轮打成失败；只看是否解析成功而完全不记，则畸形末帧会被跳过，让前面
+// 那条已被推翻的旧决策执行。
+func envelopeShaped(fragment string) bool {
+	if envelopeShapeKey.MatchString(fragment) {
+		return true
+	}
+	return envelopeShapeName.MatchString(fragment) && envelopeShapeArgs.MatchString(fragment)
 }
 
 // bareCallHasArguments 要求裸单调用对象显式带上参数键。没有外层 calls 数组
@@ -395,10 +523,35 @@ func parseEnvelopeCall(call map[string]json.RawMessage, at int) (toolCandidate, 
 		if !ok {
 			return toolCandidate{}, false
 		}
+		// "parameters" 在 JSON-Schema 里是 schema 外壳，不是参数值。模型复述
+		// 一个工具定义时（提示词的 Available tools 就是这个形状）参数会从错误的
+		// 嵌套层级取出：带必填参数的工具因此整帧失败关闭、把同一条消息里真正的
+		// 指令一起丢掉；无必填参数的工具更糟 —— schema 关键字会作为参数被真的
+		// 发出去。定义回声不是一次调用，整个候选作废。
+		if key == "parameters" && schemaShaped(decoded) {
+			return toolCandidate{}, false
+		}
 		args = decoded
 		break
 	}
 	return toolCandidate{Name: strings.TrimSpace(name), Args: args, At: at}, true
+}
+
+// schemaShaped 判断一个对象是不是 JSON-Schema 外壳而不是参数值。
+// 判据保持窄：只有 type:"object" 与 properties/required 同时在场才算，
+// 这样 {"parameters":{"path":"a.py"}} 这类真实参数不受影响。
+func schemaShaped(obj map[string]any) bool {
+	if _, ok := obj["$schema"]; ok {
+		return true
+	}
+	if typ, _ := obj["type"].(string); typ != "object" {
+		return false
+	}
+	if _, ok := obj["properties"].(map[string]any); ok {
+		return true
+	}
+	_, ok := obj["required"]
+	return ok
 }
 
 // extractEnvelopeCandidates is retained for callers that only need the legacy

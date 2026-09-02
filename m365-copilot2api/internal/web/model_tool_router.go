@@ -25,11 +25,21 @@ func modelToolRouterPrompt(prompt string, tools []map[string]any, choice any) st
 - Never build a document by shelling out. Do not use cat/tee heredocs or echo redirects to create content; call the file-writing tool or the dedicated skill instead.
 - workspace_shell is for short operational commands (ls, tests, git, package installs), not for authoring.
 - Only use tools from the available list. Validate arguments against the schema. Do not invent tools.`
-	// Multi-turn: completed tool evidence (tool[...], tool_calls:) was already
-	// acted upon, so re-invoking those tools would duplicate work.
-	if strings.Contains(prompt, "tool_calls:") || strings.Contains(prompt, "tool[call_") {
+	// Multi-turn: completed tool evidence was already acted upon, so re-invoking
+	// those tools would duplicate work.
+	//
+	// The gate must name the markers the prompt actually carries. The only
+	// producer of this text is flattenPromptMessages, and it writes
+	// "[<role> tool_calls]" and "[tool result id=call_x]" — neither contains
+	// "tool_calls:" nor "tool[call_". Those two spellings never appeared in a
+	// real request, so on every genuine multi-turn call the rules below were
+	// silently omitted and the model kept re-invoking tools whose results it had
+	// already been shown. The legacy spellings are kept so a caller that pastes a
+	// transcript in that shape still trips the gate.
+	if strings.Contains(prompt, "tool_calls]") || strings.Contains(prompt, "[tool result id=") ||
+		strings.Contains(prompt, "tool_calls:") || strings.Contains(prompt, "tool[call_") {
 		rules += `
-- Completed evidence must not be repeated: tool_calls/tool[call_x] rows are prior results already delivered to the user, never re-invoke them
+- Completed evidence must not be repeated: [role tool_calls] and [tool result id=...] rows are prior results already delivered to the user, never re-invoke them
 - Only start a new tool call when fresh unfinished work remains on the current request`
 	}
 	if name := requestedToolChoiceName(choice); name != "" {
@@ -56,9 +66,15 @@ func normalizeToolDirective(text string) string {
 	return strings.ReplaceAll(text, "：", ":")
 }
 
-// lastToolDirectiveIndex 返回最后一个 CALL_TOOL: 指令的起始下标（大小写
+// lastToolDirectiveIndex 返回最后一个 CALL_TOOL 指令的起始下标（大小写
 // 不敏感），没有则返回 -1。推理模型的指令位于思考之后，必须取最后一处：
 // 思考过程里可能复述过 "CALL_TOOL:" 字样，取第一处会解析到错误的参数。
+//
+// 「算不算一处指令」必须与 extractDirectiveCandidates 用同一个判据
+// （directiveTarget），否则两个识别器会漂移：此前这里要求标记后紧跟半角冒号，
+// 抽取侧只要求装饰之后有名字，于是 "CALL_TOOL Read({...})" 能被抽出候选却在
+// 位置上不可见 —— 要么整轮 parsed=false（raw_candidates=0），要么选中思考里
+// 那条带冒号的旧指令。
 func lastToolDirectiveIndex(text string) int {
 	lower := strings.ToLower(text)
 	last := -1
@@ -68,14 +84,10 @@ func lastToolDirectiveIndex(text string) int {
 			return last
 		}
 		idx += offset
-		cursor := idx + len(directiveMarker)
-		for cursor < len(lower) && (lower[cursor] == ' ' || lower[cursor] == '\t') {
-			cursor++
-		}
-		if cursor < len(lower) && lower[cursor] == ':' {
+		offset = idx + len(directiveMarker)
+		if name, _ := directiveTarget(text[offset:]); name != "" {
 			last = idx
 		}
-		offset = idx + len(directiveMarker)
 	}
 }
 
@@ -115,6 +127,7 @@ func parseModelToolDecision(text string, tools []map[string]any, choice any) ([]
 	// 以工具名命名的围栏与 JSON 信封是同一类「帧」：整帧要么全部合法，要么
 	// 判为不可解析。合并进同一个候选序列，位置语义（取最后一帧）不变。
 	decisions = append(decisions, extractFencedDecisions(text, tools)...)
+	decisions = append(decisions, extractXMLNamedDecisions(text)...)
 	noToolAt, noTool := trailingNoToolDecision(text)
 
 	latestAt := -1
