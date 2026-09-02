@@ -331,9 +331,9 @@ func TestStartRegisterJobRejectsBadInput(t *testing.T) {
 	server := &Server{}
 
 	for name, request := range map[string]registerJobRequest{
-		"未知模式":       {Mode: "carrier-pigeon", StartNum: 1, Target: 2},
+		"未知模式":         {Mode: "carrier-pigeon", StartNum: 1, Target: 2},
 		"startNum 为 0": {Mode: "phone", StartNum: 0, Target: 10},
-		"target 小于起点": {Mode: "phone", StartNum: 100, Target: 99},
+		"target 小于起点":  {Mode: "phone", StartNum: 100, Target: 99},
 	} {
 		if _, err := server.startRegisterJob(manager, request); err == nil {
 			t.Fatalf("%s 被接受了", name)
