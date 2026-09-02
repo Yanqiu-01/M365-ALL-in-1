@@ -280,6 +280,37 @@ type anthropicMessage struct {
 	Role    string `json:"role"`
 	Content any    `json:"content"`
 }
+
+// anthropicToolResultText flattens a tool_result content value to text.
+// Anthropic allows either a plain string or a list of content blocks, so a
+// caller returning blocks must not lose its message to a failed type assertion.
+func anthropicToolResultText(content any) string {
+	switch v := content.(type) {
+	case nil:
+		return ""
+	case string:
+		return v
+	case []any:
+		var parts []string
+		for _, raw := range v {
+			block, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			if text, ok := block["text"].(string); ok && text != "" {
+				parts = append(parts, text)
+			}
+		}
+		if len(parts) > 0 {
+			return strings.Join(parts, "\n")
+		}
+	}
+	if encoded, err := json.Marshal(content); err == nil {
+		return string(encoded)
+	}
+	return fmt.Sprint(content)
+}
+
 type anthropicTool struct {
 	Name        string         `json:"name"`
 	Description string         `json:"description,omitempty"`
@@ -351,7 +382,23 @@ func (r anthropicRequest) openAI() (oaiReq, error) {
 				calls = append(calls, map[string]any{"id": b["id"], "type": "function", "function": map[string]any{"name": b["name"], "arguments": mustJSON(b["input"])}})
 			case "tool_result":
 				id, _ := b["tool_use_id"].(string)
-				o.Messages = append(o.Messages, oaiMsg{Role: "tool", ToolCallID: id, Content: b["content"]})
+				content := b["content"]
+				// is_error is the client's own verdict on the call, and it is the
+				// only authoritative one. Dropping it left the ledger to guess from
+				// the result text, and toolResultLooksFailed guesses wrong in both
+				// directions: a failed Read whose message reads "File does not
+				// exist." was recorded as a success, so the retry was suppressed and
+				// the model was told the file had been read.
+				//
+				// The OpenAI wire format has no is_error field, so the flag is
+				// carried as an explicit prefix on the tool content. toolLooksFailed
+				// keys on a leading "error"/"failed" for observational tools and this
+				// prefix satisfies that, while staying readable to the model, which
+				// also has to understand that the call failed.
+				if isError, ok := b["is_error"].(bool); ok && isError {
+					content = "Error: " + anthropicToolResultText(content)
+				}
+				o.Messages = append(o.Messages, oaiMsg{Role: "tool", ToolCallID: id, Content: content})
 			}
 		}
 		if len(text) > 0 || len(calls) > 0 {

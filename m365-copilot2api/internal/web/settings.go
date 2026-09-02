@@ -415,7 +415,30 @@ func adaptiveToolCallLimit(c []detectedToolCall, configured int) int {
 	return configured
 }
 
+// toolShellNames are tool names that can run arbitrary commands, or delegate to
+// an agent that can, but contain none of the substrings below. They are matched
+// whole rather than by substring, because each is a short word that would
+// otherwise fire inside unrelated names.
+//
+// These are not hypothetical: Bash, Task and TodoWrite are Claude Code's own
+// tool names, and the live gateway log shows them declared 11 to 36 at a time.
+// Landing in neither the mutating nor the read-only table made Bash count as
+// "not explicitly mutating", which is the most dangerous possible default for
+// the one tool that can run anything.
+var toolShellNames = map[string]bool{
+	"bash": true, "sh": true, "zsh": true, "fish": true, "pwsh": true,
+	"powershell": true, "cmd": true, "terminal": true, "console": true,
+	"task": true, "agent": true, "subagent": true, "dispatch": true,
+	"process": true, "spawn": true, "kill": true, "eval": true, "compile": true,
+	"build": true, "deploy": true, "publish": true, "commit": true, "push": true,
+	"merge": true, "revert": true, "reset": true, "checkout": true,
+}
+
 func toolLooksMutating(name string) bool {
+	name = strings.ToLower(strings.TrimSpace(name))
+	if toolShellNames[name] {
+		return true
+	}
 	for _, word := range []string{"exec", "shell", "command", "write", "edit", "update", "delete", "remove", "move", "rename", "create", "patch", "apply", "install", "run"} {
 		if strings.Contains(name, word) {
 			return true

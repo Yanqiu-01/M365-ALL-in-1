@@ -87,7 +87,66 @@ func toolResultLooksFailed(name, result string) bool {
 		}
 		return false
 	}
+	// 命令/委派类工具的输出本身就常常「谈论」错误，而不是「是」错误：
+	// Bash 跑 grep error、go test 打出 TestErrorPath PASS、构建打出
+	// "0 errors"、Glob 列出 errors.go、Task 汇报「已修好那次 permission
+	// denied」—— 宽匹配把这五种成功全判成失败。实测这些名字（Bash / Glob /
+	// Task / TodoWrite）恰好落在两张关键字表之外，是同一处命名表不完备的
+	// 另一面。
+	//
+	// 这类工具改按「壳层怎么报失败」判定：显式非零退出码，或开头就是错误
+	// 说明。正文中间出现 error 一词不再算失败 —— 那正是它成功读到的内容。
+	if toolShellLike(name) {
+		return shellResultLooksFailed(compactToolResult(result, 4000))
+	}
 	return failureSignal.MatchString(compactToolResult(result, 4000))
+}
+
+// toolShellLike 判断工具是否属于「输出里会引用错误文本」的命令/委派类。
+// 判据与 toolLooksMutating 的壳层部分同源，但这里只关心输出如何解读，
+// 不关心副作用，因此 write/edit 一类不在内：它们的输出是简短确认，
+// 出现 error 一词通常确实是失败。
+func toolShellLike(name string) bool {
+	name = strings.ToLower(strings.TrimSpace(name))
+	if toolShellNames[name] {
+		return true
+	}
+	for _, word := range []string{"exec", "shell", "command", "bash", "terminal", "run"} {
+		if strings.Contains(name, word) {
+			return true
+		}
+	}
+	return false
+}
+
+// shellFailureSignal 只匹配壳层真正的失败信号：非零退出码，或行首的错误说明。
+// 与 failureSignal 的差别是不含裸 \berror\b —— 命令输出引用错误文本是常态。
+var shellFailureSignal = regexp.MustCompile(`(?i)(exit\s*(code|status)?\s*[:=]?\s*[1-9]\d*|\bsegmentation fault\b|\bcore dumped\b|command not found|no such file or directory)`)
+
+// shellResultLooksFailed 判定命令输出是否表示失败。
+func shellResultLooksFailed(result string) bool {
+	trimmed := strings.TrimSpace(result)
+	if trimmed == "" {
+		return false
+	}
+	if shellFailureSignal.MatchString(trimmed) {
+		return true
+	}
+	// 行首的错误说明才算失败，正文中间的不算。只看前几行：失败的命令通常
+	// 一开头就报错，而成功的长输出里第 40 行出现 error 一词是正常内容。
+	lines := strings.SplitN(trimmed, "\n", 4)
+	for i, line := range lines {
+		if i >= 3 {
+			break
+		}
+		lower := strings.ToLower(strings.TrimSpace(line))
+		for _, prefix := range []string{"error", "fatal", "failed", "failure", "exception:", "traceback", "permission denied", "panic:"} {
+			if strings.HasPrefix(lower, prefix) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // scopedCallID returns a globally unique tool call id. The scope parameters
@@ -239,6 +298,18 @@ func (l agentLedger) completedEvidence(name, args string) *toolEvidence {
 	return nil
 }
 
+// toolObservationalNames are read-only tool names containing none of the
+// substrings toolLooksObservational scans for, matched whole for the same reason
+// as toolShellNames. Glob is Claude Code's file matcher and is the case that
+// exposed the gap: its output is a list of paths, so a repository containing
+// errors.go was enough to classify a successful match as a failure.
+var toolObservationalNames = map[string]bool{
+	"glob": true, "cat": true, "head": true, "tail": true, "ls": true,
+	"dir": true, "tree": true, "pwd": true, "which": true, "whoami": true,
+	"notebook": true, "todoread": true, "peek": true, "query": true,
+	"count": true, "measure": true, "explain": true, "summarize": true,
+}
+
 // toolLooksObservational 判断工具名是否属于只读/观察类。
 //
 // APK 证据（tools/apktool，agent_ledger.go:237-244，192 字节）：
@@ -246,6 +317,9 @@ func (l agentLedger) completedEvidence(name, args string) *toolEvidence {
 // 该切片位于 0x1be6000+2656，实测 22 项，内容与顺序如下。
 func toolLooksObservational(name string) bool {
 	name = strings.ToLower(strings.TrimSpace(name))
+	if toolObservationalNames[name] {
+		return true
+	}
 	for _, word := range []string{"read", "list", "get", "search", "find", "fetch", "inspect", "stat", "status", "describe", "info", "test", "check", "verify", "validate", "browser", "lookup", "diff", "log", "show", "view", "grep"} {
 		if strings.Contains(name, word) {
 			return true
@@ -288,7 +362,25 @@ func shouldSuppressCompletedCall(name string) bool {
 // 调用方，且其注释与命名按相反极性解释同一判据，故不复用、不合并。
 func toolCanRepeatSameArguments(name string) bool {
 	name = strings.ToLower(strings.TrimSpace(name))
-	return toolLooksObservational(name) || !toolLooksMutating(name)
+	return toolLooksObservational(name) || !toolRewritesState(name)
+}
+
+// toolRewritesState 判断工具的用途本身就是改写状态 —— 写文件、打补丁、删除、
+// 安装。这类调用同参重放是把同一次改动做两遍，必须继续剔除。
+//
+// 与 toolLooksMutating 的区别是「用途」与「能力」之别，两者不能混用：
+// Bash 能改文件（所以 toolLooksMutating 为真，用于并行度与「状态是否变过」的
+// 判定），但它的同参重放通常是改完代码后复跑一次测试 —— 那是必要动作。
+// 判「能不能重复」必须问用途，问能力会把 Bash{"command":"go test"} 连同
+// write_file 一起剔掉，那正是 ledger 静默丢空的成因之一。
+func toolRewritesState(name string) bool {
+	name = strings.ToLower(strings.TrimSpace(name))
+	for _, word := range []string{"write", "edit", "delete", "remove", "move", "rename", "create", "patch", "apply", "install", "update", "upload", "publish", "commit", "push", "deploy"} {
+		if strings.Contains(name, word) {
+			return true
+		}
+	}
+	return false
 }
 
 // filterCompletedCalls 剔除「同名同参且已有结果」的调用，避免重复劳动。
@@ -330,12 +422,17 @@ func filterCompletedCalls(calls []detectedToolCall, l agentLedger) []detectedToo
 		if !toolCanRepeatSameArguments(c.Name) {
 			continue
 		}
-		// 失败的先例不构成「已完成的劳动」：那一次没有产出可复用的结果，
-		// 此时压制同参重试等于禁止模型从瞬时错误里恢复，而工作区状态尚未
-		// 改变（hasAnyMutation 为假）时这条路径原本无论如何都会剔除。
-		// 只对非明确变更类放行 —— 失败的写入/执行可能已部分生效，且
-		// toolResultLooksFailed 对非观察类走的是宽匹配（输出里出现 "error"
-		// 就算失败），对变更类放行会把一次成功的执行误判成可重放。
+		// 壳层/委派类（Bash、Task）失败过的同一条命令不自动重放：半途失败的脚本
+		// 可能已经删了文件、已经推了一半，重放会把副作用做第二遍。这一条必须压在
+		// hasAnyMutation 之前 —— 那次失败的 Bash 本身就被算作一次变更，否则它自己
+		// 就把自己的闸门顶开了。
+		//
+		// 只挡「同参且失败过」这一种情况。模型改完代码后主动复跑同一条测试命令走的
+		// 是下面 hasAnyMutation 那条路径，不受影响。
+		if prior.Failed && toolShellLike(c.Name) {
+			continue
+		}
+		// 失败的先例不构成已完成的劳动：那一次没有产出可复用的结果。
 		if prior.Failed || l.hasAnyMutation() {
 			out = append(out, c)
 		}
