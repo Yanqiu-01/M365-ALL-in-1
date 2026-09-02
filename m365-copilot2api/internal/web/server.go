@@ -1835,6 +1835,8 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	// non-streaming requests remains below until the event-level tool protocol
 	// is available end-to-end.
 	if planningMode == "router" && body.Stream && len(toolMaps) > 0 && fmt.Sprint(body.ToolChoice) != "none" {
+		routerIntent := toolIntentLikely(latestUserIntent(body.Messages, prompt), toolMaps)
+		routerOutcome := newRouterOutcome(requestID, "stream-router", len(toolMaps), body.ToolChoice, routerIntent)
 		// Preserve the existing validated tool router for streaming tool turns.
 		// Only fall through to text streaming when the router explicitly selects
 		// no tool; this prevents a natural-language preamble from becoming a
@@ -1855,6 +1857,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			s.dropTransientConversation(routeRes.ConversationID)
 		}
 		if routeErr != nil {
+			routerOutcome.record("initial", "router_error")
 			msg := upstreamStageError("router", routeErr)
 			if IsRateLimited(routeErr) {
 				msg = "upstream is rate limiting; try again shortly"
@@ -1863,8 +1866,11 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		calls, parsed = parseModelToolDecision(routeRes.Text, toolMaps, body.ToolChoice)
+		routerOutcome.observeParsed(parsed, len(calls))
 		calls = filterCompletedCalls(calls, ledger)
-		calls, _ = validateCalls("router", calls)
+		postLedger := len(calls)
+		calls, rejected := validateCalls("router", calls)
+		routerOutcome.observeValidated(postLedger, len(calls), rejected)
 		if !parsed {
 			repairRes, repairErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: `Repair this tool routing output into JSON only with shape {"calls":[{"name":"function_name","arguments":{}}]}. Use {"calls":[]} if no tool is needed. OUTPUT:\n` + compactToolResult(routeRes.Text, 6000), Tone: tone, Attachments: body.Attachments})
 			if repairErr == nil && repairRes.ConversationID != "" {
@@ -1872,11 +1878,15 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			}
 			if repairErr == nil {
 				calls, parsed = parseModelToolDecision(repairRes.Text, toolMaps, body.ToolChoice)
+				routerOutcome.observeParsed(parsed, len(calls))
 				calls = filterCompletedCalls(calls, ledger)
-				calls, _ = validateCalls("router", calls)
+				postLedger = len(calls)
+				calls, rejected = validateCalls("router", calls)
+				routerOutcome.observeValidated(postLedger, len(calls), rejected)
 			}
 		}
 		if parsed && len(calls) > 0 {
+			routerOutcome.record("validated", "emitted_tool_calls")
 			scope := fmt.Sprintf("%d:%v:stream", len(body.Messages), completedCallIDs(ledger))
 			for i := range calls {
 				calls[i].ID = scopedCallID(calls[i].Name, string(calls[i].Arguments), i, scope)
@@ -1891,6 +1901,11 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			bindRes.SessionID = ""
 			s.bindConversation(acc, &body, r, bindRes, answerPrompt, startedAt)
 			return
+		}
+		if normalizedToolChoiceMode(body.ToolChoice) == "auto" && routerIntent {
+			routerOutcome.record("validated", "intent_retry")
+		} else if !toolChoiceRequiresToolCall(body.ToolChoice) {
+			routerOutcome.record("validated", "ordinary_answer_fallback")
 		}
 	}
 	if body.Stream {
