@@ -1621,8 +1621,12 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	}
 	startedAt := time.Now()
 	beginRequest(requestID, r)
-	stage(requestID, "http_start", map[string]any{"stream": r.URL.Query().Get("stream") == "true"})
-	log.Printf("[req-trace] id=%s stage=http_start stream=%t", requestID, r.URL.Query().Get("stream") == "true")
+	// 这里只能读 query，body 还没解析（stage=body_parsed 在下面）。而 OpenAI /
+	// Anthropic 客户端都把 stream 放在 JSON body 里，不放 query，所以这个字段
+	// 对真实流量恒为 false —— 曾据此误判「流式重试路径是死代码」，实际是日志在
+	// 读错来源。字段名写清它是 query，真正的 body.Stream 在 body_parsed 里报。
+	stage(requestID, "http_start", map[string]any{"stream_query": r.URL.Query().Get("stream") == "true"})
+	log.Printf("[req-trace] id=%s stage=http_start stream_query=%t", requestID, r.URL.Query().Get("stream") == "true")
 	defer func() {
 		stage(requestID, "http_return", map[string]any{"total_ms": time.Since(startedAt).Milliseconds()})
 		endRequest(requestID, nil)
@@ -1669,8 +1673,10 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	normalizeLegacyTools(&body)
 	body.ConversationID = firstNonEmpty(body.ConversationID, body.ConversationIDC)
 	body.SessionID = firstNonEmpty(body.SessionID, body.SessionIDC)
-	log.Printf("[req-trace] id=%s stage=body_parsed messages=%d tools=%d choice=%s raw_bytes=%d", requestID, len(body.Messages), len(body.Tools), normalizedToolChoiceMode(body.ToolChoice), len(raw))
-	stage(requestID, "body_parsed", map[string]any{"messages": len(body.Messages), "tools": len(body.Tools), "raw_bytes": len(raw)})
+	// stream 报在这里而不是 http_start：这是它第一次真正可知的位置。哪条路由分支
+	// 会跑（stream-router 还是 router）完全由它决定，看日志排查时缺了它就只能靠猜。
+	log.Printf("[req-trace] id=%s stage=body_parsed messages=%d tools=%d choice=%s stream=%t raw_bytes=%d", requestID, len(body.Messages), len(body.Tools), normalizedToolChoiceMode(body.ToolChoice), body.Stream, len(raw))
+	stage(requestID, "body_parsed", map[string]any{"messages": len(body.Messages), "tools": len(body.Tools), "stream": body.Stream, "raw_bytes": len(raw)})
 	// 空请求必须在注入之前判定。下面注入的环境说明是网关自己添的内容，一旦先
 	// 注入，扁平化后的 prompt 就永远非空，messages:[] 这类请求会绕过后面那道
 	// 400 直接打到上游。这里用同一个扁平化函数和同一句错误文案，判定标准与注入
@@ -1851,8 +1857,13 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	// path forwards ordinary upstream text deltas immediately; tool routing for
 	// non-streaming requests remains below until the event-level tool protocol
 	// is available end-to-end.
+	// streamRouterOutcome 提到块外，因为下面那段 intent retry（`if body.Stream`）
+	// 是这个块的兄弟而不是子块，此前拿不到它，于是重试的成败一条都记不下来。
+	// 只有该块跑过才非 nil —— 重试自身的前置条件也正是「该块跑过」。
+	var streamRouterOutcome *routerOutcome
 	if planningMode == "router" && body.Stream && len(toolMaps) > 0 && fmt.Sprint(body.ToolChoice) != "none" {
 		routerOutcome := newRouterOutcome(requestID, "stream-router", len(toolMaps), body.ToolChoice, routerIntent)
+		streamRouterOutcome = &routerOutcome
 		// Preserve the existing validated tool router for streaming tool turns.
 		// Only fall through to text streaming when the router explicitly selects
 		// no tool; this prevents a natural-language preamble from becoming a
@@ -1942,6 +1953,13 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				retryCalls = filterCompletedCalls(retryCalls, ledger)
 				retryCalls, _ = validateCalls("stream-router-intent-retry", retryCalls)
 				if retryParsed && len(retryCalls) > 0 {
+					// 非流式那侧在同一位置记了 emitted_tool_calls（server.go:2272），
+					// 这侧漏了，于是流式重试无论成败都只留下上面那条 intent_retry。
+					// 排查时看到「记了 intent_retry 就没下文」会误判成重试没跑，
+					// 实际跑了而且成功了 —— 少这一行就少了唯一能区分两者的证据。
+					if streamRouterOutcome != nil {
+						streamRouterOutcome.record("stream-intent-retry", "emitted_tool_calls")
+					}
 					scope := fmt.Sprintf("%d:%v:stream-intent-retry", len(body.Messages), completedCallIDs(ledger))
 					for i := range retryCalls {
 						retryCalls[i].ID = scopedCallID(retryCalls[i].Name, string(retryCalls[i].Arguments), i, scope)
@@ -1957,6 +1975,11 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 					s.bindConversation(acc, &body, r, bindRes, answerPrompt, startedAt)
 					return
 				}
+			}
+			// 走到这里说明重试跑完了但没拿到可用调用（上游报错，或解析/校验后为空）。
+			// 非流式那侧记 retry_exhausted（server.go:2292），这侧同样漏了。
+			if streamRouterOutcome != nil {
+				streamRouterOutcome.record("stream-intent-retry", "retry_exhausted")
 			}
 		}
 		answerReq := buildAnswerRequest(answerPrompt, tone, body, ledger, planningMode)
