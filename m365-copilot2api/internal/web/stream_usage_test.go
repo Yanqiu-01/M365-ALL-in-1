@@ -82,6 +82,54 @@ func TestPrimaryStreamUsageCountsTheTextItActuallySent(t *testing.T) {
 	}
 }
 
+// 补 usage 的时候不能另起一帧。2026-09-02 对 gateway-c27dfe0 打一次真实流式请求，
+// 抓到的 SSE 尾部是这样：
+//
+//	data: {"choices":[{"delta":{},"finish_reason":"stop","index":0}],...}
+//	data: {"choices":[{"delta":{},"finish_reason":"stop","index":0}],...,"usage":{...}}
+//	data: [DONE]
+//
+// 一条流里 finish_reason 出现了两次。另外三条出口都是把 usage 挂在收尾帧上、
+// 只发一帧（server.go:2479、:2652、tool_response.go:49），严格按 finish_reason
+// 判定回答结束的客户端会把第二帧读成又一次完成。
+func TestTerminalChunkCarriesFinishReasonExactlyOnce(t *testing.T) {
+	src, err := os.ReadFile("server.go")
+	if err != nil {
+		t.Fatalf("read server.go: %v", err)
+	}
+	segments := strings.Split(string(src), `data: [DONE]`)
+	for i := 0; i < len(segments)-1; i++ {
+		window := segments[i]
+		if len(window) > 1400 {
+			window = window[len(window)-1400:]
+		}
+		// 窗口不能跨过流式分支的起点。同一个函数里常常先有一个非流式的 JSON
+		// 返回（它自己也带 finish_reason:"stop"），再往下才是 SSE 分支；固定
+		// 长度的回看窗口会读到那条 return 里的帧，而它和本出口不在同一条流上。
+		// 以 text/event-stream 这一行为界，只留流式分支自己的部分。
+		if at := strings.LastIndex(window, `"text/event-stream"`); at >= 0 {
+			window = window[at:]
+		}
+		// 只数真正被 sseRaw 发出去、且 finish_reason 有值的帧：
+		//   - 注释里的字样不算，否则这条测试会去断言自己上方的说明文字；
+		//   - `"finish_reason": nil` 不算。正文增量帧按 OpenAI 协议就该带
+		//     finish_reason:null，那是正确形状，不是重复收尾。
+		emitted := 0
+		for _, line := range strings.Split(window, "\n") {
+			trimmed := strings.TrimSpace(line)
+			if strings.HasPrefix(trimmed, "//") {
+				continue
+			}
+			emitted += strings.Count(trimmed, `"finish_reason": "`)
+		}
+		if emitted > 1 {
+			t.Errorf("第 %d 处 data: [DONE] 之前有 %d 帧带 finish_reason；"+
+				"应当只有收尾那一帧带，usage 挂在同一帧上而不是另发一帧。\n出口上文尾部:\n%s",
+				i+1, emitted, lastLines(window, 8))
+		}
+	}
+}
+
 // include_usage 一旦将来被支持，上面「一律发」的前提就变了。这条测试守住
 // 「现在确实没有这个开关」，将来加了会红，提醒同时更新上面的判据。
 func TestStreamOptionsIncludeUsageIsStillUnsupported(t *testing.T) {
