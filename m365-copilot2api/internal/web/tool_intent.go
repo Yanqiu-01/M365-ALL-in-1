@@ -139,6 +139,45 @@ func declaredToolNameHit(text string, tools []map[string]any) bool {
 	return false
 }
 
+// ledgerAnswersIntent reports whether this turn can already be answered from
+// tool evidence that was gathered earlier in the same conversation.
+//
+// latestUserIntent deliberately returns the newest *user* turn, which in an
+// agentic client stays the original request for the whole exchange. So on the
+// turn whose only remaining job is to report the tool result, toolIntentLikely
+// still sees "open inventory.txt ..." and reports an action request. The router
+// then reads the model's well-formed NO_TOOL_NEEDED as a mistake and retries
+// under tool_choice=required -- telling a model that has nothing left to call
+// that it must call something. Measured against a clean Claude CLI run on
+// /v1/messages: the third turn spent 27.7s on a retry that ended
+// retry_exhausted before falling back to the answer it already had.
+//
+// A completed, non-failed call is the evidence that makes prose the correct
+// output. Pending calls are not: results are still owed, so the turn is not
+// answerable and the existing behaviour is left untouched. When every completed
+// call failed, a retry can still legitimately change strategy, so the guard
+// stays out of the way there too.
+func ledgerAnswersIntent(l agentLedger) bool {
+	if len(l.Pending) > 0 {
+		return false
+	}
+	for _, e := range l.Completed {
+		if !e.Failed {
+			return true
+		}
+	}
+	return false
+}
+
+// shouldRetryForToolIntent is the single gate both router paths use before
+// spending an extra upstream round on a constrained retry.
+func shouldRetryForToolIntent(prompt string, tools []map[string]any, l agentLedger) bool {
+	if ledgerAnswersIntent(l) {
+		return false
+	}
+	return toolIntentLikely(prompt, tools)
+}
+
 // toolIntentLikely is deliberately conservative: it only repairs an auto
 // decision when the user named a declared tool or issued an action request.
 // Knowledge questions stay ordinary answers even when tools are declared.

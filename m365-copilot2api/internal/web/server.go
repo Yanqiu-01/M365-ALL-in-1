@@ -1823,6 +1823,12 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	planningMode := s.settings.get().ToolPlanningMode
 	var calls []detectedToolCall
 	var parsed bool
+	// routerIntent is the raw heuristic: did the user ask for a concrete action?
+	// routerRetry is that answer minus the turns already answerable from tool
+	// evidence, and is what gates the constrained retry. Both are declared here
+	// because the streaming intent-retry gate sits outside the router block.
+	routerIntent := toolIntentLikely(latestUserIntent(body.Messages, prompt), toolMaps)
+	routerRetry := routerIntent && !ledgerAnswersIntent(ledger)
 
 	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(s.settings.get().ChatTimeoutSeconds)*time.Second)
 	defer cancel()
@@ -1835,7 +1841,6 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	// non-streaming requests remains below until the event-level tool protocol
 	// is available end-to-end.
 	if planningMode == "router" && body.Stream && len(toolMaps) > 0 && fmt.Sprint(body.ToolChoice) != "none" {
-		routerIntent := toolIntentLikely(latestUserIntent(body.Messages, prompt), toolMaps)
 		routerOutcome := newRouterOutcome(requestID, "stream-router", len(toolMaps), body.ToolChoice, routerIntent)
 		// Preserve the existing validated tool router for streaming tool turns.
 		// Only fall through to text streaming when the router explicitly selects
@@ -1902,14 +1907,16 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			s.bindConversation(acc, &body, r, bindRes, answerPrompt, startedAt)
 			return
 		}
-		if normalizedToolChoiceMode(body.ToolChoice) == "auto" && routerIntent {
+		if normalizedToolChoiceMode(body.ToolChoice) == "auto" && routerRetry {
 			routerOutcome.record("validated", "intent_retry")
+		} else if normalizedToolChoiceMode(body.ToolChoice) == "auto" && routerIntent {
+			routerOutcome.record("validated", "intent_answered_from_ledger")
 		} else if !toolChoiceRequiresToolCall(body.ToolChoice) {
 			routerOutcome.record("validated", "ordinary_answer_fallback")
 		}
 	}
 	if body.Stream {
-		if parsed && len(calls) == 0 && normalizedToolChoiceMode(body.ToolChoice) == "auto" && toolIntentLikely(latestUserIntent(body.Messages, prompt), toolMaps) {
+		if parsed && len(calls) == 0 && normalizedToolChoiceMode(body.ToolChoice) == "auto" && routerRetry {
 			retryPrompt := modelToolRouterPrompt(routerPromptMessages(body.Messages)+"\n"+ledger.RouterContext(), toolMaps, "required") + "\nINTENT RETRY: Select at least one declared tool for this concrete action request. Do not answer with prose or NO_TOOL_NEEDED."
 			retryRes, retryErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: retryPrompt, Tone: tone, Attachments: body.Attachments})
 			recordRouterFrames(routerFrameInput{RequestID: requestID, Stage: "stream-router-intent-retry", Prompt: retryPrompt, Text: retryRes.Text, Reasoning: retryRes.Reasoning, Events: retryRes.Events, Err: retryErr})
@@ -2141,7 +2148,6 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	// Ask the upstream model to select and validate the next tool. The gateway
 	// remains tool-agnostic; it only validates and serializes the decision.
 	if planningMode == "router" && len(toolMaps) > 0 && fmt.Sprint(body.ToolChoice) != "none" {
-		routerIntent := toolIntentLikely(latestUserIntent(body.Messages, prompt), toolMaps)
 		routerOutcome := newRouterOutcome(requestID, "router", len(toolMaps), body.ToolChoice, routerIntent)
 		routePrompt := modelToolRouterPrompt(routerPromptMessages(body.Messages)+"\n"+ledger.RouterContext(), toolMaps, body.ToolChoice)
 		// routerChatWithFailover already retries a connect-stage transport
@@ -2225,7 +2231,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			s.bindConversation(acc, &body, r, bindRes, prompt, startedAt)
 			return
 		}
-		if len(calls) == 0 && normalizedToolChoiceMode(body.ToolChoice) == "auto" && routerIntent {
+		if len(calls) == 0 && normalizedToolChoiceMode(body.ToolChoice) == "auto" && routerRetry {
 			routerOutcome.record("validated", "intent_retry")
 			// A concrete action request deserves one constrained retry even in auto
 			// mode. This is the narrow repair path that avoids forcing tools for
@@ -2263,8 +2269,10 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
-		if normalizedToolChoiceMode(body.ToolChoice) == "auto" && routerIntent {
+		if normalizedToolChoiceMode(body.ToolChoice) == "auto" && routerRetry {
 			routerOutcome.record("intent_retry", "retry_exhausted")
+		} else if normalizedToolChoiceMode(body.ToolChoice) == "auto" && routerIntent {
+			routerOutcome.record("validated", "intent_answered_from_ledger")
 		} else if !toolChoiceRequiresToolCall(body.ToolChoice) {
 			routerOutcome.record("validated", "ordinary_answer_fallback")
 		}
