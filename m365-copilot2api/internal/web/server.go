@@ -1870,12 +1870,15 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		}
 		if routeErr != nil {
 			routerOutcome.record("initial", "router_error")
-			msg := upstreamStageError("router", routeErr)
-			if IsRateLimited(routeErr) {
-				msg = "upstream is rate limiting; try again shortly"
+			switch classifyRouterFailure(ctx, routeErr, body.ToolChoice) {
+			case routerFailureAbandon:
+				return
+			case routerFailureFatal:
+				writeRouterFatal(w, "router", routeErr)
+				return
+			case routerFailureAnswer:
+				log.Printf("[req-trace] id=%s stage=router_degraded reason=answer_fallback", requestID)
 			}
-			writeOpenAIError(w, http.StatusBadGateway, "router_error", msg)
-			return
 		}
 		calls, parsed = parseModelToolDecision(routeRes.Text, toolMaps, body.ToolChoice)
 		routerOutcome.observeParsed(parsed, len(calls))
@@ -2172,14 +2175,15 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		recordRouterFrames(routerFrameInput{RequestID: requestID, Stage: "router", Prompt: routePrompt, Text: routeRes.Text, Reasoning: routeRes.Reasoning, Events: routeRes.Events, Err: routeErr})
 		if routeErr != nil {
 			routerOutcome.record("initial", "router_error")
-			// 带阶段标注，便于区分握手被拒 / 读超时 / 中途断流。
-			msg := upstreamStageError("router", routeErr)
-			if IsRateLimited(routeErr) {
-				msg = "upstream is rate limiting; try again shortly"
+			switch classifyRouterFailure(ctx, routeErr, body.ToolChoice) {
+			case routerFailureAbandon:
+				return
+			case routerFailureFatal:
+				writeRouterFatal(w, "router", routeErr)
+				return
+			case routerFailureAnswer:
+				log.Printf("[req-trace] id=%s stage=router_degraded reason=answer_fallback", requestID)
 			}
-			log.Printf("[req-trace] id=%s stage=router_error err=%v", requestID, routeErr)
-			writeOpenAIError(w, http.StatusBadGateway, "router_error", msg)
-			return
 		}
 		calls, parsed = parseModelToolDecision(routeRes.Text, toolMaps, body.ToolChoice)
 		routerOutcome.observeParsed(parsed, len(calls))
