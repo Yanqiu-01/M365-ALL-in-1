@@ -112,6 +112,9 @@ func parseModelToolDecision(text string, tools []map[string]any, choice any) ([]
 	// that causes stale calls to execute after the stream has already terminated.
 	directiveAt := lastToolDirectiveIndex(text)
 	decisions := extractEnvelopeDecisions(text)
+	// 以工具名命名的围栏与 JSON 信封是同一类「帧」：整帧要么全部合法，要么
+	// 判为不可解析。合并进同一个候选序列，位置语义（取最后一帧）不变。
+	decisions = append(decisions, extractFencedDecisions(text, tools)...)
 	noToolAt, noTool := trailingNoToolDecision(text)
 
 	latestAt := -1

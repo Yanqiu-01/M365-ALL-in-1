@@ -2,6 +2,7 @@ package web
 
 import (
 	"encoding/json"
+	"regexp"
 	"strings"
 	"unicode"
 )
@@ -125,8 +126,67 @@ func balancedSpan(text string, open int, openCh, closeCh byte) int {
 	return -1
 }
 
-// extractDirectiveCandidates 找出所有 CALL_TOOL: name(<json>) 形式的候选。
+// directiveNameByte 判断字节是否可以出现在工具名里。工具名来自客户端声明
+// （Read、workspace_shell、mcp__server__tool 等），只含标识符字符。
+func directiveNameByte(ch byte) bool {
+	switch {
+	case ch >= 'a' && ch <= 'z', ch >= 'A' && ch <= 'Z', ch >= '0' && ch <= '9':
+		return true
+	case ch == '_', ch == '-', ch == '.':
+		return true
+	}
+	return false
+}
+
+// directiveNameSpan 从 rest 起跳过装饰字符后取出名字 token，返回名字与它的
+// 结束下标。装饰字符只含不影响语义的包装（引号、反引号、星号、下划线以外的
+// 强调符与空白）。
+func directiveNameSpan(rest string) (string, int) {
+	i := 0
+	// 换行也要跳过：模型会把 "CALL_TOOL:" 与名字拆到两行。跳过集合里只有
+	// 空白与装饰符，因此不可能越过实义文字去认名字。
+	for i < len(rest) && strings.IndexByte(" \t\r\n`*\"'", rest[i]) >= 0 {
+		i++
+	}
+	start := i
+	for i < len(rest) && directiveNameByte(rest[i]) {
+		i++
+	}
+	return rest[start:i], i
+}
+
+// decorationOnly 判断名字与参数之间的间隔是否只有装饰：空白、围栏反引号、
+// 强调符、以及围栏的 info string（```json）。有实义文字就说明这两段不属于
+// 同一次调用，必须放弃，否则会把后文里无关的 JSON 当成参数。
+func decorationOnly(gap string) bool {
+	gap = strings.ToLower(gap)
+	gap = strings.NewReplacer(
+		"`", " ", "*", " ", "_", " ", "\n", " ", "\t", " ", ":", " ",
+		`"`, " ", "'", " ", "=", " ", "json", " ",
+	).Replace(gap)
+	return strings.TrimSpace(gap) == ""
+}
+
+// bareDirectiveTail 判断指令名之后是否再无内容（只剩装饰与句末标点）。
+// 只有这种情况才允许把不带参数的裸名字当成一次空参数调用。
+func bareDirectiveTail(rest string) bool {
+	line := rest
+	if nl := strings.IndexByte(line, '\n'); nl >= 0 {
+		line = line[:nl]
+	}
+	return strings.Trim(strings.TrimSpace(line), " \t`*_.。!！;；,，:：)）\"'") == ""
+}
+
+// extractDirectiveCandidates 找出所有 CALL_TOOL: name <args> 形式的候选。
 // 支持指令前有思考、后有解释，参数跨多行，以及各种装饰包装。
+//
+// 参数体接受三种真实形态（实测 gpt-5.x 三者都出现过）：
+//  1. name({...}) —— 规则原文给的形状；
+//  2. name {...} / name\n{...} / name\n```json\n{...}``` —— 省掉括号，参数
+//     作为紧随其后的 JSON 对象。省括号是模型最常见的偏离，此前一律
+//     parsed=false 并触发修复轮；
+//  3. name —— 不带参数的裸名字，按空参数处理（是否合法交给 schema 校验，
+//     必填参数的工具会在校验阶段被淘汰）。
 func extractDirectiveCandidates(text string) []toolCandidate {
 	var out []toolCandidate
 	lower := strings.ToLower(text)
@@ -141,23 +201,76 @@ func extractDirectiveCandidates(text string) []toolCandidate {
 		rest := text[offset:]
 		// 跳过标记与名字之间的冒号和空白。
 		rest = strings.TrimLeft(rest, ": \t")
-		open := strings.Index(rest, "(")
-		if open < 0 {
+		name, nameEnd := directiveNameSpan(rest)
+		if name == "" {
 			continue
 		}
-		name := stripDecorations(rest[:open])
-		if name == "" || strings.ContainsAny(name, "\n") {
+		tail := rest[nameEnd:]
+
+		// 形态 1：括号参数。要求名字与 "(" 之间只有装饰。
+		if open := strings.IndexByte(tail, '('); open >= 0 && decorationOnly(tail[:open]) {
+			if close := balancedSpan(tail, open, '(', ')'); close >= 0 {
+				if args, ok := decodeArguments(tail[open+1 : close]); ok {
+					out = append(out, toolCandidate{Name: name, Args: args, At: at})
+				}
+				continue
+			}
+		}
+		// 形态 2：省略括号，参数是紧随其后的 JSON 对象。
+		if open := strings.IndexByte(tail, '{'); open >= 0 && decorationOnly(tail[:open]) {
+			if close := balancedSpan(tail, open, '{', '}'); close >= 0 {
+				if args, ok := decodeArguments(tail[open : close+1]); ok {
+					out = append(out, toolCandidate{Name: name, Args: args, At: at})
+				}
+				continue
+			}
+		}
+		// 形态 3：裸名字，无参数。
+		if bareDirectiveTail(tail) {
+			out = append(out, toolCandidate{Name: name, Args: map[string]any{}, At: at})
+		}
+	}
+	return out
+}
+
+// fencedDecisionBlock 匹配「info string 是工具名」的代码围栏。这正是
+// chathub/tool_protocol.go 的 <tools> 约定：定义用 ```name 围栏给出，调用也
+// 用同一形状回来。答案轮的 fencedToolCalls 一直认这种形状，路由轮却不认，
+// 于是模型按被教过的协议作答反而 parsed=false。
+var fencedDecisionBlock = regexp.MustCompile("(?s)```[ \t]*([A-Za-z0-9_.-]+)[ \t]*\r?\n(.*?)```")
+
+// extractFencedDecisions 把「以工具名命名的围栏」识别成决策帧。
+//
+// 这里必须知道已声明的工具名 —— 不是为了做校验，而是因为边界本身依赖它：
+// ```json / ```python 是普通代码块，只有 info string 恰好是一个已声明工具时
+// 这段围栏才是一次调用。合法性（choice、schema）仍留在 selectAllValid。
+// 因此这里绝不会凭空造出未声明的名字。
+func extractFencedDecisions(text string, tools []map[string]any) []envelopeDecision {
+	if len(tools) == 0 {
+		return nil
+	}
+	var out []envelopeDecision
+	prevEnd := -1
+	for _, m := range fencedDecisionBlock.FindAllStringSubmatchIndex(text, -1) {
+		at, end := m[0], m[1]
+		name, fn := declaredTool(text[m[2]:m[3]], tools)
+		if fn == nil {
 			continue
 		}
-		close := balancedSpan(rest, open, '(', ')')
-		if close < 0 {
-			continue
+		args, ok := decodeArguments(text[m[4]:m[5]])
+		// 相邻围栏（中间只有空白）属于同一帧，支持一次并行发起多个调用；
+		// 中间有正文说明前一个已被推翻，另起一帧。
+		merge := prevEnd >= 0 && len(out) > 0 && strings.TrimSpace(text[prevEnd:at]) == ""
+		if !merge {
+			out = append(out, envelopeDecision{At: at})
 		}
-		args, ok := decodeArguments(rest[open+1 : close])
+		cur := &out[len(out)-1]
 		if !ok {
-			continue
+			cur.Malformed = true
+		} else {
+			cur.Calls = append(cur.Calls, toolCandidate{Name: name, Args: args, At: at})
 		}
-		out = append(out, toolCandidate{Name: name, Args: args, At: at})
+		prevEnd = end
 	}
 	return out
 }
@@ -182,8 +295,16 @@ func extractEnvelopeDecisions(text string) []envelopeDecision {
 			i = end
 			continue
 		}
-		callsRaw, has := raw["calls"]
+		callsRaw, has := envelopeCallsField(raw)
 		if !has {
+			// 裸单调用对象：{"name":...,"arguments":{...}}。修复轮只要求
+			// "JSON only"，模型省掉外层 calls 数组的情况实测存在。要求
+			// arguments 键同时在场，避免把散文里的 {"name":"x"} 误判成决策。
+			if call, ok := parseEnvelopeCall(raw, i); ok && bareCallHasArguments(raw) {
+				out = append(out, envelopeDecision{At: i, Calls: []toolCandidate{call}})
+				i = end
+				continue
+			}
 			i = end
 			continue
 		}
@@ -202,27 +323,82 @@ func extractEnvelopeDecisions(text string) []envelopeDecision {
 				decision.Malformed = true
 				continue
 			}
-			var name string
-			if rawName, ok := call["name"]; !ok || json.Unmarshal(rawName, &name) != nil || strings.TrimSpace(name) == "" {
+			parsedCall, ok := parseEnvelopeCall(call, i)
+			if !ok {
 				decision.Malformed = true
 				continue
 			}
-			args := map[string]any{}
-			if rawArgs, ok := call["arguments"]; ok {
-				if strings.TrimSpace(string(rawArgs)) != "null" && json.Unmarshal(rawArgs, &args) != nil {
-					decision.Malformed = true
-					continue
-				}
-			}
-			if args == nil {
-				args = map[string]any{}
-			}
-			decision.Calls = append(decision.Calls, toolCandidate{Name: strings.TrimSpace(name), Args: args, At: i})
+			decision.Calls = append(decision.Calls, parsedCall)
 		}
 		out = append(out, decision)
 		i = end
 	}
 	return out
+}
+
+// bareCallHasArguments 要求裸单调用对象显式带上参数键。没有外层 calls 数组
+// 时这是唯一能把「决策」与「散文里恰好提到 name 的对象」区分开的信号。
+func bareCallHasArguments(raw map[string]json.RawMessage) bool {
+	for _, key := range []string{"arguments", "args", "parameters", "input", "arguments_json", "function"} {
+		if _, ok := raw[key]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// envelopeCallsField 取出调用数组字段。修复轮的提示词写的是 "calls"，但模型
+// 常按自己熟悉的线上字段名作答（tool_calls 是 OpenAI 的名字）。这些是同一
+// 语义的别名，认下来不放松任何校验。注意不含 "tools"：那是工具定义块的键，
+// 认它会把提示词回声当成决策。
+func envelopeCallsField(raw map[string]json.RawMessage) (json.RawMessage, bool) {
+	for _, key := range []string{"calls", "tool_calls", "toolCalls", "function_calls", "functionCalls"} {
+		if v, ok := raw[key]; ok {
+			return v, true
+		}
+	}
+	return nil, false
+}
+
+// parseEnvelopeCall 解析单个调用对象。三种形态：
+//   - {"name":..,"arguments":{..}}          —— 提示词要求的形状
+//   - {"type":"function","function":{..}}   —— OpenAI 线上形状，模型照抄
+//   - arguments 是 JSON 字符串               —— 同样是 OpenAI 线上形状
+//
+// 名字仍原样返回，不做存在性判断：未声明的名字由 selectDecision /
+// selectAllValid 与下游 validateDetectedToolCalls 淘汰。
+func parseEnvelopeCall(call map[string]json.RawMessage, at int) (toolCandidate, bool) {
+	if nested, ok := call["function"]; ok {
+		var inner map[string]json.RawMessage
+		if json.Unmarshal(nested, &inner) == nil {
+			if _, hasName := inner["name"]; hasName {
+				return parseEnvelopeCall(inner, at)
+			}
+		}
+	}
+	var name string
+	rawName, ok := call["name"]
+	if !ok || json.Unmarshal(rawName, &name) != nil || strings.TrimSpace(name) == "" {
+		return toolCandidate{}, false
+	}
+	args := map[string]any{}
+	for _, key := range []string{"arguments", "args", "parameters", "input", "arguments_json"} {
+		rawArgs, has := call[key]
+		if !has {
+			continue
+		}
+		body := strings.TrimSpace(string(rawArgs))
+		if body == "" || body == "null" {
+			break
+		}
+		decoded, ok := decodeArguments(body)
+		if !ok {
+			return toolCandidate{}, false
+		}
+		args = decoded
+		break
+	}
+	return toolCandidate{Name: strings.TrimSpace(name), Args: args, At: at}, true
 }
 
 // extractEnvelopeCandidates is retained for callers that only need the legacy
@@ -239,8 +415,22 @@ func extractEnvelopeCandidates(text string) ([]toolCandidate, bool) {
 
 // decodeArguments 解析参数体。允许空参数、允许被空白或围栏包裹。
 func decodeArguments(body string) (map[string]any, bool) {
+	return decodeArgumentsDepth(body, 0)
+}
+
+// decodeArgumentsDepth 额外容忍两种真实出现过的形态：
+//   - 双重编码：arguments 是一个 JSON 字符串，其内容才是对象。这是 OpenAI
+//     线上格式（function.arguments 就是字符串），训练数据里到处都是，模型在
+//     修复轮里照抄该形状的概率很高；此前一律 parsed=false。
+//   - Python 展开号：read_file(**{...})。JSON 值绝不会以 * 开头，因此剥掉前导
+//     星号不会放松任何真实约束。
+//
+// depth 限制一层解包，避免构造出的深层嵌套字符串把解析拖进递归。
+func decodeArgumentsDepth(body string, depth int) (map[string]any, bool) {
 	body = strings.TrimSpace(body)
 	body = strings.Trim(body, "`")
+	body = strings.TrimSpace(body)
+	body = strings.TrimLeft(body, "*")
 	body = strings.TrimSpace(body)
 	if body == "" {
 		return map[string]any{}, true
@@ -251,6 +441,12 @@ func decodeArguments(body string) (map[string]any, bool) {
 			args = map[string]any{}
 		}
 		return args, true
+	}
+	if depth == 0 {
+		var encoded string
+		if json.Unmarshal([]byte(body), &encoded) == nil {
+			return decodeArgumentsDepth(encoded, depth+1)
+		}
 	}
 	return nil, false
 }
