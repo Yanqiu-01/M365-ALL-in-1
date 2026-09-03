@@ -14,7 +14,7 @@ func TestResponsesResultPreservesReasoningSummary(t *testing.T) {
 			"content":           "answer",
 			"reasoning_content": "reasoning summary",
 		}}},
-	})
+	}, nil)
 	var response map[string]any
 	if err := json.Unmarshal(rr.Body.Bytes(), &response); err != nil {
 		t.Fatal(err)
@@ -44,7 +44,7 @@ func TestStreamingResponsesResultEmitsReasoningEvents(t *testing.T) {
 			"content":           "answer",
 			"reasoning_content": "reasoning summary",
 		}}},
-	})
+	}, nil)
 	body := rr.Body.String()
 	for _, want := range []string{
 		"event: response.reasoning_summary_part.added",

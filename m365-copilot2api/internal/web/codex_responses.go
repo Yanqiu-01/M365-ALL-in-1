@@ -4,14 +4,66 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
 )
 
+// declaredToolNamespaces lists the namespace wrappers a Responses request declared,
+// longest name first so a prefix match never stops at a shorter namespace.
+//
+// Codex groups tools as {type:"namespace", name:"multi_agent_v1", tools:[...]}, and
+// protocol_compat flattens the children to "<ns>__<child>" so ChatHub sees a flat
+// function list. The flat name is what the model calls back, but Codex dispatches a
+// call only when it arrives as {name:"<child>", namespace:"<ns>"} -- the flat form is
+// rejected client-side with "unsupported call: multi_agent_v1__spawn_agent". Measured
+// 2026-09-04 in the 多孔Cu session: three spawn_agent calls, all rejected, so every
+// sub-group the user asked for died before starting.
+//
+// Splitting on the first "__" is wrong: a namespace name may itself contain the
+// separator (mcp__codebase_memory_mcp), and an MCP tool declared flat as
+// type:"function" name:"mcp__x__y" must not be split at all. Only a name whose prefix
+// is an actually-declared namespace is un-flattened.
+func declaredToolNamespaces(tools []map[string]any) []string {
+	var out []string
+	for _, t := range tools {
+		if typ, _ := t["type"].(string); typ != "namespace" {
+			continue
+		}
+		name, _ := t["name"].(string)
+		if name == "" {
+			continue
+		}
+		out = append(out, name)
+	}
+	sort.Slice(out, func(i, j int) bool { return len(out[i]) > len(out[j]) })
+	return out
+}
+
+// applyToolNamespace rewrites a flat "<ns>__<child>" call into the {name, namespace}
+// pair Codex dispatches, leaving every other name untouched.
+func applyToolNamespace(item map[string]any, namespaces []string) {
+	name, _ := item["name"].(string)
+	for _, ns := range namespaces {
+		prefix := ns + "__"
+		if !strings.HasPrefix(name, prefix) {
+			continue
+		}
+		child := name[len(prefix):]
+		if child == "" {
+			return
+		}
+		item["name"] = child
+		item["namespace"] = ns
+		return
+	}
+}
+
 // writeResponsesResult projects an internal OpenAI-style result into the
 // Responses events and completion shape consumed by Codex.
-func writeResponsesResult(w http.ResponseWriter, model string, stream bool, src map[string]any) {
+func writeResponsesResult(w http.ResponseWriter, model string, stream bool, src map[string]any, namespaces []string) {
 	id := firstNonEmpty(fmt.Sprint(src["m365_response_id"]), "resp_"+uuid.NewString())
 	msg, _ := openAIChoice(src)
 	sanitizePublicAssistantMessage(msg, model)
@@ -23,11 +75,14 @@ func writeResponsesResult(w http.ResponseWriter, model string, stream bool, src 
 		for _, raw := range calls {
 			tc, _ := raw.(map[string]any)
 			fn, _ := tc["function"].(map[string]any)
+			name, _ := fn["name"].(string)
 			if tc["type"] == "custom" {
-				output = append(output, map[string]any{"type": "custom_tool_call", "id": "ctc_" + uuid.NewString(), "call_id": tc["id"], "name": fn["name"], "input": customToolInput(fn["arguments"]), "status": "completed"})
+				output = append(output, map[string]any{"type": "custom_tool_call", "id": "ctc_" + uuid.NewString(), "call_id": tc["id"], "name": name, "input": customToolInput(fn["arguments"]), "status": "completed"})
 				continue
 			}
-			output = append(output, map[string]any{"type": "function_call", "id": "fc_" + uuid.NewString(), "call_id": tc["id"], "name": fn["name"], "arguments": fn["arguments"], "status": "completed"})
+			item := map[string]any{"type": "function_call", "id": "fc_" + uuid.NewString(), "call_id": tc["id"], "name": name, "arguments": fn["arguments"], "status": "completed"}
+			applyToolNamespace(item, namespaces)
+			output = append(output, item)
 		}
 	} else {
 		text, _ := msg["content"].(string)

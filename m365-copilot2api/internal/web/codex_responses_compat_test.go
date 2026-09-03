@@ -70,7 +70,7 @@ func TestResponsesResultIncludesUsage(t *testing.T) {
 		"choices":           []any{map[string]any{"message": map[string]any{"content": "hello"}}},
 		"usage":             estimateResponsesUsage("gpt-5.5", []oaiMsg{{Role: "user", Content: "prompt"}}, nil, nil, "hello").Values,
 		"m365_usage_source": usageSourceTiktoken,
-	})
+	}, nil)
 	var response map[string]any
 	if err := json.Unmarshal(rr.Body.Bytes(), &response); err != nil {
 		t.Fatal(err)
@@ -91,7 +91,7 @@ func TestStreamingResponsesResultIncludesUsage(t *testing.T) {
 		"choices":           []any{map[string]any{"message": map[string]any{"content": "hello"}}},
 		"usage":             estimateResponsesUsage("gpt-5.5", []oaiMsg{{Role: "user", Content: "prompt"}}, nil, nil, "hello").Values,
 		"m365_usage_source": usageSourceTiktoken,
-	})
+	}, nil)
 	body := rr.Body.String()
 	if !strings.Contains(body, "event: response.completed") || !strings.Contains(body, `"total_tokens":`) || !strings.Contains(body, usageSourceTiktoken) {
 		t.Fatalf("stream completion missing usage: %s", body)

@@ -38,7 +38,7 @@ func (p *pipeResponseWriter) Flush() {}
 
 // streamResponsesAdapter converts the internal OpenAI SSE incrementally instead
 // of buffering the entire completion in httptest.ResponseRecorder.
-func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, o oaiReq, model string) {
+func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, o oaiReq, model string, namespaces []string) {
 	// 本次请求的计时。不能用包级 startedAt —— 那是服务启动时间，
 	// 拿它算 DurationMs 会把每条记录写成进程已运行的总时长。
 	requestStartedAt := time.Now()
@@ -279,6 +279,11 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 				continue
 			}
 			item := map[string]any{"type": "function_call", "id": st.ItemID, "call_id": st.ID, "name": st.Name, "arguments": st.Args, "status": "completed"}
+			// The flat "<ns>__<child>" name the model calls back is not dispatchable by
+			// Codex; only {name, namespace} is. This is the live path for a streaming
+			// Codex turn, so the fix has to land here as well as in
+			// writeResponsesResult -- the rejected spawn_agent calls came through here.
+			applyToolNamespace(item, namespaces)
 			output[entry.Index] = item
 			_ = emit("response.function_call_arguments.done", map[string]any{"type": "response.function_call_arguments.done", "output_index": entry.Index, "item_id": st.ItemID, "arguments": st.Args})
 			_ = emit("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": entry.Index, "item": item})
@@ -434,7 +439,7 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 		o.Messages = append(messages, o.Messages...)
 	}
 	if body.Stream {
-		s.streamResponsesAdapter(w, r, o, firstNonEmpty(body.Model, "m365-copilot"))
+		s.streamResponsesAdapter(w, r, o, firstNonEmpty(body.Model, "m365-copilot"), declaredToolNamespaces(body.Tools))
 		return
 	}
 	out, raw, status, stats, err := s.runOpenAIAdapterWithStats(r, o)
@@ -506,7 +511,7 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 		}
 		s.rememberResponse(tenant, publicID, stored)
 	}
-	writeResponsesResult(w, firstNonEmpty(body.Model, "m365-copilot"), body.Stream, out)
+	writeResponsesResult(w, firstNonEmpty(body.Model, "m365-copilot"), body.Stream, out, declaredToolNamespaces(body.Tools))
 }
 
 func responsesOutputHasContent(src map[string]any) bool {
