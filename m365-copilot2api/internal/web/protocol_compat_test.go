@@ -231,3 +231,32 @@ func TestAnthropicToolResult(t *testing.T) {
 		t.Fatalf("%+v %v", o, err)
 	}
 }
+
+func TestAnthropicReplayPreservesUnknownBlocksAndToolOrder(t *testing.T) {
+	r := anthropicRequest{Messages: []anthropicMessage{{Role: "assistant", Content: []any{
+		map[string]any{"type": "thinking", "thinking": "opaque provider state"},
+		map[string]any{"type": "tool_use", "id": "toolu_foreign_03", "name": "read_file", "input": map[string]any{"path": "a.txt"}},
+		map[string]any{"type": "tool_result", "tool_use_id": "toolu_foreign_03", "content": "ok"},
+	}}}}
+	o, err := r.openAI()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(o.Messages) != 2 {
+		t.Fatalf("messages=%#v, want assistant then tool result", o.Messages)
+	}
+	if o.Messages[0].Role != "assistant" || o.Messages[1].Role != "tool" || o.Messages[1].ToolCallID != "toolu_foreign_03" {
+		t.Fatalf("replay order changed: %#v", o.Messages)
+	}
+	blocks, ok := o.Messages[0].Content.([]any)
+	if !ok || len(blocks) != 1 {
+		t.Fatalf("unknown provider block was dropped: %#v", o.Messages[0].Content)
+	}
+	block, ok := blocks[0].(map[string]any)
+	if !ok || block["type"] != "thinking" || block["thinking"] != "opaque provider state" {
+		t.Fatalf("unknown block changed: %#v", blocks)
+	}
+	if err := validateToolConversation(o.Messages); err != nil {
+		t.Fatalf("combined replay must remain protocol-valid: %v", err)
+	}
+}

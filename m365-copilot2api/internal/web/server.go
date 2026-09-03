@@ -1795,11 +1795,24 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	//     on a long conversation re-flattens and re-sends the entire history.
 	historyLen := 0
 	if body.ConversationID != "" {
+		msgHashes := requestContentHashes(body.Messages)
+		cached := false
 		for _, sess := range s.sessionResolver.ListSessions() {
-			if sess.ConversationID == body.ConversationID && sess.SessionID != "" {
-				historyLen = len(sess.ContextHistory)
+			if sess.ConversationID != body.ConversationID || sess.SessionID == "" {
+				continue
+			}
+			cached = true
+			if n := contextPrefixLenHashed(sess.ContextHistory, sess.contentHashes, body.Messages, msgHashes); n > 0 {
+				historyLen = n
 				break
 			}
+		}
+		// A cached ID is only a continuation hint. Keeping it after its stored
+		// history disagrees would attach a same-length replay to the wrong cloud
+		// conversation; let the resolver choose a fresh/content-matched binding.
+		if cached && historyLen == 0 {
+			body.ConversationID = ""
+			body.SessionID = ""
 		}
 	}
 	if body.ConversationID == "" && len(body.Messages) > 0 {

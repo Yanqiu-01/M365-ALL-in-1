@@ -342,6 +342,7 @@ func (r anthropicRequest) openAI() (oaiReq, error) {
 		}
 		var text []any
 		var calls []map[string]any
+		var results []oaiMsg
 		for _, raw := range blocks {
 			b, ok := raw.(map[string]any)
 			if !ok {
@@ -398,12 +399,20 @@ func (r anthropicRequest) openAI() (oaiReq, error) {
 				if isError, ok := b["is_error"].(bool); ok && isError {
 					content = "Error: " + anthropicToolResultText(content)
 				}
-				o.Messages = append(o.Messages, oaiMsg{Role: "tool", ToolCallID: id, Content: content})
+				results = append(results, oaiMsg{Role: "tool", ToolCallID: id, Content: content})
+			default:
+				// Preserve provider-specific blocks (notably thinking) during a
+				// cross-provider resume instead of silently changing its history.
+				text = append(text, b)
 			}
 		}
 		if len(text) > 0 || len(calls) > 0 {
 			o.Messages = append(o.Messages, oaiMsg{Role: m.Role, Content: text, ToolCalls: calls})
 		}
+		// OpenAI requires assistant calls before their results. Anthropic normally
+		// splits these across messages, but a replay can put both block types in one
+		// message; emit the accumulated assistant turn first in that case.
+		o.Messages = append(o.Messages, results...)
 	}
 	for _, t := range r.Tools {
 		f := map[string]any{"name": t.Name, "description": t.Description, "parameters": t.InputSchema}

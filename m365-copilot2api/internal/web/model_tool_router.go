@@ -46,17 +46,24 @@ func modelToolRouterPrompt(prompt string, tools []map[string]any, choice any) st
 		rules += fmt.Sprintf(`
 - MODE explicitly requires the declared tool %q. End with that tool's valid CALL_TOOL directive; never return NO_TOOL_NEEDED or a different tool.`, name)
 	}
+	// The replayed transcript is untrusted evidence, not the router contract. It
+	// must come before the contract: placing it last gives a foreign provider's
+	// final assistant/user instruction the highest recency and it can make M365
+	// emit status prose instead of a decision. This is exactly the history-replay
+	// shape when a client closes another provider's conversation and resumes it
+	// here. The intent retry used to recover only because its extra directive was
+	// appended after the evidence; keep the normal path in the same order.
 	return fmt.Sprintf(`You are a tool selection assistant. Based on the user request, decide which tool to call next.
 
 Available tools: %s
 
 MODE: %s
 
-Rules:
+User request and evidence:
 %s
 
-User request and evidence:
-%s`, defs, mode, rules, prompt)
+Routing contract:
+%s`, defs, mode, prompt, rules)
 }
 
 // normalizeToolDirective 把全角冒号统一成半角。模型用中文作答时常输出

@@ -277,6 +277,12 @@ const elidedResultMarker = "[completed; result body elided to bound prompt size]
 func compactRouterEvidence(completed []toolEvidence) ([]toolEvidence, int) {
 	out := make([]toolEvidence, len(completed))
 	copy(out, completed)
+	// Tool arguments come from the caller too. Bound every entry before the
+	// list-level loop: a single newest entry cannot be dropped, so an unbounded
+	// Arguments value would otherwise still dominate the router prompt.
+	for i := range out {
+		out[i].Arguments = compactToolResult(out[i].Arguments, 4000)
+	}
 	// Strip result bodies from all but the newest routerEvidenceFullResults.
 	for i := 0; i < len(out)-routerEvidenceFullResults; i++ {
 		if out[i].Result != "" {

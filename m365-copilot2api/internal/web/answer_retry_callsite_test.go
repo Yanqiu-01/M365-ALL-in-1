@@ -2,6 +2,7 @@ package web
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http/httptest"
@@ -24,6 +25,9 @@ import (
 // the answer call -- the exact shape that produced the live 502s.
 func newAnswerRetryServer(t *testing.T) *Server {
 	t.Helper()
+	// Session resolution is process-global unless its persistence path is isolated.
+	// Keep this fixture from accidentally reusing a binding made by another test.
+	t.Setenv("M365_SESSION_CACHE", filepath.Join(t.TempDir(), "sessions.json"))
 	store, err := auth.OpenStore(filepath.Join(t.TempDir(), "accounts.json"))
 	if err != nil {
 		t.Fatal(err)
@@ -114,4 +118,52 @@ func truncateForTest(s string) string {
 		return s[:240] + "..."
 	}
 	return s
+}
+
+func TestOpenAIChatRejectsMismatchedCachedConversationHistory(t *testing.T) {
+	s := newAnswerRetryServer(t)
+	disjoint1 := []oaiMsg{
+		{Role: "user", Content: "where is the startup recovery logic?"},
+		{Role: "assistant", Content: "in startup.go line 847"},
+	}
+	rt := runtimeWorkspaceInstruction()
+	bound := s.sessionResolver.Bind("sess-cached", "conv-cached", "acc-id", &oaiReq{
+		Messages: append([]oaiMsg{{Role: "system", Content: rt}}, disjoint1...),
+	}, "", httptest.NewRequest("POST", "/", nil))
+	if bound != nil {
+		t.Fatal("first bind should not observe compression")
+	}
+	prev := answerChat
+	t.Cleanup(func() { answerChat = prev })
+	var captured *chathub.Request
+	answerChat = func(_ context.Context, _ *Server, _ string, _ chathub.Account, req chathub.Request) (chathub.Result, error) {
+		captured = &req
+		return chathub.Result{Text: "done", RequestID: "ok"}, nil
+	}
+	bodyBytes, err := json.Marshal(oaiReq{
+		Model:          "gpt-5.6-sol",
+		Stream:         false,
+		ConversationID: "conv-cached",
+		Messages: append([]oaiMsg{{Role: "system", Content: rt}}, []oaiMsg{
+			{Role: "user", Content: "what are the validation rules?"},
+			{Role: "assistant", Content: "the ledger checks round limits first"},
+		}...),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(string(bodyBytes)))
+	r.RemoteAddr = "10.200.2.2:54321"
+	r.Header.Set("X-Api-Key", "disjoint-tenant-2")
+	w := httptest.NewRecorder()
+	s.openaiChat(w, r)
+	if w.Code != 200 {
+		t.Fatalf("rejected legitimate request; status=%d body=%s", w.Code, truncateForTest(w.Body.String()))
+	}
+	if captured == nil {
+		t.Fatal("the request never reached answerChat stub")
+	}
+	if captured.ConversationID != "" || captured.SessionID != "" {
+		t.Errorf("Path A attached the cached ConversationID to a history mismatch: conversation=%s session=%s", captured.ConversationID, captured.SessionID)
+	}
 }

@@ -167,3 +167,22 @@ func TestCompletionGuardStillHoldsWhereTheLedgerHasEvidence(t *testing.T) {
 		t.Error("an answer that denies evidence the ledger holds must still be caught")
 	}
 }
+
+func TestCompactRouterEvidenceBoundsSingleHugeArguments(t *testing.T) {
+	completed := []toolEvidence{{
+		ID:        "call_1",
+		Name:      "run_shell",
+		Arguments: strings.Repeat("x", routerEvidenceMaxBytes),
+		Result:    "ok",
+	}}
+	got, dropped := compactRouterEvidence(completed)
+	if dropped != 0 || len(got) != 1 {
+		t.Fatalf("got %d entries, dropped %d; want one retained entry", len(got), dropped)
+	}
+	if len(mustJSON(got)) > routerEvidenceMaxBytes {
+		t.Fatalf("single retained entry escaped router evidence budget: %d bytes", len(mustJSON(got)))
+	}
+	if !strings.Contains(got[0].Arguments, "[truncated ") {
+		t.Fatalf("huge arguments were not compacted: %d bytes", len(got[0].Arguments))
+	}
+}
