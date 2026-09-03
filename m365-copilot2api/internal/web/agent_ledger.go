@@ -449,6 +449,31 @@ func toolCanRepeatSameArguments(name string) bool {
 	return toolLooksObservational(name) || !toolRewritesState(name)
 }
 
+// toolWritesToStream 判断工具写入的对象是活动进程的流（stdin/stdout/stderr），
+// 而不是磁盘上的持久状态。
+//
+// 这类名字含 "write" 却不改写工作区。Codex 的 write_stdin{"chars":""} 是
+// 「继续读取那个还在跑的会话的输出」的规范写法：同名同参重复正是它的本意 ——
+// 一条 30 秒还没结束的命令，必须能一直问下去。按「含 write 即改写状态」判定，
+// 第二次轮询会被 ledger 当成重复劳动剔除，而轮询恰恰只能同参重复。
+//
+// 实测症状（2026-09-03 20:48:50，/v1/responses，declared_tools=31）：
+// exec_command 起了一条 30 秒未结束的 PowerShell 扫描（session 7773），
+// write_stdin{"chars":"","session_id":7773} 轮询一次之后，模型再次请求轮询时
+// raw_candidates=1 post_ledger=0 valid_calls=0 rejected_calls=0，该轮退化成
+// ordinary_answer_fallback，回答写成「这个回合没有提供相应的本地 PowerShell
+// 工具，因此我无法继续读取 E 盘」。工具其实声明了 31 个，是 ledger 把模型
+// 选中的那一个静默丢空了 —— 模型没有幻觉，它如实描述了自己收到的东西。
+func toolWritesToStream(name string) bool {
+	name = strings.ToLower(strings.TrimSpace(name))
+	for _, word := range []string{"stdin", "stdout", "stderr"} {
+		if strings.Contains(name, word) {
+			return true
+		}
+	}
+	return false
+}
+
 // toolRewritesState 判断工具的用途本身就是改写状态 —— 写文件、打补丁、删除、
 // 安装。这类调用同参重放是把同一次改动做两遍，必须继续剔除。
 //
@@ -459,6 +484,11 @@ func toolCanRepeatSameArguments(name string) bool {
 // write_file 一起剔掉，那正是 ledger 静默丢空的成因之一。
 func toolRewritesState(name string) bool {
 	name = strings.ToLower(strings.TrimSpace(name))
+	// 流写入不是持久状态改写，必须先放行：否则 write_stdin 的轮询会被当成
+	// 重复的写操作剔除（见 toolWritesToStream 的实测记录）。
+	if toolWritesToStream(name) {
+		return false
+	}
 	for _, word := range []string{"write", "edit", "delete", "remove", "move", "rename", "create", "patch", "apply", "install", "update", "upload", "publish", "commit", "push", "deploy"} {
 		if strings.Contains(name, word) {
 			return true
