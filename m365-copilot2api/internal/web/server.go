@@ -1641,13 +1641,24 @@ func buildAnswerRequest(answerPrompt, tone string, body oaiReq, ledger agentLedg
 		req.Tools = body.Tools
 		req.ToolChoice = body.ToolChoice
 	}
-	// Router mode reaches this turn with Tools empty by design, but the caller did
-	// declare tools -- the router simply did not select one. Saying so keeps the
-	// environment prompt from offering an absent-tool escape hatch on the very
-	// turn that produces the visible answer. Measured on a clean Claude CLI run:
-	// with 36 tools declared, the answer turn came back "I don't have a dedicated
-	// file-read tool wired up in this session".
-	req.ToolsDeclared = len(body.Tools) > 0 && fmt.Sprint(body.ToolChoice) != "none"
+	// tool_choice=none is an explicit instruction not to call anything.
+	toolsActive := len(body.Tools) > 0 && fmt.Sprint(body.ToolChoice) != "none"
+	req.ToolsDeclared = toolsActive
+	// Router mode reaches this turn with Tools empty by design, and until now the
+	// schemas were absent from the text as well -- the model was told the caller's
+	// tools exist without ever seeing which. The measured failure: Codex opened a
+	// fresh conversation asking for a directory-size census, the router fell
+	// through to the answer turn, and the model replied 「这个回合没有提供相应的
+	// 本地 PowerShell 工具，因此我无法继续读取 E 盘」-- a refusal that names the
+	// missing list. Repeating the schemas here gives the turn a callable path;
+	// fencedToolCalls already converts an emitted fence back into a tool frame.
+	if planningMode != "native" && toolsActive {
+		defs, _ := json.Marshal(body.Tools)
+		answerPrompt = answerPrompt + "\n\nTOOLS_ACTIVE_NOW on the caller's machine, callable this turn: " + string(defs) +
+			"\nIf the request still needs an action, emit exactly one fenced call ```tool_name({\"arg\":\"value\"})``` from this list; otherwise answer in prose."
+		req.SchemasInText = true
+		req.Text = answerPrompt
+	}
 	return req
 }
 

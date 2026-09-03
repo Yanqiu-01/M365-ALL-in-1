@@ -25,8 +25,10 @@ func TestBuildAnswerRequestRouterOmitsNativePlugins(t *testing.T) {
 	if len(req.Tools) != 0 || req.ToolChoice != nil {
 		t.Fatalf("router answer leaked native tools: tools=%d choice=%#v", len(req.Tools), req.ToolChoice)
 	}
-	if req.Text != "[user]\nhello" {
-		t.Fatalf("empty ledger changed answer prompt: %q", req.Text)
+	// The prompt may gain the schema block (the refusal fix), but the user turn
+	// itself must survive verbatim at the head.
+	if !strings.HasPrefix(req.Text, "[user]\nhello") {
+		t.Fatalf("answer prompt lost the user turn: %q", req.Text)
 	}
 }
 
@@ -38,11 +40,11 @@ func TestBuildAnswerRequestNativeForwardsTools(t *testing.T) {
 }
 
 // Router mode must keep Tools empty here (pinned above) while still telling
-// chathub that the caller declared tools. Without that, the environment prompt
-// takes its no-tools branch on the turn that produces the visible answer and
-// offers the model an absent-tool escape hatch. Measured on a clean Claude CLI
-// run with 36 tools declared: "I don't have a dedicated file-read tool wired up
-// in this session".
+// chathub that the caller declared tools. The schemas now also ride the text:
+// the answer turn is the last chance to keep a refused action callable, and the
+// measured failure was Codex replying 「这个回合没有提供相应的本地 PowerShell
+// 工具」on a turn where 14 tools were declared -- the model could name the list
+// only by its absence.
 func TestBuildAnswerRequestReportsDeclaredToolsWithoutForwardingThem(t *testing.T) {
 	req := buildAnswerRequest("[user]\nhello", "magic", answerRequestTestBody(), agentLedger{}, "router")
 	if len(req.Tools) != 0 {
@@ -51,8 +53,11 @@ func TestBuildAnswerRequestReportsDeclaredToolsWithoutForwardingThem(t *testing.
 	if !req.ToolsDeclared {
 		t.Errorf("router answer turn must report that the caller declared tools")
 	}
-	if req.SchemasInText {
-		t.Errorf("answer prompt carries no schema list, so SchemasInText must stay false")
+	if !req.SchemasInText {
+		t.Errorf("router answer prompt now carries the schema list, so SchemasInText must be true")
+	}
+	if !strings.Contains(req.Text, "read_file") {
+		t.Errorf("answer prompt must carry the declared tool schemas, got:\n%s", req.Text)
 	}
 }
 
