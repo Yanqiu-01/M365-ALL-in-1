@@ -3,6 +3,7 @@ package web
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"regexp"
 	"sort"
@@ -508,7 +509,10 @@ func toolRewritesState(name string) bool {
 // 判定「状态已改变」以 ledger 中是否存在变更类调用为准：只要在该验证工具完成
 // 之后发生过写入，就必须允许再验证一次。
 func filterCompletedCalls(calls []detectedToolCall, l agentLedger) []detectedToolCall {
-	out := calls[:0]
+	// 不能用 calls[:0] 复用底层数组：那会就地改写入参，调用方手上的原始候选
+	// 被写坏，于是「去重把候选清空了，退回原始候选」这种补救根本无法实现 ——
+	// 退回去拿到的已经是被覆盖过的内容。dedupeCompletedCalls 依赖这一点。
+	out := make([]detectedToolCall, 0, len(calls))
 	for _, c := range calls {
 		prior := l.completedEvidence(c.Name, string(c.Arguments))
 		if prior == nil {
@@ -552,6 +556,49 @@ func filterCompletedCalls(calls []detectedToolCall, l agentLedger) []detectedToo
 		}
 	}
 	return out
+}
+
+// dedupeCompletedCalls 是 filterCompletedCalls 的唯一生产入口，它多守一条
+// 不变量：**去重可以缩短候选列表，但不允许把它清空。**
+//
+// 为什么这条不变量比去重本身重要：
+//
+// filterCompletedCalls 靠 toolLooksObservational / toolRewritesState 这类
+// 子串关键词表给「客户端任意起名的工具」分类。这些表按定义不可能完备 ——
+// 工具名是 Codex、Claude Code、各家 MCP 自己定的字符串。判错是常态，不是意外。
+// 已经踩过三次：Bash/Glob/poll_* 落在两表之外被当变更类剔除；write_stdin 含
+// "write" 被当持久写入剔除；image-only 结果被当空结果。每次都是换个名字复发。
+//
+// 判错本身可以忍，真正致命的是判错之后的后果是**静音**的：候选归零后该轮退化成
+// ordinary_answer_fallback，回答轮拿到 native_tools=0，模型如实说「这个回合没给
+// 我工具」。用户看到的是「模型在幻觉」，真实故障点隔着三层，日志里只有一个
+// post_ledger=0 能看出来。三次定位不到都是因为它不响。
+//
+// 而清空候选并不换来任何保护：防死循环的闸是 CanContinue（server.go:1748，
+// 超限返 409 tool_round_limit），跟这里无关。去重规则本身也已经在 prompt 里
+// 正确地告诉过模型了（见 RouterContext 的 hint：不得重放同参的变更类调用，
+// 读取/检查/测试类在状态变化后可以重复）。模型看得见规则还是选了同一个调用，
+// 那就照发 —— 客户端执行一次幂等写入的代价，远小于把整轮任务变成一句
+// 「我没有工具」。
+//
+// 列表里还有其他候选时，去重照常生效：三个候选里剔掉一个重复的，剩两个，
+// 永远不会归零。归零只在「模型只选了一个、而它被判成重复」时发生，那正是
+// 判错代价最大的场合。
+func dedupeCompletedCalls(requestID string, calls []detectedToolCall, l agentLedger) []detectedToolCall {
+	if len(calls) == 0 {
+		return calls
+	}
+	out := filterCompletedCalls(calls, l)
+	if len(out) > 0 {
+		return out
+	}
+	names := make([]string, 0, len(calls))
+	for _, c := range calls {
+		names = append(names, c.Name)
+	}
+	log.Printf("[ledger-dedupe-override] id=%s kept=%d tools=%s reason=dedupe emptied a parsed candidate set; emitting instead of degrading to prose",
+		requestID, len(calls), strings.Join(names, ","))
+	return calls
 }
 
 // hasAnyMutation 判断本轮对话里是否发生过变更类调用（写文件、执行命令等）。

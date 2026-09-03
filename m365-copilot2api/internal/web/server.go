@@ -1946,7 +1946,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		}
 		calls, parsed = parseModelToolDecision(routeRes.Text, toolMaps, body.ToolChoice)
 		routerOutcome.observeParsed(parsed, len(calls))
-		calls = filterCompletedCalls(calls, ledger)
+		calls = dedupeCompletedCalls(requestID, calls, ledger)
 		postLedger := len(calls)
 		calls, rejected := validateCalls("router", calls)
 		routerOutcome.observeValidated(postLedger, len(calls), rejected)
@@ -1958,7 +1958,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			if repairErr == nil {
 				calls, parsed = parseModelToolDecision(repairRes.Text, toolMaps, body.ToolChoice)
 				routerOutcome.observeParsed(parsed, len(calls))
-				calls = filterCompletedCalls(calls, ledger)
+				calls = dedupeCompletedCalls(requestID, calls, ledger)
 				postLedger = len(calls)
 				calls, rejected = validateCalls("router", calls)
 				routerOutcome.observeValidated(postLedger, len(calls), rejected)
@@ -1999,7 +1999,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			}
 			if retryErr == nil {
 				retryCalls, retryParsed := parseModelToolDecision(retryRes.Text, toolMaps, "required")
-				retryCalls = filterCompletedCalls(retryCalls, ledger)
+				retryCalls = dedupeCompletedCalls(requestID, retryCalls, ledger)
 				retryCalls, _ = validateCalls("stream-router-intent-retry", retryCalls)
 				if retryParsed && len(retryCalls) > 0 {
 					// 非流式那侧在同一位置记了 emitted_tool_calls（server.go:2272），
@@ -2319,7 +2319,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				routerOutcome.observeParsed(true, 0)
 			}
 		}
-		calls = filterCompletedCalls(calls, ledger)
+		calls = dedupeCompletedCalls(requestID, calls, ledger)
 		postLedger := len(calls)
 		calls, rejected := validateCalls("router", calls)
 		routerOutcome.observeValidated(postLedger, len(calls), rejected)
@@ -2359,7 +2359,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			if retryErr == nil {
 				calls, parsed = parseModelToolDecision(retryRes.Text, toolMaps, "required")
 				routerOutcome.observeParsed(parsed, len(calls))
-				calls = filterCompletedCalls(calls, ledger)
+				calls = dedupeCompletedCalls(requestID, calls, ledger)
 				postLedger := len(calls)
 				calls, rejected := validateCalls("router-intent-retry", calls)
 				routerOutcome.observeValidated(postLedger, len(calls), rejected)
@@ -2398,7 +2398,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 			retryRes, retryErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: retryText, Tone: tone, Attachments: body.Attachments, ToolsDeclared: true, SchemasInText: true})
 			if retryErr == nil {
 				calls, parsed = parseModelToolDecision(retryRes.Text, toolMaps, body.ToolChoice)
-				calls = filterCompletedCalls(calls, ledger)
+				calls = dedupeCompletedCalls(requestID, calls, ledger)
 				calls, _ = validateCalls("router", calls)
 				if parsed && len(calls) > 0 {
 					scope := fmt.Sprintf("%d:%v:required-retry", len(body.Messages), completedCallIDs(ledger))
