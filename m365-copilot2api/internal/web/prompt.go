@@ -26,6 +26,14 @@ func flattenPromptMessages(messages []oaiMsg, attachments []chathub.Attachment) 
 			continue
 		}
 		if role == "tool" {
+			// Image-only (and other non-text) tool results still produce
+			// attachments above. If we leave the text empty, the model is told
+			// the call returned nothing even though the file is on this turn.
+			if strings.TrimSpace(txt) == "" {
+				if note := attachmentPresenceNote(files); note != "" {
+					txt = note
+				}
+			}
 			txt = compactToolResult(txt, 4000)
 			// 空结果要说出来，不能渲染成一个空的标题行。
 			//

@@ -90,6 +90,46 @@ func parseContent(c any) (string, []chathub.Attachment) {
 	return text.String(), files
 }
 
+// attachmentPresenceNote is the text stand-in for a tool result whose payload
+// is only non-text blocks (images, files, audio). parseContent correctly lifts
+// those blocks into ChatHub attachments, but the extracted text is empty, and
+// both flattenPromptMessages and the evidence ledger used to describe that as
+// "no content". The answer model then reports the Read as empty even though
+// the image was attached to the same turn.
+func attachmentPresenceNote(files []chathub.Attachment) string {
+	if len(files) == 0 {
+		return ""
+	}
+	nImage, nFile, nAudio := 0, 0, 0
+	for _, f := range files {
+		switch strings.ToLower(strings.TrimSpace(f.Type)) {
+		case "image":
+			nImage++
+		case "audio":
+			nAudio++
+		default:
+			nFile++
+		}
+	}
+	var parts []string
+	if nImage > 0 {
+		parts = append(parts, fmt.Sprintf("%d image attachment(s)", nImage))
+	}
+	if nFile > 0 {
+		parts = append(parts, fmt.Sprintf("%d file attachment(s)", nFile))
+	}
+	if nAudio > 0 {
+		parts = append(parts, fmt.Sprintf("%d audio attachment(s)", nAudio))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "(the caller returned " + strings.Join(parts, ", ") +
+		" with this tool result; they are attached to this turn. " +
+		"This is not an empty result. Inspect the attached content directly — " +
+		"for an image, report visual facts such as pixel width and height.)"
+}
+
 // imageTypeHandledInSwitch 标出下面 switch 已经会消费 image_url 的类型，
 // 避免前置兜底分支与 case 重复追加同一个附件。
 func imageTypeHandledInSwitch(typ string) bool {

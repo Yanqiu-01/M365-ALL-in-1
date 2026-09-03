@@ -52,7 +52,6 @@ func TestEmptyToolResultIsExplicitInThePrompt(t *testing.T) {
 		{"empty string", ""},
 		{"whitespace only", "   \n\t "},
 		{"nil", nil},
-		{"image-only blocks", []any{map[string]any{"type": "image_url", "image_url": "d"}}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -93,5 +92,62 @@ func TestNonEmptyToolResultIsUnchanged(t *testing.T) {
 	}
 	if strings.Contains(prompt, "no content") {
 		t.Errorf("a non-empty result was described as empty:\n%s", prompt)
+	}
+}
+
+func TestImageOnlyToolResultIsNotDescribedAsEmpty(t *testing.T) {
+	prompt, files := flattenPromptMessages([]oaiMsg{
+		{Role: "user", Content: "read the png and tell me its size"},
+		{Role: "assistant", ToolCalls: []map[string]any{{
+			"id": "call_img", "type": "function",
+			"function": map[string]any{"name": "Read", "arguments": `{"file_path":"x.png"}`},
+		}}},
+		{Role: "tool", ToolCallID: "call_img", Content: []any{
+			map[string]any{"type": "image", "source": map[string]any{
+				"type": "base64", "media_type": "image/png", "data": "AAAA",
+			}},
+		}},
+	}, nil)
+	if len(files) == 0 {
+		t.Fatal("image-only tool result must still produce a ChatHub attachment")
+	}
+	if strings.Contains(prompt, "no content") {
+		t.Fatalf("image-only tool result must not be described as empty:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "image attachment") {
+		t.Fatalf("prompt must say the image was returned:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "not an empty result") {
+		t.Fatalf("prompt must tell the model the call succeeded with an image:\n%s", prompt)
+	}
+	// contentToString stays the generic extractor: history byte accounting and
+	// similarity hashing depend on "" for non-text content.
+	if got := contentToString([]any{map[string]any{"type": "image_url", "image_url": "data:image/png;base64,AAAA"}}); got != "" {
+		t.Fatalf("contentToString must stay empty for image-only content, got %q", got)
+	}
+	// The evidence ledger is where an image-only result must not read as empty.
+	ledger := buildAgentLedger([]oaiMsg{
+		{Role: "user", Content: "read the png"},
+		{Role: "assistant", ToolCalls: []map[string]any{{
+			"id": "call_img2", "type": "function",
+			"function": map[string]any{"name": "Read", "arguments": `{"file_path":"x.png"}`},
+		}}},
+		{Role: "tool", ToolCallID: "call_img2", Content: []any{
+			map[string]any{"type": "image", "source": map[string]any{
+				"type": "base64", "media_type": "image/png", "data": "AAAA",
+			}},
+		}},
+	})
+	if len(ledger.Completed) != 1 {
+		t.Fatalf("Completed=%d want 1", len(ledger.Completed))
+	}
+	if !strings.Contains(ledger.Completed[0].Result, "image attachment") {
+		t.Fatalf("ledger evidence must record the returned image, got %q", ledger.Completed[0].Result)
+	}
+	if ledger.Completed[0].Failed {
+		t.Error("an image-only result must not be recorded as a failure")
+	}
+	if !strings.Contains(ledger.RouterContext(), "image attachment") {
+		t.Error("router/answer evidence must carry the image note")
 	}
 }

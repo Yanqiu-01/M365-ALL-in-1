@@ -179,6 +179,29 @@ func toolArgumentsJSON(call map[string]any) string {
 	return fmt.Sprint(arguments)
 }
 
+// toolResultEvidenceText renders a tool result for the evidence ledger.
+//
+// contentToString stays the generic text extractor: history byte accounting,
+// similarity hashing and token estimation all rely on it reporting "" for
+// non-text content, so the attachment note must not leak in there.
+//
+// The ledger is different. It is what the answer turn reads back as proof of
+// what the tools returned, and an image-only Read result rendered as "" made
+// the answer model state that the read returned nothing -- while the image was
+// attached to that very turn. Observed on a cross-provider resume: two Read
+// calls on a PNG, then "both Read operations returned empty results".
+func toolResultEvidenceText(content any) string {
+	if text := strings.TrimSpace(contentToString(content)); text != "" {
+		return contentToString(content)
+	}
+	if _, files := parseContent(content); len(files) > 0 {
+		if note := attachmentPresenceNote(files); note != "" {
+			return note
+		}
+	}
+	return contentToString(content)
+}
+
 func buildAgentLedger(messages []oaiMsg) agentLedger {
 	calls := map[string]toolEvidence{}
 	order := []string{}
@@ -197,7 +220,7 @@ func buildAgentLedger(messages []oaiMsg) agentLedger {
 		}
 		if m.Role == "tool" {
 			if e, ok := calls[m.ToolCallID]; ok {
-				raw := contentToString(m.Content)
+				raw := toolResultEvidenceText(m.Content)
 				e.Result = compactToolResult(raw, 4000)
 				// 收到 tool 消息这件事本身就是「已应答」，与内容是否为空无关。
 				//
