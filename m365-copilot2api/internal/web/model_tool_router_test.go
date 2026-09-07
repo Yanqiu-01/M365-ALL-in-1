@@ -29,7 +29,7 @@ func TestModelToolRouterPromptPlacesContractAfterReplayedEvidence(t *testing.T) 
 	evidence := strings.Index(p, "User request and evidence:")
 	tail := strings.Index(p, foreignTail)
 	contract := strings.Index(p, "Routing contract:")
-	decision := strings.LastIndex(p, "end with EXACTLY one line: CALL_TOOL:")
+	decision := strings.LastIndex(p, "CALL_TOOL: tool_name({\"arg1\":\"value1\"})")
 	if evidence < 0 || tail < evidence || contract < tail || decision < contract {
 		t.Fatalf("router prompt must end with its decision contract after replayed evidence; evidence=%d tail=%d contract=%d decision=%d\n%s", evidence, tail, contract, decision, p)
 	}

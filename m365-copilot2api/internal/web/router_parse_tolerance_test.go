@@ -231,3 +231,65 @@ CALL_TOOL: read_file({"path":"a.py"})`
 		t.Fatalf("took the restated example instead of the real decision: %s", calls[0].Arguments)
 	}
 }
+
+// 2026-09-08 实测：router 每轮只 emit 1 个调用 —— 契约写死
+// "end with EXACTLY one line"，选择侧也只取最后一个指令位置，模型真发出
+// 多行 CALL_TOOL 时其余行被静默丢弃。契约放开后，指令路径必须与信封/围栏
+// 路径一样支持一次多调用。
+func TestParseDirectiveFrameAcceptsMultipleCalls(t *testing.T) {
+	tools := extractTestTools()
+
+	// 背靠背两行指令，中间只有换行：同一帧，全部执行。
+	calls, parsed := parseModelToolDecision(
+		"两个独立操作一起做。\nCALL_TOOL: read_file({\"path\":\"a.py\"})\nCALL_TOOL: run_tests({})", tools, "auto")
+	if !parsed || len(calls) != 2 || calls[0].Name != "read_file" || calls[1].Name != "run_tests" {
+		t.Fatalf("adjacent directives are one frame: parsed=%v calls=%+v", parsed, calls)
+	}
+
+	// 中间隔一行空行仍算同一帧（只隔空白）。
+	calls, parsed = parseModelToolDecision(
+		"CALL_TOOL: read_file({\"path\":\"a.py\"})\n\nCALL_TOOL: run_tests({})", tools, "auto")
+	if !parsed || len(calls) != 2 {
+		t.Fatalf("blank line between directives must stay in one frame: parsed=%v calls=%+v", parsed, calls)
+	}
+
+	// 夹了正文说明前面的已被推翻：只认最后那条。
+	calls, parsed = parseModelToolDecision(
+		"CALL_TOOL: read_file({\"path\":\"a.py\"})\n不对，直接跑测试。\nCALL_TOOL: run_tests({})", tools, "auto")
+	if !parsed || len(calls) != 1 || calls[0].Name != "run_tests" {
+		t.Fatalf("prose between directives must split frames: parsed=%v calls=%+v", parsed, calls)
+	}
+
+	// 帧内任何一条无效 → 整帧失败关闭，不得静默执行子集。
+	if _, parsed := parseModelToolDecision(
+		"CALL_TOOL: read_file({\"path\":\"a.py\"})\nCALL_TOOL: delete_everything({})", tools, "auto"); parsed {
+		t.Fatal("an invalid call in the final frame must fail the whole frame")
+	}
+
+	// 帧内 schema 不合法同样整帧失败。
+	if _, parsed := parseModelToolDecision(
+		"CALL_TOOL: read_file({\"path\":\"a.py\"})\nCALL_TOOL: read_file({\"path\":123})", tools, "auto"); parsed {
+		t.Fatal("a schema-invalid call in the final frame must fail the whole frame")
+	}
+
+	// 末尾 NO_TOOL_NEEDED 仍取消在前的指令帧。
+	calls, parsed = parseModelToolDecision(
+		"CALL_TOOL: read_file({\"path\":\"a.py\"})\n\nNO_TOOL_NEEDED", tools, "auto")
+	if !parsed || len(calls) != 0 {
+		t.Fatalf("terminal no-tool must cancel an earlier directive frame: parsed=%v calls=%+v", parsed, calls)
+	}
+
+	// 思考里复述的指令（前面有正文隔开）仍不并入末帧。
+	calls, parsed = parseModelToolDecision(
+		"一种做法是 CALL_TOOL: run_tests({})，但先读文件更稳妥。\n\nCALL_TOOL: read_file({\"path\":\"a.py\"})", tools, "auto")
+	if !parsed || len(calls) != 1 || calls[0].Name != "read_file" {
+		t.Fatalf("a directive quoted in reasoning must not merge into the final frame: parsed=%v calls=%+v", parsed, calls)
+	}
+
+	// 多行参数体的指令之间也能成帧（前一条 End 是参数体闭合位置）。
+	calls, parsed = parseModelToolDecision(
+		"CALL_TOOL: read_file({\n  \"path\": \"a.py\"\n})\nCALL_TOOL: run_tests({})", tools, "auto")
+	if !parsed || len(calls) != 2 {
+		t.Fatalf("multi-line argument bodies must not break the frame: parsed=%v calls=%+v", parsed, calls)
+	}
+}

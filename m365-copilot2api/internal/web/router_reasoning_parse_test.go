@@ -115,12 +115,13 @@ func TestParseToolDecisionHandlesWriteFilePayload(t *testing.T) {
 	}
 }
 
-// 路由规则必须保留 APK 的 "end with EXACTLY one line" 措辞，
+// 路由规则必须保留 APK 契约的收尾措辞（决策行置于回复末尾），
 // 否则推理模型会把指令放在开头之外的位置而不自知。
 func TestRouterPromptKeepsAPKWording(t *testing.T) {
 	prompt := modelToolRouterPrompt("请读取 inventory.py", routerTestTools(), "auto")
 	for _, want := range []string{
-		"end with EXACTLY one line: CALL_TOOL:",
+		"end with the decision lines",
+		"CALL_TOOL: tool_name({\"arg1\":\"value1\"})",
 		"If no tool is needed, end with: NO_TOOL_NEEDED",
 		"Do not invent tools.",
 	} {

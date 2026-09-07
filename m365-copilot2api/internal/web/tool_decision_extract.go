@@ -31,6 +31,10 @@ type toolCandidate struct {
 	Name string
 	Args map[string]any
 	At   int // 在原文中的位置，用于「取最后一个」
+	// End 是候选在原文中的结束下标（参数体闭合之后）。只有指令路径的抽取器
+	// 填它：末帧合并（directivesAreAdjacent）需要用它判断两条指令之间是否
+	// 只隔空白。信封/围栏路径的帧边界已由 envelopeDecision 自身表达，无需此值。
+	End int
 }
 
 // envelopeDecision keeps the envelope boundary as well as its candidates.
@@ -248,11 +252,15 @@ func extractDirectiveCandidates(text string) []toolCandidate {
 			continue
 		}
 
+		// tail 是剥掉名字之后的剩余文本，它在原文中的起始下标是：
+		base := len(text) - len(tail)
+
 		// 形态 1：括号参数。要求名字与 "(" 之间只有装饰。
 		if open := strings.IndexByte(tail, '('); open >= 0 && decorationOnly(tail[:open]) {
 			if close := balancedSpan(tail, open, '(', ')'); close >= 0 {
 				if args, ok := decodeArguments(tail[open+1 : close]); ok {
-					out = append(out, toolCandidate{Name: name, Args: args, At: at})
+					// base + close + 1 = 参数体 ")" 之后的原文下标。
+					out = append(out, toolCandidate{Name: name, Args: args, At: at, End: base + close + 1})
 				}
 				continue
 			}
@@ -261,14 +269,19 @@ func extractDirectiveCandidates(text string) []toolCandidate {
 		if open := strings.IndexByte(tail, '{'); open >= 0 && decorationOnly(tail[:open]) {
 			if close := balancedSpan(tail, open, '{', '}'); close >= 0 {
 				if args, ok := decodeArguments(tail[open : close+1]); ok {
-					out = append(out, toolCandidate{Name: name, Args: args, At: at})
+					out = append(out, toolCandidate{Name: name, Args: args, At: at, End: base + close + 1})
 				}
 				continue
 			}
 		}
 		// 形态 3：裸名字，无参数。必须独占一行：行首 + 名字后无内容。
 		if bareDirectiveHead(text, at) && bareDirectiveTail(tail) {
-			out = append(out, toolCandidate{Name: name, Args: map[string]any{}, At: at})
+			// 整个指令行就是一帧：End 取到行尾（含换行）。
+			end := len(text)
+			if nl := strings.IndexByte(text[base:], '\n'); nl >= 0 {
+				end = base + nl + 1
+			}
+			out = append(out, toolCandidate{Name: name, Args: map[string]any{}, At: at, End: end})
 		}
 	}
 	return out
