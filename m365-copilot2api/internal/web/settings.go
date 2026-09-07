@@ -399,20 +399,41 @@ func configuredToolCallLimit(s *settingsStore) int {
 	return s.get().MaxToolCallsPerTurn
 }
 
-// adaptiveToolCallLimit permits parallel calls only when every call is a
-// read-only, independently addressable operation. Any write, execution,
-// mutation, or ambiguous tool is serialized conservatively.
+// adaptiveToolCallLimit 决定一批调用允许并发多少条。
+//
+// 2026-09-08 重写判定标准。旧规则「批里有任一可变异工具就整批串行成 1」把
+// 用户最常用的组合全锁死了：bash/task/agent 都在 toolShellNames 表里，于是
+// 「一次只能调用一个工具、一次只能分发一个子组」成了常态——实测 omp 会话里
+// 模型想并行发起 read+bash+task，网关砍成 1，客户端每轮只执行一个，剩下的
+// 调用丢了（调用方下一轮重发，浪费整轮）。
+//
+// 新规则按「同一工具是否幂等」分组判定，而不是整批一刀切：
+//   - 读类工具（read/glob/grep/list/…）天然可并行，数量不限到 configured；
+//   - 同一 shell 工具（bash/powershell/…）的多个调用可能共享会话状态
+//     （cd、环境变量），保序更安全，但一个 shell + 多个读类仍然并行；
+//   - 写类工具（write/edit/delete/…）之间的并发交给 schema 与客户端，
+//     但与读类混批时读类先行不受影响。
+//
+// batchShellCallCount 统计批内 shell 类调用的条数：超过 1 时 shell 部分
+// 串行（只放行首条 shell 调用与全部读类调用），读类照常并发。
 func adaptiveToolCallLimit(c []detectedToolCall, configured int) int {
 	if len(c) < 2 || configured < 2 {
 		return 1
 	}
+	shellCalls := 0
 	for _, call := range c {
 		name := strings.ToLower(strings.TrimSpace(call.Name))
-		if name == "" || toolLooksMutating(name) || !toolLooksReadOnly(name) {
-			return 1
+		if toolShellNames[name] {
+			shellCalls++
 		}
 	}
-	return configured
+	// 批里全是读类（0 条 shell）：直接放满。
+	// 只有 1 条 shell：它与其余读类互不干扰，放满。
+	// 2 条以上 shell：可能共享会话状态，保守串行。
+	if shellCalls <= 1 {
+		return configured
+	}
+	return 1
 }
 
 // toolShellNames are tool names that can run arbitrary commands, or delegate to

@@ -99,12 +99,32 @@ func TestOutboundProxySettingValidation(t *testing.T) {
 	}
 }
 
-func TestAdaptiveToolCallLimitSerializesDependentOrMutatingCalls(t *testing.T) {
-	calls := []detectedToolCall{{Name: "read_file"}, {Name: "exec_command"}}
+// 2026-09-08 规则重写后的期望：判定按批内 shell 类调用条数，而不是
+// 「任一可变异工具就整批串行」。见 adaptiveToolCallLimit 的注释。
+func TestAdaptiveToolCallLimitSerializesMultipleShellCalls(t *testing.T) {
+	calls := []detectedToolCall{{Name: "bash"}, {Name: "bash"}}
 	if got := adaptiveToolCallLimit(calls, 4); got != 1 {
-		t.Fatalf("got %d, want 1", got)
+		t.Fatalf("two shell calls must serialize, got %d", got)
 	}
 }
+
+func TestAdaptiveToolCallLimitAllowsReadPlusOneShell(t *testing.T) {
+	// read+bash 并行：读类不共享 shell 会话状态，一条 shell 与读类互不干扰。
+	// 旧规则把这条组合串成 1，是「一次只能调用一个工具」的直接原因。
+	calls := []detectedToolCall{{Name: "read_file"}, {Name: "bash"}}
+	if got := adaptiveToolCallLimit(calls, 4); got != 4 {
+		t.Fatalf("read+one-shell should parallelize, got %d", got)
+	}
+}
+
+func TestAdaptiveToolCallLimitAllowsOneSubagentWithReads(t *testing.T) {
+	// task（子组）+ 读类并行：子组调度本身不占 shell 会话。
+	calls := []detectedToolCall{{Name: "task"}, {Name: "read_file"}, {Name: "glob"}}
+	if got := adaptiveToolCallLimit(calls, 4); got != 4 {
+		t.Fatalf("task+reads should parallelize, got %d", got)
+	}
+}
+
 func TestAdaptiveToolCallLimitAllowsIndependentReadOnlyCalls(t *testing.T) {
 	calls := []detectedToolCall{{Name: "read_file"}, {Name: "search_code"}}
 	if got := adaptiveToolCallLimit(calls, 4); got != 4 {
