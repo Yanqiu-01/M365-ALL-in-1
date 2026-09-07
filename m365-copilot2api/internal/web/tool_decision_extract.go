@@ -634,6 +634,122 @@ func hasTrailingNoTool(text string) bool {
 }
 
 // selectDecision 对候选做统一校验，返回最后一个通过的调用。
+var (
+	// powerShellEatenAccelerators 是 2026-09-07 直连 4141 逐字符探测确认的
+	// 「会被上游 Markdown 管线吃掉前缀」的单 token 加速器方法集：方法名 →
+	// 应恢复的完整前缀。上游吃的是 [xxx]:: 这类单 token 方括号字面量
+	// （[string]::IsNullOrWhiteSpace 到客户端只剩 :IsNullOrWhiteSpace），带点
+	// 的完整限定名 [System.String]:: 原样通过。逐个登记而不是泛匹配 :word(，
+	// 避免把合法 PowerShell 冒号语法（$env:、label:）或无关残缺误伤。
+	powerShellEatenAccelerators = map[string]string{
+		"IsNullOrWhiteSpace": "[string]::",
+		"Ceiling":            "[math]::",
+		"Floor":              "[math]::",
+		"Max":                "[math]::",
+		"Min":                "[math]::",
+		"Round":              "[math]::",
+		"Sqrt":               "[math]::",
+		"Abs":                "[math]::",
+		"GetFolderPath":      "[System.Environment]::",
+		"NewGuid":            "[System.Guid]::",
+		"Now":                "[System.DateTime]::",
+		"Today":              "[System.DateTime]::",
+		"WriteLine":          "[System.Console]::",
+		"ReadAllText":        "[System.IO.File]::",
+		"WriteAllText":       "[System.IO.File]::",
+		"Exists":             "[System.IO.File]::",
+		"Combine":            "[System.IO.Path]::",
+		"FromSeconds":        "[System.TimeSpan]::",
+		"FromMinutes":        "[System.TimeSpan]::",
+		"IsMatch":            "[System.Text.RegularExpressions.Regex]::",
+		"Escape":             "[System.Text.RegularExpressions.Regex]::",
+	}
+)
+
+// repairPowerShellArguments restores PowerShell type accelerators eaten by the
+// upstream's Markdown pipeline, which strips [xxx]:: down to : for accelerator
+// literals like [string], [math], [int], [Console] ([System.String]:: with its
+// dot survives — the stripper only matches single-token names). It changes only
+// the command field for a case-insensitive PowerShell tool name.
+//
+// 两个安全阀：
+//   - 前缀恢复前先查 [System.X]::Method( 是否已完整在场（前一个正则可能已
+//     修过一遍 / 命令本来就是完整写法），避免拼出双重前缀；
+//   - 只有前缀表里登记过的方法才恢复，不在表里的 :word( 原样保留 —— 那可能
+//     是合法语法（$env:、label:）或与加速器无关的残缺，瞎补反而制造错误。
+func repairPowerShellArguments(name string, args map[string]any) map[string]any {
+	if !strings.EqualFold(strings.TrimSpace(name), "powershell") {
+		return args
+	}
+	command, ok := args["command"].(string)
+	if !ok || command == "" {
+		return args
+	}
+	repaired := command
+	for method, accelerator := range powerShellEatenAccelerators {
+		if accelerator == "" {
+			continue // 属性型（MaxValue/MinValue）暂不恢复：吃法未实测确认。
+		}
+		if strings.Contains(repaired, accelerator+method) {
+			continue // 该方法的完整写法已在场，不重复处理。
+		}
+		// :Method( 前一个字符不能是 ':'（排除 [System.String]::Method( 的
+		// 完整写法与 $env: 形态），也不能是标识符字符（排除 foo:Method(）。
+		repaired = restoreEatenAccelerator(repaired, method, accelerator)
+	}
+	if repaired == command {
+		return args
+	}
+	clone := make(map[string]any, len(args))
+	for key, value := range args {
+		clone[key] = value
+	}
+	clone["command"] = repaired
+	return clone
+}
+
+// restoreEatenAccelerator 把 command 里「:Method(」残迹恢复成
+// 「accelerator + Method(」。逐段扫描而不是纯正则替换，因为需要逐位置看
+// 冒号前一个字符；返回恢复后的完整命令。
+func restoreEatenAccelerator(command, method, accelerator string) string {
+	var out strings.Builder
+	out.Grow(len(command) + 32)
+	i := 0
+	for i < len(command) {
+		j := strings.Index(command[i:], ":"+method+"(")
+		if j < 0 {
+			out.WriteString(command[i:])
+			break
+		}
+		j += i
+		out.WriteString(command[i:j])
+		// 冒号前一个字符若是 ':'（完整 :: 写法）或标识符字符（foo:Method()），
+		// 这不是被吃掉的加速器，原样保留。
+		if j > 0 {
+			prev := command[j-1]
+			if prev == ':' || isIdentByte(prev) {
+				out.WriteString(":" + method + "(")
+				i = j + len(":"+method+"(")
+				continue
+			}
+		}
+		out.WriteString(accelerator + method + "(")
+		i = j + len(":"+method+"(")
+	}
+	return out.String()
+}
+
+// isIdentByte 报告 b 是否可出现在标识符中间（字母/数字/下划线），用于排除
+// foo:Method( 这类与加速器无关的冒号。
+func isIdentByte(b byte) bool {
+	return b == '_' || (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9')
+}
+
+func marshalToolArguments(name string, args map[string]any) ([]byte, error) {
+	return json.Marshal(repairPowerShellArguments(name, args))
+}
+
+// selectDecision 对候选做统一校验,返回最后一个通过的调用。
 func selectDecision(candidates []toolCandidate, tools []map[string]any, choice any) ([]detectedToolCall, bool) {
 	for i := len(candidates) - 1; i >= 0; i-- {
 		c := candidates[i]
@@ -644,7 +760,7 @@ func selectDecision(candidates []toolCandidate, tools []map[string]any, choice a
 		if fn == nil || schemaValid(c.Args, fn) != nil {
 			continue
 		}
-		encoded, err := json.Marshal(c.Args)
+		encoded, err := marshalToolArguments(c.Name, c.Args)
 		if err != nil {
 			continue
 		}
@@ -669,7 +785,7 @@ func selectAllValid(candidates []toolCandidate, tools []map[string]any, choice a
 		if fn == nil || schemaValid(c.Args, fn) != nil {
 			continue
 		}
-		encoded, err := json.Marshal(c.Args)
+		encoded, err := marshalToolArguments(c.Name, c.Args)
 		if err != nil {
 			continue
 		}

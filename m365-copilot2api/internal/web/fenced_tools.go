@@ -46,13 +46,13 @@ func fencedToolCalls(text string, tools []map[string]any, choice any) []detected
 			}
 			if m, ok := v.(map[string]any); ok {
 				if cmd, hasCmd := m["command"]; hasCmd && cmd != "" {
-					cmdBytes, _ := json.Marshal(map[string]any{"command": cmd, "timeout": m["timeout"], "workdir": m["workdir"]})
+					cmdBytes, _ := marshalToolArguments(converted, map[string]any{"command": cmd, "timeout": m["timeout"], "workdir": m["workdir"]})
 					out = append(out, detectedToolCall{ID: callID(converted, string(cmdBytes), len(out)), Type: "function", Name: converted, Arguments: cmdBytes})
 					continue
 				}
 			}
 			if v == nil {
-				cmdBytes, _ := json.Marshal(map[string]any{"command": args})
+				cmdBytes, _ := marshalToolArguments(converted, map[string]any{"command": args})
 				out = append(out, detectedToolCall{ID: callID(converted, string(cmdBytes), len(out)), Type: "function", Name: converted, Arguments: cmdBytes})
 				continue
 			}
@@ -93,7 +93,7 @@ func fencedToolCalls(text string, tools []map[string]any, choice any) []detected
 				continue
 			}
 			if cmd, hasCmd := obj["command"]; hasCmd && cmd != "" {
-				cmdBytes, _ := json.Marshal(map[string]any{"command": cmd, "timeout": obj["timeout"], "workdir": obj["workdir"]})
+				cmdBytes, _ := marshalToolArguments(shell, map[string]any{"command": cmd, "timeout": obj["timeout"], "workdir": obj["workdir"]})
 				out = append(out, detectedToolCall{ID: callID(shell, string(cmdBytes), len(out)), Type: "function", Name: shell, Arguments: cmdBytes})
 				break
 			}
