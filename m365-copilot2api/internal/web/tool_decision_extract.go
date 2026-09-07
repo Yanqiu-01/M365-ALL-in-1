@@ -643,6 +643,9 @@ var (
 	// 避免把合法 PowerShell 冒号语法（$env:、label:）或无关残缺误伤。
 	powerShellEatenAccelerators = map[string]string{
 		"IsNullOrWhiteSpace": "[string]::",
+		"IsNullOrEmpty":      "[string]::",
+		"Format":             "[string]::",
+		"Join":               "[string]::",
 		"Ceiling":            "[math]::",
 		"Floor":              "[math]::",
 		"Max":                "[math]::",
@@ -655,6 +658,7 @@ var (
 		"Now":                "[System.DateTime]::",
 		"Today":              "[System.DateTime]::",
 		"WriteLine":          "[System.Console]::",
+		"ReadLine":           "[System.Console]::",
 		"ReadAllText":        "[System.IO.File]::",
 		"WriteAllText":       "[System.IO.File]::",
 		"Exists":             "[System.IO.File]::",
