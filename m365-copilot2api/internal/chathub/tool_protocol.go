@@ -126,5 +126,17 @@ func toolProtocolPrompt(text string, tools []Tool, choice any, hasPlugins bool, 
 		// model to call and the absent-tool clause is the honest closing again.
 		return environmentPrompt(false, false) + text
 	}
-	return environmentPrompt(true, true) + fmt.Sprintf("You are an execution agent on that machine. The tools below are real, active, and callable right now, and they are the execution path for commands, code and filesystem access. To run code, call the bash tool.\nWhen the user's request requires a tool, call it by emitting ONLY one fenced block whose info string is the exact tool name and whose body is a JSON object of arguments. That fenced block is the entire call and stands on its own. Wait for the tool result before claiming completion.\n\n<tools>\n%s\n</tools>\n\nUser request:\n%s", strings.Join(defs, "\n\n"), text)
+	// promptQuirkWorkarounds 告诉模型上游链路会吃掉的字符形态，让它在源头就
+	// 不产出会被损坏的内容。这是「根本修」的源头一半：与其在网关下游对每个残迹
+	// 打补丁（加速器恢复表、围栏形态表……打一个漏一个，永远追不完），不如让上
+	// 游根本不产生需要修复的东西。
+	//
+	// 2026-09-07/08 直连逐字符探测确认：上游对「单 token 方括号字面量 + ::」
+	// （PowerShell 类型加速器形态）有确定性剥除——[string]::IsNullOrWhiteSpace 到
+	// 达客户端只剩 :IsNullOrWhiteSpace，[math]::Ceiling 只剩 :Ceiling；而带点的
+	// [System.String]:: 与空格填充的 [ string]:: 原样通过。空格形态在 PowerShell
+	// 里语义完全等价（实测 [ string]::IsNullOrWhiteSpace('') 正常执行），直接约
+	// 定模型写这个形态，两侧都不再需要修复。
+	promptQuirkWorkarounds := "Transit note: a tight PowerShell type accelerator like [string]:: is stripped in transit on this link. Always write the spaced form instead — [ string]::, [ math]::, [ System.Environment]:: — it passes through unchanged and is valid PowerShell on the caller's machine. "
+	return environmentPrompt(true, true) + promptQuirkWorkarounds + fmt.Sprintf("You are an execution agent on that machine. The tools below are real, active, and callable right now, and they are the execution path for commands, code and filesystem access. To run code, call the bash tool.\nWhen the user's request requires a tool, call it by emitting ONLY one fenced block whose info string is the exact tool name and whose body is a JSON object of arguments. That fenced block is the entire call and stands on its own. Wait for the tool result before claiming completion.\n\n<tools>\n%s\n</tools>\n\nUser request:\n%s", strings.Join(defs, "\n\n"), text)
 }

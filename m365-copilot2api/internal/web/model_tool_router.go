@@ -53,8 +53,16 @@ func modelToolRouterPrompt(prompt string, tools []map[string]any, choice any) st
 	// shape when a client closes another provider's conversation and resumes it
 	// here. The intent retry used to recover only because its extra directive was
 	// appended after the evidence; keep the normal path in the same order.
+	//
+	// routerTransitNote 与 chathub/tool_protocol.go 的 promptQuirkWorkarounds
+	// 同源：上游链路会确定性剥除「单 token 方括号字面量 + ::」（PowerShell
+	// 类型加速器形态）。路由轮的 Tools 为空、schema 在正文里走的是另一条组
+	// 装路径，不会经过 toolProtocolPrompt，所以这里单独带上同一条约定——让
+	// 模型在源头就写不会被吃掉的空格形态（[ string]::），而不是等网关下游
+	// 对每个残迹打补丁。空格形态在 PowerShell 里语义等价，两侧零成本。
+	routerTransitNote := "Transit note: a tight PowerShell type accelerator like [string]:: is stripped in transit on this link. When your command arguments use one, write the spaced form instead — [ string]::, [ math]::, [ System.Environment]:: — which passes through unchanged and is valid PowerShell. "
 	return fmt.Sprintf(`You are a tool selection assistant. Based on the user request, decide which tool to call next.
-
+%s
 Available tools: %s
 
 MODE: %s
@@ -63,7 +71,7 @@ User request and evidence:
 %s
 
 Routing contract:
-%s`, defs, mode, prompt, rules)
+%s`, routerTransitNote, defs, mode, prompt, rules)
 }
 
 // normalizeToolDirective 把全角冒号统一成半角。模型用中文作答时常输出
