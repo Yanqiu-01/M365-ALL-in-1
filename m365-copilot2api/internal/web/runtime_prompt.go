@@ -75,13 +75,26 @@ func describeRuntimeHost(goos, goarch string) string {
 			"The workspace files area is mounted at /workspace (the 软件区) and is a normal writable directory — "+
 			"treat it as the project root and write there directly.", goarch)
 	case "windows":
+		// The host shell and the caller's tool are different things. Claude Code
+		// declares a Bash tool (which this host serves through Git Bash) while the
+		// interactive shell is PowerShell — a prompt that only says "the shell is
+		// PowerShell" made the model emit Get-Location/Get-ChildItem into the Bash
+		// tool, which died with "command not found". Name both halves, and let the
+		// caller's tool description (which says bash/POSIX when it is) win for
+		// tool arguments.
 		return fmt.Sprintf("Host: Windows/%s, the user's own PC. "+
-			"The shell is PowerShell, and local or mapped paths such as C:\\ and E:\\ refer to the caller's real filesystem. "+
-			"POSIX-only commands are unavailable: use Get-ChildItem instead of ls, Get-Content instead of cat, "+
-			"Get-Location instead of pwd, and $env:NAME instead of $NAME.", goarch)
+			"Local or mapped paths such as C:\\ and E:\\ refer to the caller's real filesystem, "+
+			"and PowerShell cmdlets like Get-ChildItem, Get-Content and Get-Location run on this host. "+
+			"When a declared tool's own description specifies its shell or syntax (for example a bash/POSIX shell tool), "+
+			"write commands in THAT tool's dialect, not in PowerShell.", goarch)
 	case "linux":
-		return fmt.Sprintf("Host: Linux/%s. This may be a PC or a phone running RikkaHub under proot; "+
-			"either way it is a real filesystem with a POSIX shell.", goarch)
+		// GOOS=linux 只说明内核，不说明宿主形态。PC 上这台网关的调用方就是
+		// Claude Code / Codex 这类 CLI 编程代理，之前写成「可能是跑 RikkaHub
+		// 的手机」会让 PC 场景的模型按手机工作区（/workspace）的假设干活。
+		// proot/RikkaHub 只发生在手机上，两者分开表述。
+		return fmt.Sprintf("Host: Linux/%s. "+
+			"On a PC the caller is a CLI coding agent such as Claude Code or Codex, and this is a real filesystem with a POSIX shell. "+
+			"On a phone the gateway may run inside the RikkaHub workspace under proot — also a real filesystem, with the workspace as the project root.", goarch)
 	case "darwin":
 		return fmt.Sprintf("Host: macOS/%s, the user's own Mac, with a POSIX shell.", goarch)
 	default:
