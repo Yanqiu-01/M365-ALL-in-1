@@ -76,7 +76,12 @@ func fencedToolCalls(text string, tools []map[string]any, choice any) []detected
 			}
 			if m, ok := v.(map[string]any); ok {
 				if cmd, hasCmd := m["command"]; hasCmd && cmd != "" {
-					cmdBytes, _ := marshalToolArguments(converted, map[string]any{"command": cmd, "timeout": m["timeout"], "workdir": m["workdir"]})
+					// 透传模型给的全部参数键，而不是重建 {command,timeout,workdir}。
+					// omp 一类客户端的 bash schema required 含 "i"（concise intent），
+					// 重建白名单会把它剥掉，validateDetectedToolCalls 必然拒收
+					// 「missing required argument i」，模型拿不到执行结果只能重试，
+					// 再拒——2026-09-08 用户会话实测六连拒都在这条路径上。
+					cmdBytes, _ := marshalToolArguments(converted, m)
 					out = append(out, detectedToolCall{ID: callID(converted, string(cmdBytes), len(out)), Type: "function", Name: converted, Arguments: cmdBytes})
 					continue
 				}
@@ -154,7 +159,9 @@ func fencedToolCalls(text string, tools []map[string]any, choice any) []detected
 				continue
 			}
 			if cmd, hasCmd := obj["command"]; hasCmd && cmd != "" {
-				cmdBytes, _ := marshalToolArguments(shell, map[string]any{"command": cmd, "timeout": obj["timeout"], "workdir": obj["workdir"]})
+				// 同上：透传全部键。裸 JSON 兜底和围栏转换是同一条决策语义，
+				// 白名单重建在这里同样会剥掉 required 字段（如 omp 的 i）。
+				cmdBytes, _ := marshalToolArguments(shell, obj)
 				out = append(out, detectedToolCall{ID: callID(shell, string(cmdBytes), len(out)), Type: "function", Name: shell, Arguments: cmdBytes})
 				break
 			}
