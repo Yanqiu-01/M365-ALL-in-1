@@ -53,6 +53,69 @@ func declaredShell(allowed map[string]bool) string {
 	return ""
 }
 
+// synthesizeShellArguments 为「纯命令围栏」（```bash\nls -la\n```，没有 JSON
+// 参数）合成参数对象。
+//
+// 网关自己造参数时必须照客户端声明的 schema 来：required 里的字段一个都不能少，
+// 否则 validateDetectedToolCalls 必然拒收，模型看不到任何执行结果，只能重试再被
+// 拒。硬编码 {"command": …} 就是这么坏事的 —— omp 的 bash schema required 是
+// ["command","i"]，2026-09-08 当天同一原因被拒 24 次、跨两个构建。
+//
+// 只填网关真能诚实给出的值：命令进 command，其余必填字符串字段填一句由命令本身
+// 派生的说明（intent 类字段的诚实答案就是「这条命令要做什么」），声明了 default
+// 的按 default 填。非字符串的必填字段没有可诚实派生的值，留空 —— 那种情况应当
+// 被校验拒收并进修复轮如实告知模型，而不是让网关瞎编一个值。
+func synthesizeShellArguments(name, command string, tools []map[string]any) map[string]any {
+	return fillRequiredShellArguments(name, map[string]any{"command": command}, tools)
+}
+
+// fillRequiredShellArguments 补齐 args 里缺失的必填字段，已有键一律不动。
+//
+// 三条 shell 参数出口（纯命令围栏、带 JSON 的围栏、裸 JSON 兜底）共用它：
+// 模型给了什么就照原样透传，只把它漏掉的必填字段按声明补上。
+func fillRequiredShellArguments(name string, args map[string]any, tools []map[string]any) map[string]any {
+	fn := toolFunction(name, tools)
+	if fn == nil {
+		return args
+	}
+	command, _ := args["command"].(string)
+	params, _ := fn["parameters"].(map[string]any)
+	props, _ := params["properties"].(map[string]any)
+	for _, field := range requiredToolArguments(name, tools) {
+		if _, present := args[field]; present {
+			continue
+		}
+		spec, _ := props[field].(map[string]any)
+		if def, ok := spec["default"]; ok {
+			args[field] = def
+			continue
+		}
+		if typ, _ := spec["type"].(string); typ != "" && typ != "string" {
+			continue
+		}
+		args[field] = summarizeShellCommand(command)
+	}
+	return args
+}
+
+// summarizeShellCommand 给出一句关于命令的简短说明，供 intent 类必填字段使用。
+// 内容取自命令首行，不编造模型没表达过的意图。截断按 rune 边界，中文命令不会
+// 被切出半个字符。
+func summarizeShellCommand(command string) string {
+	line := strings.TrimSpace(command)
+	if i := strings.IndexAny(line, "\r\n"); i >= 0 {
+		line = strings.TrimSpace(line[:i])
+	}
+	if line == "" {
+		return "run the shell command"
+	}
+	const limit = 60
+	if runes := []rune(line); len(runes) > limit {
+		line = strings.TrimSpace(string(runes[:limit])) + "…"
+	}
+	return "run: " + line
+}
+
 func fencedToolCalls(text string, tools []map[string]any, choice any) []detectedToolCall {
 	allowed := allowedToolNames(tools)
 	shell := declaredShell(allowed)
@@ -81,13 +144,18 @@ func fencedToolCalls(text string, tools []map[string]any, choice any) []detected
 					// 重建白名单会把它剥掉，validateDetectedToolCalls 必然拒收
 					// 「missing required argument i」，模型拿不到执行结果只能重试，
 					// 再拒——2026-09-08 用户会话实测六连拒都在这条路径上。
-					cmdBytes, _ := marshalToolArguments(converted, m)
+					// 模型漏掉的必填字段按声明补齐，已给的键一律不动。
+					cmdBytes, _ := marshalToolArguments(converted, fillRequiredShellArguments(converted, m, tools))
 					out = append(out, detectedToolCall{ID: callID(converted, string(cmdBytes), len(out)), Type: "function", Name: converted, Arguments: cmdBytes})
 					continue
 				}
 			}
 			if v == nil {
-				cmdBytes, _ := marshalToolArguments(converted, map[string]any{"command": args})
+				// 纯命令围栏（```bash\nls -la\n```）没有 JSON 参数，参数由网关合成。
+				// 合成时必须照声明的 schema 补齐必填字段，而不是只塞一个 command：
+				// omp 的 bash schema required 是 ["command","i"]，只给 command 必被
+				// schemaValid 拒收，模型永远看不到执行结果。
+				cmdBytes, _ := marshalToolArguments(converted, synthesizeShellArguments(converted, args, tools))
 				out = append(out, detectedToolCall{ID: callID(converted, string(cmdBytes), len(out)), Type: "function", Name: converted, Arguments: cmdBytes})
 				continue
 			}
@@ -161,7 +229,8 @@ func fencedToolCalls(text string, tools []map[string]any, choice any) []detected
 			if cmd, hasCmd := obj["command"]; hasCmd && cmd != "" {
 				// 同上：透传全部键。裸 JSON 兜底和围栏转换是同一条决策语义，
 				// 白名单重建在这里同样会剥掉 required 字段（如 omp 的 i）。
-				cmdBytes, _ := marshalToolArguments(shell, obj)
+				// 必填字段的补齐也走同一个函数，三条出口不再各行其是。
+				cmdBytes, _ := marshalToolArguments(shell, fillRequiredShellArguments(shell, obj, tools))
 				out = append(out, detectedToolCall{ID: callID(shell, string(cmdBytes), len(out)), Type: "function", Name: shell, Arguments: cmdBytes})
 				break
 			}

@@ -1886,7 +1886,10 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	if body.ToolChoice == nil && len(toolMaps) > 0 {
 		body.ToolChoice = "auto"
 	}
-	validateCalls := func(stage string, calls []detectedToolCall) ([]detectedToolCall, int) {
+	// 返回拒收明细而不是条数：修复轮必须知道「为何被拒」才修得对。
+	// 此前这里压成 int，拒收原因只进日志，修复轮拿不到，于是只能写死
+	// 一句「你选错工具了」——而实测最常见的拒收是缺必填参数，工具名本身是对的。
+	validateCalls := func(stage string, calls []detectedToolCall) ([]detectedToolCall, []rejectedToolCall) {
 		valid, rejected := validateDetectedToolCalls(calls, toolMaps, body.ToolChoice)
 		// 客户端显式关闭并行时降为单调用。这里是 11 处决策解析的共同收口，放在
 		// 别处会漏掉分支。
@@ -1895,7 +1898,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		for _, call := range rejected {
 			log.Printf("[tool-validation] id=%s stage=%s rejected_name=%q reason=%q", requestID, stage, call.Name, call.Reason)
 		}
-		return valid, len(rejected)
+		return valid, rejected
 	}
 	planningMode := s.settings.get().ToolPlanningMode
 	var calls []detectedToolCall
@@ -1960,7 +1963,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		calls = dedupeCompletedCalls(requestID, calls, ledger)
 		postLedger := len(calls)
 		calls, rejected := validateCalls("router", calls)
-		routerOutcome.observeValidated(postLedger, len(calls), rejected)
+		routerOutcome.observeValidated(postLedger, len(calls), len(rejected))
 		if !parsed {
 			repairRes, repairErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: `Repair this tool routing output into JSON only with shape {"calls":[{"name":"function_name","arguments":{}}]}. Use {"calls":[]} if no tool is needed. OUTPUT:\n` + compactToolResult(routeRes.Text, 6000), Tone: tone, Attachments: body.Attachments})
 			if repairErr == nil && repairRes.ConversationID != "" {
@@ -1972,7 +1975,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				calls = dedupeCompletedCalls(requestID, calls, ledger)
 				postLedger = len(calls)
 				calls, rejected = validateCalls("router", calls)
-				routerOutcome.observeValidated(postLedger, len(calls), rejected)
+				routerOutcome.observeValidated(postLedger, len(calls), len(rejected))
 			}
 		}
 		if parsed && len(calls) > 0 {
@@ -2144,12 +2147,12 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		}
 		calls, rejected := validateCalls("stream", rawCalls)
 		toolResult := chathub.Result{Text: text.String()}
-		if len(calls) == 0 && rejected > 0 {
+		if len(calls) == 0 && len(rejected) > 0 {
 			// A native ChatHub event can contain a fabricated or empty tool name.
 			// Do not leak it to the local runner: ask the model to remap the intent
 			// to exactly one of the tools the client actually declared.
 			repairPrompt := modelToolRouterPrompt(routerPromptMessages(body.Messages)+"\n"+ledger.RouterContext(), toolMaps, "required") +
-				"\nREPAIR RULE: The previous upstream event selected an undeclared tool. Select one declared tool that performs the intended operation. Never return unknown_tool."
+				toolRejectionRepairInstruction(rejected, toolMaps)
 			repairRes, repairErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: repairPrompt, Tone: tone, Attachments: body.Attachments})
 			if repairErr == nil {
 				repaired, parsed := parseModelToolDecision(repairRes.Text, toolMaps, body.ToolChoice)
@@ -2209,7 +2212,8 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				if len(ejected) == 0 {
 					ejected = nativeToolCalls(corrected.Events, body.Tools)
 				}
-				ejectedCalls, ejectedRejected := validateCalls("stream-eject", ejected)
+				ejectedCalls, ejectedRejectedCalls := validateCalls("stream-eject", ejected)
+				ejectedRejected := len(ejectedRejectedCalls)
 				if len(ejectedCalls) > 0 {
 					ejectedCalls = limitToolCalls(ejectedCalls, adaptiveToolCallLimit(ejectedCalls, configuredToolCallLimit(s.settings)))
 					_ = writeToolResponse(w, id, model, true, ejectedCalls, corrected)
@@ -2333,7 +2337,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		calls = dedupeCompletedCalls(requestID, calls, ledger)
 		postLedger := len(calls)
 		calls, rejected := validateCalls("router", calls)
-		routerOutcome.observeValidated(postLedger, len(calls), rejected)
+		routerOutcome.observeValidated(postLedger, len(calls), len(rejected))
 		if len(calls) > 0 {
 			routerOutcome.record("validated", "emitted_tool_calls")
 			scope := fmt.Sprintf("%d:%v", len(body.Messages), completedCallIDs(ledger))
@@ -2373,7 +2377,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				calls = dedupeCompletedCalls(requestID, calls, ledger)
 				postLedger := len(calls)
 				calls, rejected := validateCalls("router-intent-retry", calls)
-				routerOutcome.observeValidated(postLedger, len(calls), rejected)
+				routerOutcome.observeValidated(postLedger, len(calls), len(rejected))
 				if parsed && len(calls) > 0 {
 					routerOutcome.record("intent_retry", "emitted_tool_calls")
 					scope := fmt.Sprintf("%d:%v:intent-retry", len(body.Messages), completedCallIDs(ledger))
@@ -2681,7 +2685,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 	invalidDetectedTool := false
 	if rawCalls := fencedToolCalls(res.Text, toolMaps, body.ToolChoice); len(rawCalls) > 0 {
 		calls, rejected := validateCalls("fenced", rawCalls)
-		invalidDetectedTool = rejected > 0
+		invalidDetectedTool = len(rejected) > 0
 		if len(calls) > 0 {
 			calls = limitToolCalls(calls, adaptiveToolCallLimit(calls, configuredToolCallLimit(s.settings)))
 			_ = writeToolResponse(w, id, model, body.Stream, calls, res)
@@ -2690,7 +2694,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 	}
 	if rawCalls := nativeToolCalls(res.Events, body.Tools); len(rawCalls) > 0 {
 		calls, rejected := validateCalls("native", rawCalls)
-		invalidDetectedTool = invalidDetectedTool || rejected > 0
+		invalidDetectedTool = invalidDetectedTool || len(rejected) > 0
 		if len(calls) > 0 {
 			calls = limitToolCalls(calls, adaptiveToolCallLimit(calls, configuredToolCallLimit(s.settings)))
 			_ = writeToolResponse(w, id, model, body.Stream, calls, res)

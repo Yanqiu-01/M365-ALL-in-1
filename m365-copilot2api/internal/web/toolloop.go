@@ -471,3 +471,61 @@ func isSandboxHallucination(text string) bool {
 	}
 	return false
 }
+
+// toolRejectionRepairInstruction 把真实的拒收原因写成修复指令。
+//
+// 原来这条指令是写死的一句「上游选了一个未声明的工具，请改选一个已声明的」。
+// 而实测最常见的拒收根本不是选错工具：omp 的 bash schema 把 "i"（concise
+// intent）列进 required，模型少写这个字段 → schemaValid 报
+// 「missing required argument i」→ 网关却告诉模型「你选错工具了」。模型于是
+// 换一个工具重试，i 照样不写，再拒。修复轮永远修不好它，因为反馈没说真正的
+// 问题（2026-09-08 实测同一原因当天被拒 24 次，跨两个构建）。
+//
+// 通用修法：如实回传每条拒收的工具名与原因，并附上该工具声明的 schema，
+// 让模型看得见到底缺哪个字段。这样不论缺哪个必填参数、拒收原因是哪一种，
+// 修复轮都能自愈，不用为每种形态各写一条规则。
+func toolRejectionRepairInstruction(rejected []rejectedToolCall, tools []map[string]any) string {
+	if len(rejected) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("\nREPAIR RULE: your previous tool call was rejected by the gateway's schema validation. Fix exactly what is reported below and re-emit the call. Do not switch to a different tool unless the reason says the tool was not declared.\n")
+	seen := map[string]bool{}
+	for _, r := range rejected {
+		b.WriteString(fmt.Sprintf("- tool %q rejected: %s\n", r.Name, r.Reason))
+		if r.Name == "" || seen[r.Name] {
+			continue
+		}
+		seen[r.Name] = true
+		if fn := toolFunction(r.Name, tools); fn != nil {
+			if params, ok := fn["parameters"]; ok {
+				if encoded, err := json.Marshal(params); err == nil {
+					b.WriteString(fmt.Sprintf("  declared schema for %s: %s\n", r.Name, string(encoded)))
+				}
+			}
+		}
+	}
+	b.WriteString("Every property listed in that schema's \"required\" array must be present in arguments.\n")
+	return b.String()
+}
+
+// requiredToolArguments 返回工具 schema 里 required 列出的字段名。
+// 网关自己合成参数时用它按声明补齐，而不是硬编码键名。
+func requiredToolArguments(name string, tools []map[string]any) []string {
+	fn := toolFunction(name, tools)
+	if fn == nil {
+		return nil
+	}
+	params, _ := fn["parameters"].(map[string]any)
+	if params == nil {
+		return nil
+	}
+	raw, _ := params["required"].([]any)
+	out := make([]string, 0, len(raw))
+	for _, entry := range raw {
+		if field, ok := entry.(string); ok && strings.TrimSpace(field) != "" {
+			out = append(out, field)
+		}
+	}
+	return out
+}
