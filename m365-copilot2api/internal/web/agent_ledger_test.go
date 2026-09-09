@@ -8,9 +8,15 @@ import (
 
 func TestCompactToolResultKeepsHeadTailAndError(t *testing.T) {
 	s := "start\n" + strings.Repeat("progress line\n", 1000) + "ERROR: build failed\nexit code 1"
-	got := compactToolResult(s, 800)
-	if len(got) > 900 || !strings.Contains(got, "start") || !strings.Contains(got, "ERROR: build failed") || !strings.Contains(got, "exit code 1") || !strings.Contains(got, "truncated") {
+	// 完整版省略标记（行号锚定 + 补读指引）只在预算充裕（limit≥1200）时出现。
+	got := compactToolResult(s, 4000)
+	if len(got) > 4400 || !strings.Contains(got, "start") || !strings.Contains(got, "ERROR: build failed") || !strings.Contains(got, "exit code 1") || !strings.Contains(got, "gateway truncation") || !strings.Contains(got, "NOT the upstream") {
 		t.Fatalf("bad compact result: %d %q", len(got), got)
+	}
+	// 小预算退化为短版标记，标记本身不吃掉预算。
+	short := compactToolResult(s, 300)
+	if len(short) > 320 || !strings.Contains(short, "[truncated ") {
+		t.Fatalf("small-budget compact: %d %q", len(short), short)
 	}
 }
 
@@ -182,7 +188,7 @@ func TestCompactRouterEvidenceBoundsSingleHugeArguments(t *testing.T) {
 	if len(mustJSON(got)) > routerEvidenceMaxBytes {
 		t.Fatalf("single retained entry escaped router evidence budget: %d bytes", len(mustJSON(got)))
 	}
-	if !strings.Contains(got[0].Arguments, "[truncated ") {
+	if !strings.Contains(got[0].Arguments, "gateway truncation for prompt budget") {
 		t.Fatalf("huge arguments were not compacted: %d bytes", len(got[0].Arguments))
 	}
 }

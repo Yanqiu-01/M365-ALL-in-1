@@ -45,6 +45,11 @@ var failureSignal = regexp.MustCompile(`(?i)(exit\s*(code|status)?\s*[:=]?\s*[1-
 // 路由 prompt 的总量由 routerEvidenceMaxBytes 与 routerMaxGroups 各自兜底。
 const ledgerResultLimit = 64 << 10
 
+// compactToolResult 超限时保留头尾、省略中段。省略标记要说清三件事：
+// 省了多少、中间大概是什么位置、以及「读全文请重新带范围调用」——否则模型把
+// 这行当成「平台把全文截断了」（2026-09-09 用户实测），以为自己看到的就是
+// 上游的全部输出，转而向用户报告内容缺失。头尾窗口让模型既能识别内容又能
+// 锚定行号；真正要中段时它需要知道「用带 offset/limit 的读法去取」。
 func compactToolResult(s string, limit int) string {
 	s = strings.TrimSpace(s)
 	if limit < 200 {
@@ -58,7 +63,19 @@ func compactToolResult(s string, limit int) string {
 	if tail < 80 {
 		tail = 80
 	}
-	return s[:head] + fmt.Sprintf("\n... [truncated %d bytes] ...\n", len(s)-head-tail) + s[len(s)-tail:]
+	// 行号锚定：头部结尾与尾部开头所在行，模型可据此发起点读取。
+	headLine := 1 + strings.Count(s[:head], "\n")
+	tailLine := 1 + strings.Count(s[:len(s)-tail], "\n")
+	omitted := len(s) - head - tail
+	// 完整版标记（~190 字节）只在预算充裕时使用；benchmark 一类 300-600 字节
+	// 的小预算用短版，避免标记本身吃掉预算。
+	if limit >= 1200 {
+		return s[:head] +
+			fmt.Sprintf("\n... [gateway truncation for prompt budget: %d bytes omitted here (lines ~%d-%d); this is NOT the upstream's full output — to read the middle, re-read the source with an offset/range instead of citing it] ...\n",
+				omitted, headLine, tailLine) +
+			s[len(s)-tail:]
+	}
+	return s[:head] + fmt.Sprintf("\n... [truncated %d bytes] ...\n", omitted) + s[len(s)-tail:]
 }
 
 // toolResultLooksFailed 判断一次工具结果是否表示失败。
