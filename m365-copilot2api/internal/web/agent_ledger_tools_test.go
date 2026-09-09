@@ -58,16 +58,18 @@ func TestToolLooksObservational(t *testing.T) {
 	}
 }
 
-// 只读类压制重放；写入类不压制，避免丢失副作用。
-func TestShouldSuppressCompletedCall(t *testing.T) {
+// toolCanRepeatSameArguments 的极性契约（2026-09-09 起替代已删除的
+// shouldSuppressCompletedCall 测试：那个名字按相反极性解释同一判据，
+// 属死代码已删）。
+func TestToolCanRepeatSameArgumentsPolarity(t *testing.T) {
 	for _, name := range []string{"read_file", "list_files", "grep_repo"} {
-		if !shouldSuppressCompletedCall(name) {
-			t.Errorf("%q should be suppressed", name)
+		if !toolCanRepeatSameArguments(name) {
+			t.Errorf("%q should be repeatable", name)
 		}
 	}
-	for _, name := range []string{"write_file", "shell", "apply_patch", "delete_path"} {
-		if shouldSuppressCompletedCall(name) {
-			t.Errorf("%q must not be suppressed", name)
+	for _, name := range []string{"write_file", "apply_patch", "delete_path"} {
+		if toolCanRepeatSameArguments(name) {
+			t.Errorf("%q must not be repeatable", name)
 		}
 	}
 }

@@ -35,6 +35,16 @@ type agentLedger struct {
 
 var failureSignal = regexp.MustCompile(`(?i)(exit\s*(code|status)?\s*[:=]?\s*[1-9]\d*|\berror\b|\bfailed\b|\bfailure\b|exception|traceback|timed?\s*out|permission denied|not found|refused)`)
 
+// ledgerResultLimit 是单条工具结果在 ledger 存储、prompt 渲染、失败判定三处
+// 共用的截断上限（2026-09-09 从 4000 放大）。
+//
+// 4000 的年代背景是「每条结果都是一小段确认或短输出」；实际工作负载里模型
+// 经常一轮读进几千行的源码/配置，头部 1/3 + 尾部的窗口让中间内容全部消失，
+// 模型引用不到自己刚读过的段落，只能重读（浪费一轮）或者编造中间内容。
+// 上限的存在意义只剩「防单条结果吃满整个请求预算」，不再承担「省 token」：
+// 路由 prompt 的总量由 routerEvidenceMaxBytes 与 routerMaxGroups 各自兜底。
+const ledgerResultLimit = 64 << 10
+
 func compactToolResult(s string, limit int) string {
 	s = strings.TrimSpace(s)
 	if limit < 200 {
@@ -98,9 +108,9 @@ func toolResultLooksFailed(name, result string) bool {
 	// 这类工具改按「壳层怎么报失败」判定：显式非零退出码，或开头就是错误
 	// 说明。正文中间出现 error 一词不再算失败 —— 那正是它成功读到的内容。
 	if toolShellLike(name) {
-		return shellResultLooksFailed(compactToolResult(result, 4000))
+		return shellResultLooksFailed(compactToolResult(result, ledgerResultLimit))
 	}
-	return failureSignal.MatchString(compactToolResult(result, 4000))
+	return failureSignal.MatchString(compactToolResult(result, ledgerResultLimit))
 }
 
 // toolShellLike 判断工具是否属于「输出里会引用错误文本」的命令/委派类。
@@ -222,7 +232,7 @@ func buildAgentLedger(messages []oaiMsg) agentLedger {
 		if m.Role == "tool" {
 			if e, ok := calls[m.ToolCallID]; ok {
 				raw := toolResultEvidenceText(m.Content)
-				e.Result = compactToolResult(raw, 4000)
+				e.Result = compactToolResult(raw, ledgerResultLimit)
 				// 收到 tool 消息这件事本身就是「已应答」，与内容是否为空无关。
 				//
 				// 空结果在协议上完全合法：一条没有输出的命令、一次只做写入的调用、
@@ -286,11 +296,14 @@ func normalizeFailure(s string) string {
 const routerEvidenceFullResults = 8
 
 // routerEvidenceMaxBytes caps the serialised ledger. Identity-only entries run
-// ~120 bytes, so 32KB holds roughly 260 calls' identities plus the newest
-// results -- past that, the OLDEST identities are dropped and counted, never
-// the newest. It sits in the same spirit as routerMaxGroups' 40-group cap on
+// ~120 bytes. It sits in the same spirit as routerMaxGroups' 40-group cap on
 // the other half of this prompt (router_history_trim.go:12).
-const routerEvidenceMaxBytes = 32 << 10
+//
+// 结果保真优先于总量预算（2026-09-09）：单条结果本身的截断由 ledgerResultLimit
+// 在入口处统一控制，这里只兜「条目数 × 单条」的乘积上限。之前 32KB 会在多轮
+// 工作负载里把中段结果整个 elide 掉，模型引用不到自己刚读过的内容；放大后
+// 配合 routerMaxGroups 的历史条数上限，实际 prompt 仍受 trim 层约束。
+const routerEvidenceMaxBytes = 256 << 10
 
 // elidedResultMarker replaces an older result body. It says the call completed
 // so the model does not treat the entry as an untried action.
@@ -305,7 +318,7 @@ func compactRouterEvidence(completed []toolEvidence) ([]toolEvidence, int) {
 	// list-level loop: a single newest entry cannot be dropped, so an unbounded
 	// Arguments value would otherwise still dominate the router prompt.
 	for i := range out {
-		out[i].Arguments = compactToolResult(out[i].Arguments, 4000)
+		out[i].Arguments = compactToolResult(out[i].Arguments, ledgerResultLimit)
 	}
 	// Strip result bodies from all but the newest routerEvidenceFullResults.
 	for i := 0; i < len(out)-routerEvidenceFullResults; i++ {
@@ -411,18 +424,6 @@ func toolLooksObservational(name string) bool {
 		}
 	}
 	return false
-}
-
-// shouldSuppressCompletedCall 判定一个已完成过的调用是否应被压制重放：
-// 只读类可以安全跳过，写入类不压制以免丢失副作用。
-//
-// APK 证据（agent_ledger.go:247-251，128 字节）：
-// 依次调用 toolLooksObservational 与 toolLooksMutating。
-func shouldSuppressCompletedCall(name string) bool {
-	if toolLooksObservational(name) {
-		return true
-	}
-	return !toolLooksMutating(strings.ToLower(strings.TrimSpace(name)))
 }
 
 // toolCanRepeatSameArguments 判断「同名同参的重复调用」有可能是必要动作，

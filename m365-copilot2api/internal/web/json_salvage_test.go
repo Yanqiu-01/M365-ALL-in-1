@@ -98,6 +98,107 @@ func TestSalvageKeepsRealEscapedQuotes(t *testing.T) {
 	}
 }
 
+func TestSalvageTabPathLiteralReread(t *testing.T) {
+	// P1 实锤回归：C:\temp\x.md 的 \t 是合法 JSON 转义，严格解析"成功"但结果
+	// 是损坏的 C:<TAB>emp/x.md。字面读法必须胜出。
+	cases := []struct{ body, want string }{
+		{`{"file_path":"C:` + bs + `temp` + bs + `x.md"}`, `C:\temp\x.md`},
+		{`{"file_path":"C:` + bs + `new` + bs + `x.md"}`, `C:\new\x.md`},
+		{`{"file_path":"E:` + bs + `repo` + bs + `x.go"}`, `E:\repo\x.go`},
+		{`{"file_path":"C:` + bs + `bin` + bs + `x.exe"}`, `C:\bin\x.exe`},
+	}
+	for _, c := range cases {
+		var args map[string]any
+		if !unmarshalJSONTolerant(c.body, &args) {
+			t.Fatalf("解析失败: %s", c.body)
+		}
+		got, _ := args["file_path"].(string)
+		// 逐字符比对并显示不可见字符，方便下次排查
+		if got != c.want {
+			show := func(v string) string {
+				r := ""
+				for i := 0; i < len(v); i++ {
+					switch {
+					case v[i] == 0x5c:
+						r += "<BS>"
+					case v[i] == 0x09:
+						r += "<TAB>"
+					default:
+						r += string(v[i])
+					}
+				}
+				return r
+			}
+			t.Fatalf("file_path=%s want %s (输入 %s)", show(got), show(c.want), c.body)
+		}
+	}
+}
+
+func TestSalvageRealTabIntentNotCorrupted(t *testing.T) {
+	// 对照组：真想表达制表符的合法 JSON 不得被改写。普通字符串没有盘符前缀，
+	// 字面重读的判据不命中，原始解析结果保持不变。
+	cases := []string{
+		`{"text":"a` + bs + `tb"}`,                 // 非盘符
+		`{"text":"value` + bs + `temp"}`,           // \t 在词中，但无盘符前缀
+		`{"text":"C:` + bs + bs + `temp` + bs + bs + `x"}`, // 双反斜杠=真反斜杠，不损坏
+	}
+	for _, body := range cases {
+		var strict map[string]any
+		if json.Unmarshal([]byte(body), &strict) != nil {
+			t.Fatalf("测试前提失效，应为合法 JSON: %s", body)
+		}
+		var tolerant map[string]any
+		if !unmarshalJSONTolerant(body, &tolerant) {
+			t.Fatalf("解析失败: %s", body)
+		}
+		if strict["text"] != tolerant["text"] {
+			t.Fatalf("合法转义被改写: strict=%v tolerant=%v (%s)", strict["text"], tolerant["text"], body)
+		}
+	}
+}
+
+// P2 回归：同一逻辑调用以 canonical 与 inline 两种形态出现时，必须去重成一条。
+// 修复前 inline 路径不走参数补齐，字节与 canonical 不同，dedup 未命中 —— 命令
+// 被执行两次（2026-09-09 审计实锤）。
+func TestDoubleShapeDeduplicates(t *testing.T) {
+	tools := ompShellTools()
+	bt := "```"
+	text := bt + "bash\n{\"command\":\"ls\"}\n" + bt + "\n中间话\n" + bt + "bash({\"command\":\"ls\"})\n" + bt
+	calls := fencedToolCalls(text, tools, "auto")
+	if len(calls) != 1 {
+		t.Fatalf("双形态产生 %d 个调用（应为 1）: %+v", len(calls), calls)
+	}
+	if string(calls[0].Arguments) != `{"command":"ls","i":"run: ls"}` {
+		t.Fatalf("参数补齐丢失: %s", calls[0].Arguments)
+	}
+}
+
+// P3 回归：答案轮不再静默吞调用。
+func TestWrongKeyShellFenceStillDispatched(t *testing.T) {
+	// shell 围栏的 body 是 JSON 但没有 command 键（键名漂移）——修复前静默
+	// continue，客户端只看到空回合；现在把 body 原文当命令派发，错误由调用方
+	// 回传给模型。
+	tools := ompShellTools()
+	calls := fencedToolCalls("```bash\n{\"i\":\"list files\"}\n```", tools, "auto")
+	if len(calls) != 1 {
+		t.Fatalf("wrong-key shell 围栏被吞: %d", len(calls))
+	}
+}
+
+func TestTruncatedNonShellFenceFailClosed(t *testing.T) {
+	// 与路由轮 fail-closed 对齐：body 解析不出的非 shell 围栏照样派发原文，
+	// 让 schema 校验拒收并触发修复轮，而不是凭空消失。
+	tools := editTools()
+	text := "```edit\n{\"file_path\":\"broken\n```"
+	calls := fencedToolCalls(text, tools, "auto")
+	if len(calls) != 1 {
+		t.Fatalf("截断围栏被吞: %d", len(calls))
+	}
+	if calls[0].Name != "Edit" || calls[0].Arguments == nil {
+		t.Fatalf("fail-closed 派发形状错误: %+v", calls[0])
+	}
+}
+
 func TestSalvageDoesNotInventValidJSON(t *testing.T) {
 	// 转义之外的语法错误不在抢救范围内，必须照旧算失败，不能骗过调用方。
 	for _, body := range []string{`{"a":}`, `{"a" "b"}`, `{`, `not json at all`} {

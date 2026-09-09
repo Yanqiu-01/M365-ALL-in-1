@@ -73,6 +73,11 @@ func synthesizeShellArguments(name, command string, tools []map[string]any) map[
 //
 // 三条 shell 参数出口（纯命令围栏、带 JSON 的围栏、裸 JSON 兜底）共用它：
 // 模型给了什么就照原样透传，只把它漏掉的必填字段按声明补上。
+//
+// 只有「意图描述类」字段才由网关代填（omp 的 i）；路径、URL 等语义无法从
+// 命令诚实推出的字段不填——硬塞一句 "run: ls" 进 cwd 这类字段是伪造参数，
+// 2026-09-09 审计实锤（required 含 cwd 的 schema 会收到 cwd="run: ls -la"
+// 并把它当工作目录）。填不了的留给 schema 校验拒收，修复轮如实告知模型。
 func fillRequiredShellArguments(name string, args map[string]any, tools []map[string]any) map[string]any {
 	fn := toolFunction(name, tools)
 	if fn == nil {
@@ -93,9 +98,28 @@ func fillRequiredShellArguments(name string, args map[string]any, tools []map[st
 		if typ, _ := spec["type"].(string); typ != "" && typ != "string" {
 			continue
 		}
+		if !intentLikeFieldName(field) {
+			continue
+		}
 		args[field] = summarizeShellCommand(command)
 	}
 	return args
+}
+
+// intentLikeFieldName 判断一个必填字段名是否属于「意图/说明」类——即那句由
+// 命令派生的摘要可以诚实填充的字段。路径类、输出类字段一律不算。
+func intentLikeFieldName(field string) bool {
+	f := strings.ToLower(field)
+	if f == "i" {
+		// omp 的单字母 intent 字段。
+		return true
+	}
+	for _, word := range []string{"intent", "description", "purpose", "reason", "why", "summary", "note", "comment", "explanation"} {
+		if strings.Contains(f, word) {
+			return true
+		}
+	}
+	return false
 }
 
 // summarizeShellCommand 给出一句关于命令的简短说明，供 intent 类必填字段使用。
@@ -152,6 +176,13 @@ func fencedToolCalls(text string, tools []map[string]any, choice any) []detected
 					out = append(out, detectedToolCall{ID: callID(converted, string(cmdBytes), len(out)), Type: "function", Name: converted, Arguments: cmdBytes})
 					continue
 				}
+				// JSON 形状但 command 键缺失/为空（{"i":"..."}、{"cmd":"ls"} 这类
+				// 键名漂移）：此前静默 continue，客户端只看到空回合。把 body 原文
+				// 当作命令本身派发——意图（跑一条命令）是清楚的，只是键名写错；
+				// 真正的修复由调用方把错误输出回给模型，跟命令执行失败同等对待。
+				cmdBytes, _ := marshalToolArguments(converted, synthesizeShellArguments(converted, args, tools))
+				out = append(out, detectedToolCall{ID: callID(converted, string(cmdBytes), len(out)), Type: "function", Name: converted, Arguments: cmdBytes})
+				continue
 			}
 			if v == nil {
 				// 纯命令围栏（```bash\nls -la\n```）没有 JSON 参数，参数由网关合成。
@@ -171,6 +202,13 @@ func fencedToolCalls(text string, tools []map[string]any, choice any) []detected
 			continue
 		}
 		if v == nil {
+			// 与路由轮的 fail-closed 策略对齐（tool_decision_extract.go 把解析
+			// 不出的 JSON 体记为 Malformed 进修复轮）：非 shell 围栏的 body 解析
+			// 失败也照样派发——参数原文进 arguments 字符串，schema 校验来拒收，
+			// 修复轮来教模型。静默 continue 曾让截断的调用凭空消失（客户端只
+			// 看到模型说要做什么，然后什么都没发生）。
+			b := []byte(args)
+			out = append(out, detectedToolCall{ID: callID(declared, string(b), len(out)), Type: toolType(declared, tools), Name: declared, Arguments: b})
 			continue
 		}
 		b, _ := json.Marshal(v)
@@ -192,10 +230,19 @@ func fencedToolCalls(text string, tools []map[string]any, choice any) []detected
 		if !unmarshalJSONTolerant(c.Body, &v) {
 			continue
 		}
-		if _, isMap := v.(map[string]any); !isMap {
+		m, isMap := v.(map[string]any)
+		if !isMap {
 			continue
 		}
-		b, _ := json.Marshal(v)
+		// 与 canonical 围栏同一条补齐路径：shell 工具缺的必填字段照声明补上，
+		// 两路的参数字节才能归一，下面的去重才会命中（否则同一逻辑调用会以
+		// 不同的参数各派发一次，命令被执行两遍 —— 2026-09-09 审计实锤）。
+		// 判据用小写名进 toolShellNames：这个表覆盖 bash/sh/powershell 等
+		// 各种壳层拼写，也与并行限制的口径一致。
+		if toolShellNames[strings.ToLower(declared)] {
+			m = fillRequiredShellArguments(declared, m, tools)
+		}
+		b, _ := marshalToolArguments(declared, m)
 		// 与上面同一个调用可能两种形态都被抓到：按名字+参数去重。
 		dup := false
 		for _, existing := range out {

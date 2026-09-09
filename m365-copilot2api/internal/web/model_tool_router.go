@@ -134,18 +134,6 @@ func lastToolDirectiveIndex(text string) int {
 	}
 }
 
-// hasTrailingNoToolMarker 判断 NO_TOOL_NEEDED 是否作为收尾指令出现。
-// 取末尾若干字符做窗口：指令按规则独占最后一行，而思考正文里的提及
-// 通常位于更靠前的位置。
-func hasTrailingNoToolMarker(text string) bool {
-	trimmed := strings.TrimRight(strings.TrimSpace(text), "。.!！`\"'\u201d\u3002")
-	const window = 64
-	tail := trimmed
-	if len(tail) > window {
-		tail = tail[len(tail)-window:]
-	}
-	return strings.Contains(strings.ToUpper(tail), "NO_TOOL_NEEDED")
-}
 
 // parseModelToolDecision 抽取模型的路由决策。
 //

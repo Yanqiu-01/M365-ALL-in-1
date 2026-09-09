@@ -569,15 +569,6 @@ func schemaShaped(obj map[string]any) bool {
 
 // extractEnvelopeCandidates is retained for callers that only need the legacy
 // flattened view. New decision routing must use extractEnvelopeDecisions so a
-// malformed final envelope cannot be mistaken for an empty decision.
-func extractEnvelopeCandidates(text string) ([]toolCandidate, bool) {
-	decisions := extractEnvelopeDecisions(text)
-	out := make([]toolCandidate, 0)
-	for _, decision := range decisions {
-		out = append(out, decision.Calls...)
-	}
-	return out, len(decisions) > 0
-}
 
 // decodeArguments 解析参数体。允许空参数、允许被空白或围栏包裹。
 func decodeArguments(body string) (map[string]any, bool) {
@@ -642,11 +633,6 @@ func trailingNoToolDecision(text string) (int, bool) {
 		return offsets[i], line == noToolMarker
 	}
 	return -1, false
-}
-
-func hasTrailingNoTool(text string) bool {
-	_, ok := trailingNoToolDecision(text)
-	return ok
 }
 
 // selectDecision 对候选做统一校验，返回最后一个通过的调用。

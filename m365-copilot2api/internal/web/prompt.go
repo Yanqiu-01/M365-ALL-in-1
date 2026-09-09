@@ -34,7 +34,7 @@ func flattenPromptMessages(messages []oaiMsg, attachments []chathub.Attachment) 
 					txt = note
 				}
 			}
-			txt = compactToolResult(txt, 4000)
+			txt = compactToolResult(txt, ledgerResultLimit)
 			// 空结果要说出来，不能渲染成一个空的标题行。
 			//
 			// 早先内容为空时这里写出的是 "[tool result id=x]" 后面跟一个空行，模型

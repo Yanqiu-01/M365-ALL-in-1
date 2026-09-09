@@ -200,6 +200,32 @@ func TestRepairInstructionKeepsUndeclaredToolReason(t *testing.T) {
 	}
 }
 
+// P4 回归：路径类必填字段不得被塞命令摘要。cwd 的诚实值只能来自模型或
+// default；网关代填 "run: ls" 会被当工作目录使用（2026-09-09 审计实锤）。
+func TestPathLikeRequiredFieldNotPolluted(t *testing.T) {
+	tools := []map[string]any{{
+		"type": "function",
+		"function": map[string]any{
+			"name": "bash",
+			"parameters": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"command": map[string]any{"type": "string"},
+					"cwd":     map[string]any{"type": "string"},
+				},
+				"required": []any{"command", "cwd"},
+			},
+		},
+	}}
+	calls := fencedToolCalls("```bash\nls -la\n```", tools, "auto")
+	if len(calls) != 1 {
+		t.Fatalf("calls=%d", len(calls))
+	}
+	if _, present := decodeArgs(t, calls[0])["cwd"]; present {
+		t.Fatal("cwd was fabricated by the gateway")
+	}
+}
+
 func TestRepairInstructionEmptyWithoutRejections(t *testing.T) {
 	if got := toolRejectionRepairInstruction(nil, ompShellTools()); got != "" {
 		t.Fatalf("expected empty instruction, got %q", got)

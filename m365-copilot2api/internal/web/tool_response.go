@@ -6,6 +6,19 @@ import (
 	"time"
 )
 
+// toolCallMaps 把抽取结果转成 OpenAI tool_calls 数组形状。
+func toolCallMaps(calls []detectedToolCall) []any {
+	out := make([]any, 0, len(calls))
+	for _, c := range calls {
+		typ := c.Type
+		if typ == "" {
+			typ = "function"
+		}
+		out = append(out, map[string]any{"id": c.ID, "type": typ, "function": map[string]any{"name": c.Name, "arguments": string(c.Arguments)}})
+	}
+	return out
+}
+
 func writeToolResponse(w http.ResponseWriter, id, model string, stream bool, calls []detectedToolCall, res chathub.Result) error {
 	toolCalls := toolCallMaps(calls)
 	msg := map[string]any{"role": "assistant", "content": nil, "tool_calls": toolCalls}

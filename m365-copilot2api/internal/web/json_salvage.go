@@ -23,9 +23,9 @@ import (
 // JSON 就照旧算失败。这条路径不放松任何 schema 校验，只是把「网关自己看不懂
 // 的转义」从静默丢弃改成尽力还原。
 //
-// 已知无法修复的歧义：C:\temp 里的 \t 恰好是合法 JSON 转义，会被解析成制表符。
-// 那种输入是合法 JSON，严格解析就成功了，根本走不到这里；要正确表达只能靠
-// 模型写双反斜杠或正斜杠，网关无从分辨。
+// 已知无法修复的歧义：C:\temp 里的 \t 恰好是合法 JSON 转义。那种输入是合法
+// JSON，严格解析就成功，走不到这里——它由 unmarshalJSONTolerant 的第三条路径
+// （reinterpretWindowsPathStrings）处理，不在这条函数的职责内。
 func salvageInvalidJSONEscapes(body string) (string, bool) {
 	return salvageJSONEscapes(body, false)
 }
@@ -107,6 +107,103 @@ func salvageJSONEscapes(body string, literalBackslashBeforeQuote bool) (string, 
 	return b.String(), true
 }
 
+// windowsPathControlEscape 识别「合法转义吃掉 Windows 路径」这一类损坏。
+//
+// C:\temp 里的 \t 是合法 JSON 转义，严格解析会成功——但解析出的字符串里出现
+// 了制表符，路径已经损坏。实测（2026-09-09 审计）：C:\temp\x.md 被解析成
+// C:<TAB>emp\x.md 交付给工具，工具报 file not found，模型不知道为什么。同类：
+// \n → C:<LF>ew，\r → C:<CR>epo，\b → C:<BS>in，\f → C:<FF>ile。
+//
+// 判据（三条同时满足才算）：
+//  1. 字符串以盘符开头（X:\，大小写均可）；
+//  2. 字符串里含有由单反斜杠引入的 \t \n \r \b \f（真 Windows 路径的目录
+//     分隔符是字面反斜杠，合法 JSON 必须写成 \\）；
+//  3. 按字面读法重解析后，控制字符消失且反斜杠保留 —— 只有这样才证明「字面
+//     读法」是模型的意图，避免把真要表达制表符的正常 JSON 误改成路径。
+//
+// 这是启发式：C:\temp 作为"字面路径"的先验远高于"字符串字面量里恰好以
+// C: 开头且含真制表符"的先验，两遍解析给了我们验证的机会。
+func stringLooksLikeCorruptedWindowsPath(s string) bool {
+	if len(s) < 3 {
+		return false
+	}
+	c := s[0]
+	isLetter := (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+	if !isLetter || s[1] != ':' || s[2] != '\\' {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] != '\\' || i+1 >= len(s) {
+			continue
+		}
+		switch s[i+1] {
+		case 't', 'n', 'r', 'b', 'f':
+			return true
+		}
+	}
+	return false
+}
+
+// reinterpretWindowsPathStrings 把 body 里所有「以盘符开头且含单反斜杠合法
+// 转义」的 JSON 字符串按字面语义重写（\t → 字面反斜杠 + t，其余转义同样落回
+// 字面形式），返回重写结果与是否发生了改写。改写后的文本必须由调用方重新
+// 解析验证——写出来不是合法 JSON 就丢弃。
+func reinterpretWindowsPathStrings(body string) (string, bool) {
+	var b strings.Builder
+	b.Grow(len(body))
+	changed := false
+	inString := false
+	for i := 0; i < len(body); i++ {
+		ch := body[i]
+		if !inString {
+			if ch == '"' {
+				inString = true
+			}
+			b.WriteByte(ch)
+			continue
+		}
+		switch {
+		case ch == '"':
+			inString = false
+			b.WriteByte(ch)
+		case ch == '\\':
+			if i+1 >= len(body) {
+				b.WriteByte(ch)
+				continue
+			}
+			next := body[i+1]
+			switch next {
+			case '"', '\\', '/', 'u':
+				// 这些保持转义语义：\" 是真引号，\\ 是真反斜杠，
+				// \uXXXX 是真 Unicode。字面读法不碰它们。
+				b.WriteByte(ch)
+				b.WriteByte(next)
+				i++
+			case 't', 'n', 'r', 'b', 'f':
+				// 字面读法：这五个「半转义」在字面语义下是反斜杠+字母。
+				// 输出双反斜杠+字母（\\t 解析回反斜杠、t 两个字符）。
+				b.WriteString(`\\`)
+				b.WriteByte(next)
+				i++
+				changed = true
+			default:
+				// \x、\y 等其余一切反斜杠引入的字节：字面读法下它们同样是
+				// 反斜杠+字母，同样必须双写才能在重解析后还原成字面量。
+				b.WriteString(`\\`)
+				b.WriteByte(next)
+				i++
+				changed = true
+			}
+		default:
+			b.WriteByte(ch)
+		}
+	}
+	if !changed {
+		return body, false
+	}
+	return b.String(), true
+}
+
 // closesStringValue 判断紧跟引号之后的字节是否是 JSON 结构分隔符——是的话，
 // 那个引号更像字符串的收尾，而不是被转义的引号字面量。
 func closesStringValue(rest string) bool {
@@ -149,12 +246,29 @@ func hasFourHexDigits(rest string) bool {
 	return true
 }
 
-// unmarshalJSONTolerant 先按严格 JSON 解析；失败时用 salvageInvalidJSONEscapes
-// 修一次转义再解析。合法输入永远走第一条路径，字节不变。
+// unmarshalJSONTolerant 按三条路径解析，全失败才返回 false：
+//
+//  1. 严格 JSON —— 合法输入永远走这条，字节不变；
+//  2. 抢救非法转义后重解析（两遍歧义读法：保守优先，只有保守读法也失败才试
+//     「反斜杠在引号前算字面量」）；
+//  3. 「合法转义损坏了 Windows 路径」的启发式重读：字符串以盘符开头、含由单
+//     反斜杠引入的 \t\n\r\b\f、且按字面读法重解析后控制字符消失——此时严格
+//     解析虽然"成功"，但结果是损坏的路径，字面读法才是模型意图。实测
+//     C:\temp\x.md 会被严格解析成 C:<TAB>emp\x.md 交付给工具。
 //
 // 返回 true 只代表「解析出了合法 JSON」，与参数是否满足工具 schema 无关：
 // schema 校验仍由 validateDetectedToolCalls 负责。
 func unmarshalJSONTolerant(body string, out any) bool {
+	// 先试「盘符路径被合法转义损坏」的字面读法。这个判定只看输入字节形状，
+	// 与严格解析成败无关：C:\temp\x.md（\x 非法，严格失败）和 C:\temp（\t
+	// 合法，严格"成功"但损坏）是同一类输入，必须走同一条字面路径。
+	if stringLooksLikeCorruptedWindowsPath(windowsPathProbe(body)) {
+		if literal, changed := reinterpretWindowsPathStrings(body); changed {
+			if json.Unmarshal([]byte(literal), out) == nil {
+				return true
+			}
+		}
+	}
 	if json.Unmarshal([]byte(body), out) == nil {
 		return true
 	}
@@ -169,4 +283,27 @@ func unmarshalJSONTolerant(body string, out any) bool {
 		}
 	}
 	return false
+}
+
+// windowsPathProbe 判断 body 里的任意 JSON 字符串值是否形如「盘符开头 + 单
+// 反斜杠转义」。它扫的是原始字节（解码前），逐个检查引号包裹的片段：
+// 只要有一个值命中盘符+转义字母的形状，整个 body 就按字面读法重试。
+func windowsPathProbe(body string) string {
+	for i := 0; i+2 < len(body); i++ {
+		// 盘符形状：引号 + 字母 + 冒号 + 反斜杠，例如 "C:\t…
+		if body[i] != '"' {
+			continue
+		}
+		c := body[i+1]
+		isLetter := (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+		if isLetter && body[i+2] == ':' && i+3 < len(body) && body[i+3] == '\\' {
+			// 返回从引号后的内容开始、到下一个引号（或结尾）为止的片段。
+			rest := body[i+1:]
+			if end := strings.IndexByte(rest, '"'); end >= 0 {
+				return rest[:end]
+			}
+			return rest
+		}
+	}
+	return ""
 }

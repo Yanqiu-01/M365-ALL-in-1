@@ -165,23 +165,21 @@ func TestLedgerDropKeepsSurvivorsIntactInBatch(t *testing.T) {
 	}
 }
 
-// shouldSuppressCompletedCall 在当前代码里没有生产调用方（只有它自己的测试），
-// 是死代码。它的函数体与 toolCanRepeatSameArguments 逐字同形、取值处处相同，
-// 但命名与注释按相反极性解释同一判据（「应当压制」对「可以重复」）。所以不能
-// 按它的名字接到 filterCompletedCalls 上：那样读出来是「读取压制、写入放行」，
-// 正好把去重的本职反过来。这里把「取值相同、语义相反」这层关系钉住。
+// shouldSuppressCompletedCall（已随 2026-09-09 审计删除）曾与
+// toolCanRepeatSameArguments 逐字同形、取值处处相同，但命名与注释按相反极性
+// 解释同一判据（「应当压制」对「可以重复」）。所以不能按它的名字接到
+// filterCompletedCalls 上：那样读出来是「读取压制、写入放行」，正好把去重的
+// 本职反过来。删除前用本测试钉住 toolCanRepeatSameArguments 的取值契约，
+// 防止有人将来「顺手合并」回那个反向语义。
 func TestLedgerDropDeadSuppressHelperIsNotTheRepeatGate(t *testing.T) {
+	// 只读/表外名字：允许同名同参重复。
 	for _, name := range []string{"read_file", "Glob", "poll_job"} {
-		if shouldSuppressCompletedCall(name) != toolCanRepeatSameArguments(name) {
-			t.Errorf("%s: 两个判据在只读/表外名字上应同值", name)
+		if !toolCanRepeatSameArguments(name) {
+			t.Errorf("%s: 只读/表外名字应进入「可重复」分支", name)
 		}
 	}
-	// 写入类：shouldSuppressCompletedCall 说「不要压制」（即允许重放），而去重
-	// 要求的恰恰是压制。语义相反，这就是不能复用的原因。
+	// 写入类：变更类不得进入「可重复」分支 —— 这正是与旧函数语义相反的地方。
 	for _, name := range []string{"write_file", "apply_patch", "delete_path"} {
-		if shouldSuppressCompletedCall(name) {
-			t.Errorf("%s: 既有契约要求它返回 false", name)
-		}
 		if toolCanRepeatSameArguments(name) {
 			t.Errorf("%s: 变更类不得进入「可重复」分支", name)
 		}

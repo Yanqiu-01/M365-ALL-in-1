@@ -30,9 +30,9 @@ func configuredContextBudget() int {
 }
 
 // toolResultPromptLimit mirrors the truncation the send path applies to every
-// tool result (prompt.go:29). The budget has to charge the same number or it
+// tool result (prompt.go). The budget has to charge the same number or it
 // prices bytes that never leave the gateway.
-const toolResultPromptLimit = 4000
+const toolResultPromptLimit = ledgerResultLimit
 
 // attachmentTokenCost is a nominal charge for one attachment. parseContent
 // moves image/file/audio payloads out of the text (multimodal.go:41-88) and

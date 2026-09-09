@@ -250,52 +250,6 @@ func callID(name, args string, index int) string {
 	return "call_" + uuid.NewString()
 }
 
-func extractToolCalls(text string, tools []map[string]any, choice any) ([]detectedToolCall, bool) {
-	start := strings.Index(text, "<m365-tool-call>")
-	end := strings.Index(text, "</m365-tool-call>")
-	if start < 0 || end <= start {
-		return nil, false
-	}
-	var raw any
-	if json.Unmarshal([]byte(text[start+len("<m365-tool-call>"):end]), &raw) != nil {
-		return nil, false
-	}
-	items := []any{raw}
-	if arr, ok := raw.([]any); ok {
-		items = arr
-	}
-	out := make([]detectedToolCall, 0, len(items))
-	for i, item := range items {
-		m, ok := item.(map[string]any)
-		if !ok {
-			continue
-		}
-		n, _ := m["name"].(string)
-		name, fn := declaredTool(n, tools)
-		if fn == nil || !toolChoiceAllows(choice, name) {
-			continue
-		}
-		a, _ := json.Marshal(m["arguments"])
-		out = append(out, detectedToolCall{ID: callID(name, string(a), i), Type: toolType(name, tools), Name: name, Arguments: a})
-	}
-	valid, _ := validateDetectedToolCalls(out, tools, choice)
-	return valid, len(valid) > 0
-}
-
-func validateToolResult(messages []oaiMsg, known map[string]bool) error {
-	for _, m := range messages {
-		if m.Role == "tool" {
-			if m.ToolCallID == "" {
-				return fmt.Errorf("tool_call_id required")
-			}
-			if len(known) > 0 && !known[m.ToolCallID] {
-				return fmt.Errorf("unknown tool_call_id: %s", m.ToolCallID)
-			}
-		}
-	}
-	return nil
-}
-
 var toolRefusalPatterns = []string{
 	"tools are not available",
 	"tool is not available",

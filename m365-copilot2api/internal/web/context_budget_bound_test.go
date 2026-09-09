@@ -246,12 +246,16 @@ func TestRouterLedgerStopsGrowingWithConversationLength(t *testing.T) {
 
 	// The property that matters is that the ledger half stops growing with
 	// conversation length, so the capped history half actually caps the prompt.
+	// 2026-09-09 结果保真改造后，增长上限由 routerEvidenceMaxBytes（256KB）
+	// 承担：超过它，最老的身份条目被整条丢弃并计数；256KB 恰好比 2000 条
+	// 身份行的自然体量大一点点，所以这里的断言是「不超过字节帽 + 一条身份行」。
 	at200 := len(buildAgentLedger(separateTurnsMessages(200, 2000)).RouterContext())
 	at2000 := len(buildAgentLedger(separateTurnsMessages(2000, 2000)).RouterContext())
-	t.Logf("RouterContext at 200 turns = %d bytes | at 2000 turns = %d bytes", at200, at2000)
-	if at2000 > at200*2 {
-		t.Fatalf("RouterContext still tracks conversation length: %d bytes at 200 calls vs %d bytes at 2000; the 40-group history cap therefore bounds nothing",
-			at200, at2000)
+	t.Logf("RouterContext at 200 turns = %d bytes | at 2000 turns = %d bytes | byte cap = %d",
+		at200, at2000, routerEvidenceMaxBytes)
+	if at2000 > routerEvidenceMaxBytes+400 {
+		t.Fatalf("RouterContext exceeds its byte cap: %d bytes at 2000 calls (cap %d + one identity row)",
+			at2000, routerEvidenceMaxBytes)
 	}
 
 	// And the newest evidence must always survive the bound.
@@ -261,9 +265,11 @@ func TestRouterLedgerStopsGrowingWithConversationLength(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// 账本本身无界：agent_ledger.go 把每一条 completed toolEvidence 都序列化进去，
-// 每条带一个压到 4000 字节的 Result 和一个完全没有上界的 Arguments。而这串东西
-// 会被重新拼进每一个 router / retry / repair / answer 提示。
+// 账本有界性：agent_ledger.go 把每一条 completed toolEvidence 都序列化进
+// RouterContext，而 RouterContext 会被重新拼进每一个 router / retry / repair /
+// answer 提示。2026-09-09 起单条结果的入口截断放大到 ledgerResultLimit（64KB，
+// 保真优先），总量约束改由 routerEvidenceMaxBytes（256KB）承担：超限时仍然
+// 从最老开始整条丢弃并计数，最新证据永不牺牲。
 // ---------------------------------------------------------------------------
 
 func TestRouterContextStaysBoundedAtManyCompletedCalls(t *testing.T) {
@@ -279,7 +285,7 @@ func TestRouterContextStaysBoundedAtManyCompletedCalls(t *testing.T) {
 	}
 
 	ctx := buildAgentLedger(agentLoopMessages(500, 4000)).RouterContext()
-	const cap = 64 << 10
+	const cap = routerEvidenceMaxBytes
 	if len(ctx) > cap {
 		t.Fatalf("RouterContext is %d bytes at 500 completed calls (cap would be %d): every router, retry, repair and answer prompt carries all of it",
 			len(ctx), cap)
