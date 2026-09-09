@@ -165,6 +165,27 @@ func normalizeReasoningEffort(e string) (string, error) {
 	return "", fmt.Errorf("unsupported reasoning effort %q; use none, minimal, low, medium, high, xhigh, or max", e)
 }
 
+func routeConfiguredTone(tone, effort string) string {
+	if effort == "none" || effort == "minimal" || effort == "low" {
+		if strings.HasSuffix(tone, "_Reasoning") {
+			candidate := strings.TrimSuffix(tone, "_Reasoning") + "_Chat"
+			if validUpstreamTone(candidate) {
+				return candidate
+			}
+		}
+		return tone
+	}
+	if effort == "medium" || effort == "high" || effort == "xhigh" || effort == "max" {
+		if strings.HasSuffix(tone, "_Chat") {
+			candidate := strings.TrimSuffix(tone, "_Chat") + "_Reasoning"
+			if validUpstreamTone(candidate) {
+				return candidate
+			}
+		}
+	}
+	return tone
+}
+
 // reasoningToneForMappings resolves a public model ID to an internal ChatHub
 // tone. Values such as Gpt_5_2_Chat are upstream-only identifiers: they are
 // never public model IDs and are not emitted by the model catalog.
@@ -174,7 +195,10 @@ func reasoningToneForMappings(model, effort string, mappings []modelMapping) (st
 		return "", err
 	}
 	if tone, ok := configuredModelTone(model, mappings); ok {
-		return tone, nil
+		if strings.Contains(strings.ToLower(model), "reasoning") {
+			return tone, nil
+		}
+		return routeConfiguredTone(tone, e), nil
 	}
 	base := modelTone(model)
 	// Explicit reasoning aliases are never silently downgraded by a generic client default.

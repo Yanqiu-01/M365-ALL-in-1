@@ -1722,8 +1722,8 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	body.SessionID = firstNonEmpty(body.SessionID, body.SessionIDC)
 	// stream 报在这里而不是 http_start：这是它第一次真正可知的位置。哪条路由分支
 	// 会跑（stream-router 还是 router）完全由它决定，看日志排查时缺了它就只能靠猜。
-	log.Printf("[req-trace] id=%s stage=body_parsed messages=%d tools=%d choice=%s stream=%t raw_bytes=%d", requestID, len(body.Messages), len(body.Tools), normalizedToolChoiceMode(body.ToolChoice), body.Stream, len(raw))
-	stage(requestID, "body_parsed", map[string]any{"messages": len(body.Messages), "tools": len(body.Tools), "stream": body.Stream, "raw_bytes": len(raw)})
+	log.Printf("[req-trace] id=%s stage=body_parsed model=%s effort=%s tone=%s messages=%d tools=%d choice=%s stream=%t raw_bytes=%d", requestID, body.Model, effort, tone, len(body.Messages), len(body.Tools), normalizedToolChoiceMode(body.ToolChoice), body.Stream, len(raw))
+	stage(requestID, "body_parsed", map[string]any{"model": body.Model, "effort": effort, "tone": tone, "messages": len(body.Messages), "tools": len(body.Tools), "stream": body.Stream, "raw_bytes": len(raw)})
 	// 空请求必须在注入之前判定。下面注入的环境说明是网关自己添的内容，一旦先
 	// 注入，扁平化后的 prompt 就永远非空，messages:[] 这类请求会绕过后面那道
 	// 400 直接打到上游。这里用同一个扁平化函数和同一句错误文案，判定标准与注入

@@ -333,6 +333,44 @@ func TestReasoningEffortRouting(t *testing.T) {
 	}
 }
 
+func TestConfiguredModelMappingsHonorEffortWhenTonePairExists(t *testing.T) {
+	mappings := []modelMapping{{
+		PublicModel:           "custom-gpt-5.5",
+		UpstreamTone:          "Gpt_5_5_Reasoning",
+		DisplayName:           "Custom GPT-5.5",
+		DefaultReasoningLevel: "xhigh",
+	}}
+	for _, tc := range []struct {
+		effort string
+		want   string
+	}{
+		{effort: "none", want: "Gpt_5_5_Chat"},
+		{effort: "low", want: "Gpt_5_5_Chat"},
+		{effort: "high", want: "Gpt_5_5_Reasoning"},
+		{effort: "max", want: "Gpt_5_5_Reasoning"},
+	} {
+		got, err := reasoningToneForMappings("custom-gpt-5.5", tc.effort, mappings)
+		if err != nil || got != tc.want {
+			t.Fatalf("effort=%s got=%q err=%v, want %q", tc.effort, got, err, tc.want)
+		}
+	}
+}
+
+func TestConfiguredGpt56MappingRemainsFixedWithoutChatTone(t *testing.T) {
+	mappings := []modelMapping{{
+		PublicModel:           "gpt-5.6-luna",
+		UpstreamTone:          "Gpt_5_6_Reasoning",
+		DisplayName:           "GPT-5.6-Luna",
+		DefaultReasoningLevel: "xhigh",
+	}}
+	for _, effort := range []string{"none", "low", "medium", "high", "xhigh", "max"} {
+		got, err := reasoningToneForMappings("gpt-5.6-luna", effort, mappings)
+		if err != nil || got != "Gpt_5_6_Reasoning" {
+			t.Fatalf("effort=%s got=%q err=%v", effort, got, err)
+		}
+	}
+}
+
 func TestChatRejectsInvalidReasoningBeforeUpstream(t *testing.T) {
 	s := &Server{}
 	r := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"gpt-5.6-reasoning","reasoning_effort":"extreme","messages":[{"role":"user","content":"hello"}]}`))
