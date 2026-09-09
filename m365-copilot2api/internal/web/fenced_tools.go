@@ -124,7 +124,10 @@ func fencedToolCalls(text string, tools []map[string]any, choice any) []detected
 		name := m[1]
 		args := strings.TrimSpace(m[2])
 		var v any
-		_ = json.Unmarshal([]byte(args), &v)
+		// 容错解析：非法转义（C:\Users 的 \U）与裸控制字符先抢救一次。
+		// 失败时 v 仍为 nil，走下面的「纯命令围栏」分支 —— 此前带 Windows 路径的
+		// JSON 参数解析失败后，整段 JSON 文本会被当成 command 本身派发出去。
+		_ = unmarshalJSONTolerant(args, &v)
 		// Auto-convert bash/shell code blocks to tool calls, but only when
 		// the client declared the tool.
 		if lower := strings.ToLower(name); lower == "bash" || lower == "sh" || lower == "shell" || lower == "powershell" || lower == "cmd" {
@@ -184,7 +187,9 @@ func fencedToolCalls(text string, tools []map[string]any, choice any) []detected
 			continue
 		}
 		var v any
-		if json.Unmarshal([]byte(c.Body), &v) != nil {
+		// 容错解析：内联围栏的参数同样常带 Windows 路径（2026-09-09 实测被打断的
+		// edit 调用就是这一形态 + C:\Users 路径）。
+		if !unmarshalJSONTolerant(c.Body, &v) {
 			continue
 		}
 		if _, isMap := v.(map[string]any); !isMap {
@@ -223,7 +228,7 @@ func fencedToolCalls(text string, tools []map[string]any, choice any) []detected
 				continue
 			}
 			var obj map[string]any
-			if json.Unmarshal([]byte(line[:braceEnd+1]), &obj) != nil {
+			if !unmarshalJSONTolerant(line[:braceEnd+1], &obj) {
 				continue
 			}
 			if cmd, hasCmd := obj["command"]; hasCmd && cmd != "" {

@@ -3,6 +3,7 @@ package web
 import (
 	"encoding/json"
 	"fmt"
+	"runtime"
 	"strings"
 )
 
@@ -69,6 +70,12 @@ func modelToolRouterPrompt(prompt string, tools []map[string]any, choice any) st
 	// 模型在源头就写不会被吃掉的空格形态（[ string]::），而不是等网关下游
 	// 对每个残迹打补丁。空格形态在 PowerShell 里语义等价，两侧零成本。
 	routerTransitNote := "Transit note: a tight PowerShell type accelerator like [string]:: is stripped in transit on this link. When your command arguments use one, write the spaced form instead — [ string]::, [ math]::, [ System.Environment]:: — which passes through unchanged and is valid PowerShell. "
+	// 路由轮直接产出 CALL_TOOL 的 JSON 参数，正是「单反斜杠 Windows 路径」
+	// 出问题的地方：\U 不是合法 JSON 转义，整个调用此前会被静默丢弃；进了
+	// POSIX shell 工具的裸路径又会被吃掉反斜杠（grep 报无结果）。网关侧已有
+	// 兜底（json_salvage.go），但源头写对就完全不触发。与 Transit note 同理，
+	// 路由轮不经过 runtimeWorkspaceInstruction，所以这条规则要单独带上。
+	routerTransitNote += windowsPathRouterNote()
 	return fmt.Sprintf(`You are a tool selection assistant. Based on the user request, decide which tool to call next.
 %s
 Available tools: %s
@@ -80,6 +87,19 @@ User request and evidence:
 
 Routing contract:
 %s`, routerTransitNote, defs, mode, prompt, rules)
+}
+
+// windowsPathRouterNote 只在 Windows 宿主上给出，其他宿主没有这个问题，
+// 平白加规则会挤占路由契约的注意力。与 runtime_prompt.go 的
+// windowsPathQuotingRule 同源，措辞按路由轮的产物（CALL_TOOL 的 JSON）收窄。
+func windowsPathRouterNote() string {
+	if runtime.GOOS != "windows" {
+		return ""
+	}
+	return "Windows path rule: inside CALL_TOOL JSON arguments write backslashes doubled " +
+		"(\"E:\\\\project\\\\file.md\") or use forward slashes (\"E:/project/file.md\") — a single backslash " +
+		"before a letter is not a valid JSON escape. If the argument is a command for a POSIX/bash shell tool, " +
+		"also quote the path inside the command, or the shell strips the backslashes and the command finds nothing. "
 }
 
 // normalizeToolDirective 把全角冒号统一成半角。模型用中文作答时常输出

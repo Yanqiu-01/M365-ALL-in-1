@@ -602,7 +602,10 @@ func decodeArgumentsDepth(body string, depth int) (map[string]any, bool) {
 		return map[string]any{}, true
 	}
 	var args map[string]any
-	if json.Unmarshal([]byte(body), &args) == nil {
+	// 容错解析：非法转义（Windows 路径 C:\Users 里的 \U 不是合法 JSON 转义）与
+	// 字符串内的裸控制字符先抢救一次再解析。合法输入走严格路径，字节不变。
+	// 见 json_salvage.go —— 修的是「网关看不懂的转义写法」，不放松 schema 校验。
+	if unmarshalJSONTolerant(body, &args) {
 		if args == nil {
 			args = map[string]any{}
 		}

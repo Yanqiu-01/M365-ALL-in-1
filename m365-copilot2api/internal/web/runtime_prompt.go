@@ -86,7 +86,8 @@ func describeRuntimeHost(goos, goarch string) string {
 			"Local or mapped paths such as C:\\ and E:\\ refer to the caller's real filesystem, "+
 			"and PowerShell cmdlets like Get-ChildItem, Get-Content and Get-Location run on this host. "+
 			"When a declared tool's own description specifies its shell or syntax (for example a bash/POSIX shell tool), "+
-			"write commands in THAT tool's dialect, not in PowerShell.", goarch)
+			"write commands in THAT tool's dialect, not in PowerShell.\n"+
+			"%s", goarch, windowsPathQuotingRule())
 	case "linux":
 		// GOOS=linux 只说明内核，不说明宿主形态。PC 上这台网关的调用方就是
 		// Claude Code / Codex 这类 CLI 编程代理，之前写成「可能是跑 RikkaHub
@@ -100,6 +101,26 @@ func describeRuntimeHost(goos, goarch string) string {
 	default:
 		return fmt.Sprintf("Host: %s/%s. Treat the process working directory as the project root.", goos, goarch)
 	}
+}
+
+// windowsPathQuotingRule 针对 Windows 上「反斜杠路径被两层吃掉」的实测故障。
+//
+//	POSIX shell 层：Git Bash 里裸写 E:\download\claude 会被当成转义序列吃掉
+//	反斜杠，变成 E:downloadclaude。grep 因此报「无此文件或目录」，模型看到的
+//	却像是「搜索完成、零结果」，于是据此下结论——2026-09-09 用户实测就是这样
+//	丢掉了整批 grep 结果。加引号或改用正斜杠都能正常工作。
+//
+//	JSON 层：C:\Users 里的 \U 不是合法 JSON 转义，参数整体解析失败。网关侧已
+//	有兜底（json_salvage.go），但双反斜杠或正斜杠从一开始就不会触发。
+//
+// 两层的正确写法是同一个，所以在提示词里合并成一条规则给出。
+func windowsPathQuotingRule() string {
+	return "Windows path rule, both halves matter: (1) in a POSIX/bash shell tool, always quote a " +
+		"backslash path (\"E:\\project\\file.md\") or write it with forward slashes (E:/project/file.md) — " +
+		"unquoted, the shell eats the backslashes, so E:\\download\\claude becomes E:downloadclaude and the " +
+		"command silently finds nothing; a zero-result grep on a path you did not quote means this, not an " +
+		"empty search result. (2) in JSON tool arguments, write backslashes doubled (\"C:\\\\Users\\\\me\\\\a.md\") " +
+		"or use forward slashes, because a single backslash before a letter is not a valid JSON escape."
 }
 
 // probeInstructions 给的是这台机器上真的能跑的命令。给错 shell 的命令比不给
