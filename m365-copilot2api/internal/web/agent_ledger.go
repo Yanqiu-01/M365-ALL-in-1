@@ -67,9 +67,11 @@ func compactToolResult(s string, limit int) string {
 	headLine := 1 + strings.Count(s[:head], "\n")
 	tailLine := 1 + strings.Count(s[:len(s)-tail], "\n")
 	omitted := len(s) - head - tail
-	// 完整版标记（~190 字节）只在预算充裕时使用；benchmark 一类 300-600 字节
-	// 的小预算用短版，避免标记本身吃掉预算。
-	if limit >= 1200 {
+	// 完整版标记（~190 字节）只在面向模型的预算下使用。门槛取
+	// ledgerResultLimit/4（16KB）：低于这个量级的结果要么是 benchmark 内部
+	// 日志（不喂给模型），要么本身会被 head/tail 窗口基本盖满，190 字节的
+	// 标记占比过高；面向模型的出口全部 ≥64KB。
+	if limit >= ledgerResultLimit/4 {
 		return s[:head] +
 			fmt.Sprintf("\n... [gateway truncation for prompt budget: %d bytes omitted here (lines ~%d-%d); this is NOT the upstream's full output — to read the middle, re-read the source with an offset/range instead of citing it] ...\n",
 				omitted, headLine, tailLine) +

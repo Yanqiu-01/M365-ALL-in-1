@@ -8,10 +8,17 @@ import (
 
 func TestCompactToolResultKeepsHeadTailAndError(t *testing.T) {
 	s := "start\n" + strings.Repeat("progress line\n", 1000) + "ERROR: build failed\nexit code 1"
-	// 完整版省略标记（行号锚定 + 补读指引）只在预算充裕（limit≥1200）时出现。
+	// 完整版省略标记（行号锚定 + 补读指引）只在面向模型的预算（limit≥16KB）下
+	// 出现；4400 一类中间档走短版。
 	got := compactToolResult(s, 4000)
-	if len(got) > 4400 || !strings.Contains(got, "start") || !strings.Contains(got, "ERROR: build failed") || !strings.Contains(got, "exit code 1") || !strings.Contains(got, "gateway truncation") || !strings.Contains(got, "NOT the upstream") {
+	if len(got) > 4200 || !strings.Contains(got, "start") || !strings.Contains(got, "ERROR: build failed") || !strings.Contains(got, "exit code 1") || !strings.Contains(got, "[truncated ") {
 		t.Fatalf("bad compact result: %d %q", len(got), got)
+	}
+	// 完整版省略标记只在真正发生省略且面向模型预算（limit≥16KB）时出现。
+	// 构造一个超过 64KB 的输入。
+	full := compactToolResult(s+strings.Repeat("filler line\n", 6000), ledgerResultLimit)
+	if !strings.Contains(full, "gateway truncation") || !strings.Contains(full, "NOT the upstream") {
+		t.Fatalf("model-facing budget lost the full marker: %q", full[len(full)-300:])
 	}
 	// 小预算退化为短版标记，标记本身不吃掉预算。
 	short := compactToolResult(s, 300)
