@@ -369,7 +369,9 @@ func dialTunnel(ctx context.Context, u *url.URL, host string, timeout time.Durat
 			URL: &url.URL{Opaque: target}, Host: target, Header: make(http.Header)}
 		if u.User != nil {
 			pw, _ := u.User.Password()
-			req.SetBasicAuth(u.User.Username(), pw)
+			// SetBasicAuth writes "Authorization", but proxies require "Proxy-Authorization".
+			req.Header.Set("Proxy-Authorization", "Basic "+
+				base64.StdEncoding.EncodeToString([]byte(u.User.Username()+":"+pw)))
 		}
 		if err := req.Write(c); err != nil {
 			c.Close()
