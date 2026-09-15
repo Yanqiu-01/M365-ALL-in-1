@@ -134,6 +134,42 @@ func TestSalvageTabPathLiteralReread(t *testing.T) {
 	}
 }
 
+func TestSalvageWriteContentsNewlinesNotFlattened(t *testing.T) {
+	// 回归：同一条 Write 调用里，file_path 是 C:\temp\x.go（\t 必须字面读），
+	// contents 是合法 JSON 的 "a\nb\nc"（\n 必须是真换行）。字面读法如果扫
+	// 整段 JSON，会把 contents 里的 \n 一并改成两个字符「\n」，写到磁盘就是
+	// 一整行，随后 Edit 因 old_string 对不上而失败。
+	body := `{"file_path":"C:` + bs + `temp` + bs + `x.go","contents":"package main` + bs + `n` + bs + `nfunc main() {}"}`
+	var args map[string]any
+	if !unmarshalJSONTolerant(body, &args) {
+		t.Fatalf("解析失败: %s", body)
+	}
+	if got, _ := args["file_path"].(string); got != `C:\temp\x.go` {
+		t.Fatalf("file_path=%q", got)
+	}
+	got, _ := args["contents"].(string)
+	if got != "package main\n\nfunc main() {}" {
+		t.Fatalf("contents 换行被压扁: %q", got)
+	}
+}
+
+func TestSalvageEditOldStringNewlinesNotFlattened(t *testing.T) {
+	body := `{"file_path":"C:` + bs + `new` + bs + `a.go","old_string":"func a() {` + bs + `n}","new_string":"func a() {` + bs + `n` + bs + `treturn` + bs + `n}"}`
+	var args map[string]any
+	if !unmarshalJSONTolerant(body, &args) {
+		t.Fatalf("解析失败: %s", body)
+	}
+	if got, _ := args["file_path"].(string); got != `C:\new\a.go` {
+		t.Fatalf("file_path=%q", got)
+	}
+	if got, _ := args["old_string"].(string); got != "func a() {\n}" {
+		t.Fatalf("old_string 换行被压扁: %q", got)
+	}
+	if got, _ := args["new_string"].(string); got != "func a() {\n\treturn\n}" {
+		t.Fatalf("new_string 换行被压扁: %q", got)
+	}
+}
+
 func TestSalvageRealTabIntentNotCorrupted(t *testing.T) {
 	// 对照组：真想表达制表符的合法 JSON 不得被改写。普通字符串没有盘符前缀，
 	// 字面重读的判据不命中，原始解析结果保持不变。

@@ -144,20 +144,33 @@ func stringLooksLikeCorruptedWindowsPath(s string) bool {
 	return false
 }
 
-// reinterpretWindowsPathStrings 把 body 里所有「以盘符开头且含单反斜杠合法
-// 转义」的 JSON 字符串按字面语义重写（\t → 字面反斜杠 + t，其余转义同样落回
-// 字面形式），返回重写结果与是否发生了改写。改写后的文本必须由调用方重新
-// 解析验证——写出来不是合法 JSON 就丢弃。
+// looksLikeWindowsPathAt 报告 body[i:] 是否以盘符路径开头（X:\）。
+func looksLikeWindowsPathAt(body string, i int) bool {
+	if i+2 >= len(body) {
+		return false
+	}
+	c := body[i]
+	isLetter := (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+	return isLetter && body[i+1] == ':' && body[i+2] == '\\'
+}
+
+// reinterpretWindowsPathStrings 只把「以盘符开头」的 JSON 字符串按字面语义
+// 重写（\t → 字面反斜杠 + t）。同一段 JSON 里其它字段保持 JSON 转义语义——
+// 否则 Write/Edit 的 contents/old_string/new_string 里真正的 \n 会被一并改成
+// 两个字符「\n」，写到磁盘就是一整行，随后 Edit 因 old_string 对不上而失败。
+// 改写后的文本必须由调用方重新解析验证——写出来不是合法 JSON 就丢弃。
 func reinterpretWindowsPathStrings(body string) (string, bool) {
 	var b strings.Builder
 	b.Grow(len(body))
 	changed := false
 	inString := false
+	pathString := false
 	for i := 0; i < len(body); i++ {
 		ch := body[i]
 		if !inString {
 			if ch == '"' {
 				inString = true
+				pathString = looksLikeWindowsPathAt(body, i+1)
 			}
 			b.WriteByte(ch)
 			continue
@@ -165,6 +178,7 @@ func reinterpretWindowsPathStrings(body string) (string, bool) {
 		switch {
 		case ch == '"':
 			inString = false
+			pathString = false
 			b.WriteByte(ch)
 		case ch == '\\':
 			if i+1 >= len(body) {
@@ -172,6 +186,13 @@ func reinterpretWindowsPathStrings(body string) (string, bool) {
 				continue
 			}
 			next := body[i+1]
+			if !pathString {
+				// 非路径字符串：\n 就是换行，原样拷贝，不改语义。
+				b.WriteByte(ch)
+				b.WriteByte(next)
+				i++
+				continue
+			}
 			switch next {
 			case '"', '\\', '/', 'u':
 				// 这些保持转义语义：\" 是真引号，\\ 是真反斜杠，
