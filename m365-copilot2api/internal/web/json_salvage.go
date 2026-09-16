@@ -6,6 +6,12 @@ import (
 	"strings"
 )
 
+// chatHubWrapMinLine is the minimum line length in bytes for a raw newline
+// inside a JSON string to be treated as a ChatHub wrapping artifact rather
+// than an intentional newline. ChatHub wraps long lines at ~80 characters;
+// legitimate short lines (< 60 chars) with raw newlines are preserved.
+const chatHubWrapMinLine = 60
+
 // salvageInvalidJSONEscapes 修复 JSON 字符串里「只有一种正确读法」的两类非法写法。
 //
 //  1. 非法转义序列。Windows 路径写进 JSON 字符串时，C:\Users 里的 \U 不是合法
@@ -43,11 +49,18 @@ func salvageJSONEscapes(body string, literalBackslashBeforeQuote bool) (string, 
 	b.Grow(len(body) + 16)
 	changed := false
 	inString := false
+	// lineStart tracks the body offset where the current line within the
+	// current JSON string began. ChatHub wraps long lines at ~80 characters,
+	// inserting raw newlines into JSON string values. A raw newline after a
+	// long line is a wrapping artifact; a raw newline after a short line is
+	// more likely intentional (e.g. Edit's CUT/PUT syntax).
+	lineStart := -1
 	for i := 0; i < len(body); i++ {
 		ch := body[i]
 		if !inString {
 			if ch == '"' {
 				inString = true
+				lineStart = i + 1
 			}
 			b.WriteByte(ch)
 			continue
@@ -87,16 +100,35 @@ func salvageJSONEscapes(body string, literalBackslashBeforeQuote bool) (string, 
 			changed = true
 		case ch < 0x20:
 			switch ch {
-			case '\n':
-				b.WriteString(`\n`)
-			case '\r':
-				b.WriteString(`\r`)
+			case '\n', '\r':
+				// ChatHub wraps long lines at ~80 chars. If the line
+				// since the last raw newline is longer than the wrap
+				// threshold, this raw newline is a wrapping artifact:
+				// remove it to rejoin the line instead of escaping it.
+				if lineStart >= 0 && i-lineStart > chatHubWrapMinLine {
+					changed = true
+					if ch == '\r' && i+1 < len(body) && body[i+1] == '\n' {
+						i++
+					}
+					lineStart = i + 1
+					continue
+				}
+				lineStart = i + 1
+				if ch == '\n' {
+					b.WriteString(`\n`)
+				} else {
+					b.WriteString(`\r`)
+				}
+				changed = true
 			case '\t':
+				lineStart = i + 1
 				b.WriteString(`\t`)
+				changed = true
 			default:
+				lineStart = i + 1
 				b.WriteString(fmt.Sprintf(`\u%04x`, ch))
+				changed = true
 			}
-			changed = true
 		default:
 			b.WriteByte(ch)
 		}

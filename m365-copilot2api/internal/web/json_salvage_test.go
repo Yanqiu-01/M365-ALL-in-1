@@ -78,6 +78,35 @@ func TestSalvageTrailingBackslash(t *testing.T) {
 	}
 }
 
+func TestSalvageRejoinsChatHubWrappedLine(t *testing.T) {
+	// ChatHub wraps long lines at ~80 chars, inserting raw newlines into
+	// JSON string values. The salvage path must rejoin these lines instead
+	// of preserving them as \n escapes in the decoded value.
+	longLine := strings.Repeat("a", 80)
+	body := `{"content":"` + longLine + "\n" + `tail"}`
+	var args map[string]any
+	if !unmarshalJSONTolerant(body, &args) {
+		t.Fatalf("wrapped line not salvaged: %q", body)
+	}
+	want := longLine + "tail"
+	if got, _ := args["content"].(string); got != want {
+		t.Fatalf("content=%q, want %q (no embedded newline)", got, want)
+	}
+}
+
+func TestSalvagePreservesShortLineRawNewline(t *testing.T) {
+	// A raw newline after a short line is more likely intentional (e.g.
+	// Edit's CUT/PUT syntax). It must be escaped to \n, not removed.
+	body := `{"input":"short\nput"}`
+	var args map[string]any
+	if !unmarshalJSONTolerant(body, &args) {
+		t.Fatalf("short line not salvaged: %q", body)
+	}
+	if got, _ := args["input"].(string); got != "short\nput" {
+		t.Fatalf("input=%q", got)
+	}
+}
+
 func TestSalvageKeepsRealEscapedQuotes(t *testing.T) {
 	// 真转义引号必须原样保留。第一遍（保守读法）就该解析成功，
 	// 「反斜杠算字面量」那一遍根本不该被用上。
