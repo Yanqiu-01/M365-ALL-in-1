@@ -241,6 +241,30 @@ func TestExtractSurvivesLayeredDecoration(t *testing.T) {
 	}
 }
 
+// 全角标点归一化只允许发生在 JSON 字符串外面。模型逐字引用文件内容时，
+// 中文逗号/括号就是有效数据；把它们改成 ASCII 会导致客户端端 Edit
+// "String to replace not found"，而且网关自己看不到这层破坏。
+func TestNormalizeDecisionTextKeepsFullWidthPunctuationInsideJSONStrings(t *testing.T) {
+	text := `CALL_TOOL：read_file（{"path":"数据，最简（中文）"}）`
+	got := normalizeDecisionText(text)
+	want := `CALL_TOOL:read_file({"path":"数据，最简（中文）"})`
+	if got != want {
+		t.Fatalf("normalizeDecisionText changed string data:\ngot  %q\nwant %q", got, want)
+	}
+
+	calls, parsed := parseModelToolDecision(text, extractTestTools(), "auto")
+	if !parsed || len(calls) != 1 || calls[0].Name != "read_file" {
+		t.Fatalf("normalized full-width wrapper did not parse: parsed=%v calls=%+v", parsed, calls)
+	}
+	var args map[string]string
+	if err := json.Unmarshal(calls[0].Arguments, &args); err != nil {
+		t.Fatalf("arguments were not valid JSON: %v", err)
+	}
+	if args["path"] != "数据，最简（中文）" {
+		t.Fatalf("full-width data was corrupted: %q", args["path"])
+	}
+}
+
 // 抽取与校验必须分离：候选枚举本身不应过滤未知工具，
 // 否则新增工具时又要回到抽取器里改判断。
 func TestExtractionIsSeparateFromValidation(t *testing.T) {

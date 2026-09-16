@@ -53,19 +53,61 @@ const (
 )
 
 // normalizeDecisionText 统一全角标点与代码围栏，使后续抽取只面对一种形态。
-// 只替换等宽的 ASCII 对应物，不改变字节长度以外的语义。
+//
+// 替换必须 JSON-string-aware。模型可能在 Edit 的 old_string/new_string 里
+// 逐字引用中文标点（例如 "整数，最简"）；若把这些字符也换掉，工具调用
+// 虽然 schema 合法，但参数已经不是文件里的原文，客户端随后报
+// "String to replace not found"。只在 JSON 字符串外面做包装归一化；
+// 字符串字面量内部一字不改。CRLF 归一化同样放在字符串外，
+// 裸控制字符的 salvage 仍由 decodeArguments 的容错路径处理。
 func normalizeDecisionText(text string) string {
-	replacer := strings.NewReplacer(
-		"：", ":",
-		"（", "(",
-		"）", ")",
-		"“", `"`,
-		"”", `"`,
-		"，", ",",
-		"\r\n", "\n",
-		"\r", "\n",
-	)
-	return replacer.Replace(text)
+	var b strings.Builder
+	b.Grow(len(text))
+	inString, escaped := false, false
+	for _, r := range text {
+		if !inString {
+			switch r {
+			case '"':
+				inString = true
+				escaped = false
+				b.WriteRune(r)
+			case '：':
+				b.WriteByte(':')
+			case '（':
+				b.WriteByte('(')
+			case '）':
+				b.WriteByte(')')
+			case '“', '”':
+				b.WriteByte('"')
+			case '，':
+				b.WriteByte(',')
+			case '\r':
+				// \r\n 只写一次 \n；裸 \r 也归一化为 \n。
+			case '\n':
+				b.WriteByte('\n')
+			default:
+				b.WriteRune(r)
+			}
+			continue
+		}
+		if escaped {
+			escaped = false
+			b.WriteRune(r)
+			continue
+		}
+		switch r {
+		case '\\':
+			escaped = true
+			b.WriteRune(r)
+		case '"':
+			inString = false
+			escaped = false
+			b.WriteRune(r)
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 // stripDecorations 去掉不影响语义的包装字符，让指令行的边界可被识别。
