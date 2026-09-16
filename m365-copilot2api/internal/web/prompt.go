@@ -9,32 +9,38 @@ import (
 // flattenPromptMessages adapts role-based messages to ChatHub's single text field
 // without losing instruction priority or tool-call identity.
 func flattenPromptMessages(messages []oaiMsg, attachments []chathub.Attachment) (string, []chathub.Attachment) {
+	return flattenPromptMessagesWithToolNames(messages, attachments, nil)
+}
+
+func flattenPromptMessagesWithToolNames(messages []oaiMsg, attachments []chathub.Attachment, priorNames map[string]string) (string, []chathub.Attachment) {
+	names := make(map[string]string, len(priorNames))
+	for id, name := range priorNames {
+		names[id] = name
+	}
 	var b strings.Builder
 	for _, m := range messages {
+		recordToolCallNames(names, m)
 		role := strings.ToLower(strings.TrimSpace(m.Role))
 		if role == "" {
 			role = "user"
 		}
 		txt, files := parseContent(m.Content)
 		attachments = append(attachments, files...)
-		txt = strings.TrimSpace(txt)
+		// A final empty numbered line ends in the gutter TAB itself. Keep it
+		// until promptToolResult has recognised the listing; trimming first
+		// would turn "2\t\n" into "2" and prevent normalisation of every row.
+		if role != "tool" || len(m.ToolCalls) > 0 {
+			txt = strings.TrimSpace(txt)
+		}
 		if len(m.ToolCalls) > 0 {
 			if txt != "" {
 				b.WriteString(fmt.Sprintf("\n[%s]\n%s\n", role, txt))
 			}
-			b.WriteString(fmt.Sprintf("\n[%s tool_calls]\n%s\n", role, mustJSON(m.ToolCalls)))
+			b.WriteString(fmt.Sprintf("\n[%s tool_calls]\n%s\n", role, mustJSON(promptToolCalls(m.ToolCalls))))
 			continue
 		}
 		if role == "tool" {
-			// Image-only (and other non-text) tool results still produce
-			// attachments above. If we leave the text empty, the model is told
-			// the call returned nothing even though the file is on this turn.
-			if strings.TrimSpace(txt) == "" {
-				if note := attachmentPresenceNote(files); note != "" {
-					txt = note
-				}
-			}
-			txt = compactToolResult(txt, ledgerResultLimit)
+			txt = promptToolResult(toolResultName(m, names), txt, files)
 			// 空结果要说出来，不能渲染成一个空的标题行。
 			//
 			// 早先内容为空时这里写出的是 "[tool result id=x]" 后面跟一个空行，模型

@@ -95,6 +95,12 @@ func toolResultLooksFailed(name, result string) bool {
 	if trimmed == "" {
 		return false
 	}
+	// OpenAI clients may return the bare Edit error without Anthropic's
+	// authoritative "Error:" prefix. Keep the ledger consistent with recovery
+	// for stale snapshots and identical replacements as well as not-found.
+	if strings.EqualFold(strings.TrimSpace(name), "Edit") && editFailureReason(trimmed) != "" {
+		return true
+	}
 	if toolLooksObservational(name) {
 		// 结构化结果：只认显式的失败字段。
 		var probe map[string]any
@@ -251,7 +257,7 @@ func buildAgentLedger(messages []oaiMsg) agentLedger {
 		if m.Role == "tool" {
 			if e, ok := calls[m.ToolCallID]; ok {
 				raw := toolResultEvidenceText(m.Content)
-				e.Result = compactToolResult(raw, ledgerResultLimit)
+				e.Result = compactToolResult(normalizeReadGutter(e.Name, raw), ledgerResultLimit)
 				// 收到 tool 消息这件事本身就是「已应答」，与内容是否为空无关。
 				//
 				// 空结果在协议上完全合法：一条没有输出的命令、一次只做写入的调用、
@@ -347,7 +353,7 @@ func compactRouterEvidence(completed []toolEvidence) ([]toolEvidence, int) {
 	}
 	dropped := 0
 	for len(out) > 1 {
-		b, err := json.Marshal(out)
+		b, err := json.Marshal(promptEvidence(out))
 		if err != nil || len(b) <= routerEvidenceMaxBytes {
 			break
 		}
@@ -361,12 +367,12 @@ func compactRouterEvidence(completed []toolEvidence) ([]toolEvidence, int) {
 
 func (l agentLedger) RouterContext() string {
 	type compact struct {
-		Completed    []toolEvidence `json:"completed"`
-		Pending      []toolEvidence `json:"pending"`
-		RepeatedCall bool           `json:"repeated_call"`
+		Completed    []promptToolEvidence `json:"completed"`
+		Pending      []promptToolEvidence `json:"pending"`
+		RepeatedCall bool                 `json:"repeated_call"`
 	}
 	completed, dropped := compactRouterEvidence(l.Completed)
-	b, _ := json.Marshal(compact{completed, l.Pending, l.RepeatedCall})
+	b, _ := json.Marshal(compact{promptEvidence(completed), promptEvidence(l.Pending), l.RepeatedCall})
 	// 逐字取自原 APK rodata。关键是后半句：read/inspect/check/test 在工作区
 	// 状态变化后允许重复，只禁止「参数完全相同的变更类调用」。
 	//

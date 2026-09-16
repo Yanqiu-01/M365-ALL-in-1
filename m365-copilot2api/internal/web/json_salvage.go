@@ -23,9 +23,9 @@ import (
 // JSON 就照旧算失败。这条路径不放松任何 schema 校验，只是把「网关自己看不懂
 // 的转义」从静默丢弃改成尽力还原。
 //
-// 已知无法修复的歧义：C:\temp 里的 \t 恰好是合法 JSON 转义。那种输入是合法
-// JSON，严格解析就成功，走不到这里——它由 unmarshalJSONTolerant 的第三条路径
-// （reinterpretWindowsPathStrings）处理，不在这条函数的职责内。
+// C:\temp 里的 \t 恰好是合法 JSON 转义；仅靠本函数无法区分路径和控制字符。
+// unmarshalJSONTolerant 先选择盘符字段的字面读法，再在保留该解释的候选上
+// 抢救其它非法转义/裸控制字符，避免 fallback 又把路径解成控制字符。
 func salvageInvalidJSONEscapes(body string) (string, bool) {
 	return salvageJSONEscapes(body, false)
 }
@@ -107,22 +107,14 @@ func salvageJSONEscapes(body string, literalBackslashBeforeQuote bool) (string, 
 	return b.String(), true
 }
 
-// windowsPathControlEscape 识别「合法转义吃掉 Windows 路径」这一类损坏。
+// stringLooksLikeCorruptedWindowsPath inspects the raw JSON spelling of a
+// drive-prefixed string for single-backslash \t/\n/\r/\b/\f escapes. A doubled
+// backslash already represents a literal separator and is left alone.
 //
-// C:\temp 里的 \t 是合法 JSON 转义，严格解析会成功——但解析出的字符串里出现
-// 了制表符，路径已经损坏。实测（2026-09-09 审计）：C:\temp\x.md 被解析成
-// C:<TAB>emp\x.md 交付给工具，工具报 file not found，模型不知道为什么。同类：
-// \n → C:<LF>ew，\r → C:<CR>epo，\b → C:<BS>in，\f → C:<FF>ile。
-//
-// 判据（三条同时满足才算）：
-//  1. 字符串以盘符开头（X:\，大小写均可）；
-//  2. 字符串里含有由单反斜杠引入的 \t \n \r \b \f（真 Windows 路径的目录
-//     分隔符是字面反斜杠，合法 JSON 必须写成 \\）；
-//  3. 按字面读法重解析后，控制字符消失且反斜杠保留 —— 只有这样才证明「字面
-//     读法」是模型的意图，避免把真要表达制表符的正常 JSON 误改成路径。
-//
-// 这是启发式：C:\temp 作为"字面路径"的先验远高于"字符串字面量里恰好以
-// C: 开头且含真制表符"的先验，两遍解析给了我们验证的机会。
+// This is a heuristic, not proof of model intent: an unescaped C:\temp is much
+// more likely to be a path than a string intentionally containing C:<TAB>emp.
+// The caller reparses each candidate and excludes known Edit/Write text fields
+// from path reinterpretation even when their contents start with a drive prefix.
 func stringLooksLikeCorruptedWindowsPath(s string) bool {
 	if len(s) < 3 {
 		return false
@@ -140,6 +132,9 @@ func stringLooksLikeCorruptedWindowsPath(s string) bool {
 		case 't', 'n', 'r', 'b', 'f':
 			return true
 		}
+		// A doubled backslash is already a literal separator. Its second
+		// byte cannot also start a control escape (e.g. JSON "C:\\temp").
+		i++
 	}
 	return false
 }
@@ -152,6 +147,52 @@ func looksLikeWindowsPathAt(body string, i int) bool {
 	c := body[i]
 	isLetter := (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
 	return isLetter && body[i+1] == ':' && body[i+2] == '\\'
+}
+
+// toolTextStringAt recognises a file-text member at the opening value quote.
+// A content/old_string/new_string value can itself start with "C:" followed by
+// a real newline or tab. That is still file content, not a path to reinterpret.
+// Read the syntactic key without requiring the whole (possibly invalid) JSON to
+// parse, and honour escaped key spellings such as "old_\u0073tring".
+func toolTextStringAt(body string, quote int) bool {
+	i := quote - 1
+	skipSpace := func() {
+		for i >= 0 && (body[i] == ' ' || body[i] == '\t' || body[i] == '\r' || body[i] == '\n') {
+			i--
+		}
+	}
+	skipSpace()
+	if i < 0 || body[i] != ':' {
+		return false
+	}
+	i--
+	skipSpace()
+	if i < 0 || body[i] != '"' {
+		return false
+	}
+	end := i + 1
+	for i--; i >= 0; i-- {
+		if body[i] != '"' {
+			continue
+		}
+		backslashes := 0
+		for j := i - 1; j >= 0 && body[j] == '\\'; j-- {
+			backslashes++
+		}
+		if backslashes%2 != 0 {
+			continue
+		}
+		var key string
+		if json.Unmarshal([]byte(body[i:end]), &key) != nil {
+			return false
+		}
+		switch strings.ToLower(key) {
+		case "old_string", "new_string", "content", "contents":
+			return true
+		}
+		return false
+	}
+	return false
 }
 
 // reinterpretWindowsPathStrings 只把「以盘符开头」的 JSON 字符串按字面语义
@@ -170,7 +211,7 @@ func reinterpretWindowsPathStrings(body string) (string, bool) {
 		if !inString {
 			if ch == '"' {
 				inString = true
-				pathString = looksLikeWindowsPathAt(body, i+1)
+				pathString = looksLikeWindowsPathAt(body, i+1) && !toolTextStringAt(body, i)
 			}
 			b.WriteByte(ch)
 			continue
@@ -267,29 +308,29 @@ func hasFourHexDigits(rest string) bool {
 	return true
 }
 
-// unmarshalJSONTolerant 按三条路径解析，全失败才返回 false：
-//
-//  1. 严格 JSON —— 合法输入永远走这条，字节不变；
-//  2. 抢救非法转义后重解析（两遍歧义读法：保守优先，只有保守读法也失败才试
-//     「反斜杠在引号前算字面量」）；
-//  3. 「合法转义损坏了 Windows 路径」的启发式重读：字符串以盘符开头、含由单
-//     反斜杠引入的 \t\n\r\b\f、且按字面读法重解析后控制字符消失——此时严格
-//     解析虽然"成功"，但结果是损坏的路径，字面读法才是模型意图。实测
-//     C:\temp\x.md 会被严格解析成 C:<TAB>emp\x.md 交付给工具。
-//
-// 返回 true 只代表「解析出了合法 JSON」，与参数是否满足工具 schema 无关：
-// schema 校验仍由 validateDetectedToolCalls 负责。
+// unmarshalJSONTolerant first tries the existing drive-path literal heuristic,
+// then ordinary JSON. Each candidate retains its interpretation through strict
+// parsing and both conservative/trailing-backslash salvage passes. Edit/Write
+// text fields keep their JSON escape semantics. Success here only means valid JSON;
+// validateDetectedToolCalls still enforces the declared tool schema.
 func unmarshalJSONTolerant(body string, out any) bool {
 	// 先试「盘符路径被合法转义损坏」的字面读法。这个判定只看输入字节形状，
 	// 与严格解析成败无关：C:\temp\x.md（\x 非法，严格失败）和 C:\temp（\t
 	// 合法，严格"成功"但损坏）是同一类输入，必须走同一条字面路径。
 	if stringLooksLikeCorruptedWindowsPath(windowsPathProbe(body)) {
 		if literal, changed := reinterpretWindowsPathStrings(body); changed {
-			if json.Unmarshal([]byte(literal), out) == nil {
+			if unmarshalJSONWithSalvage(literal, out) {
 				return true
 			}
 		}
 	}
+	return unmarshalJSONWithSalvage(body, out)
+}
+
+// Keep the selected path interpretation while escaping raw control characters
+// or a trailing directory separator. Restarting salvage from the original body
+// would turn a path's \r/\t back into control bytes.
+func unmarshalJSONWithSalvage(body string, out any) bool {
 	if json.Unmarshal([]byte(body), out) == nil {
 		return true
 	}
@@ -321,9 +362,13 @@ func windowsPathProbe(body string) string {
 			// 返回从引号后的内容开始、到下一个引号（或结尾）为止的片段。
 			rest := body[i+1:]
 			if end := strings.IndexByte(rest, '"'); end >= 0 {
-				return rest[:end]
+				rest = rest[:end]
 			}
-			return rest
+			if stringLooksLikeCorruptedWindowsPath(rest) {
+				return rest
+			}
+			// Another field may contain the damaged path. An earlier,
+			// properly escaped path must not mask it.
 		}
 	}
 	return ""

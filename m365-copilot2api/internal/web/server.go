@@ -412,6 +412,8 @@ func (s *Server) Routes() http.Handler {
 	m.HandleFunc("/v1/images/generations", s.imageGenerations)
 	m.HandleFunc("/v1/images/edits", s.imageEdits)
 	m.HandleFunc("/v1/images/files/", s.generatedImageFile)
+	m.HandleFunc("/wall/random", s.wallpaperRandom)
+	m.HandleFunc("/wall/info", s.wallpaperInfo)
 	m.HandleFunc("/", s.rootPage)
 	return recoverPanics(requestID(httpTrace(securityHeaders(s.adminMiddleware(s.debugMiddleware(m))))))
 }
@@ -422,7 +424,7 @@ func (s *Server) adminMiddleware(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		if r.URL.Path == "/api/admin/login" || r.URL.Path == "/api/admin/session" || r.URL.Path == "/api/admin/change-password" || r.URL.Path == "/api/admin/logout" || r.URL.Path == "/api/auth/start" || r.URL.Path == "/api/auth/status" || r.URL.Path == "/api/auth/callback" || r.URL.Path == "/api/auth/reset" || r.URL.Path == "/api/live" || r.URL.Path == "/" || r.URL.Path == "/login" || r.URL.Path == "/workbench" || r.URL.Path == "/favicon.ico" {
+		if r.URL.Path == "/api/admin/login" || r.URL.Path == "/api/admin/session" || r.URL.Path == "/api/admin/change-password" || r.URL.Path == "/api/admin/logout" || r.URL.Path == "/api/auth/start" || r.URL.Path == "/api/auth/status" || r.URL.Path == "/api/auth/callback" || r.URL.Path == "/api/auth/reset" || r.URL.Path == "/api/live" || r.URL.Path == "/" || r.URL.Path == "/login" || r.URL.Path == "/workbench" || r.URL.Path == "/favicon.ico" || r.URL.Path == "/wall/random" || r.URL.Path == "/wall/info" {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -1842,7 +1844,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		// because the router, identity answer, tool-intent heuristics and token
 		// accounting read it, but it must not be what we send: re-sending a
 		// 148-message history every turn is what saturated the CPU.
-		incPrompt, incAtt := flattenPromptMessages(body.Messages[historyLen:], nil)
+		incPrompt, incAtt := flattenPromptMessagesWithToolNames(body.Messages[historyLen:], nil, toolCallNames(body.Messages[:historyLen]))
 		incPrompt = strings.TrimSpace(incPrompt)
 		if incPrompt != "" {
 			// Bind stored the injected runtime system at index 0, so HistoryLen
@@ -1900,6 +1902,21 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		}
 		return valid, rejected
 	}
+	// The failure arrives in this request's tool results, not in the model's
+	// answer. Carry a bounded correction into both routing and answer paths.
+	recovery := editRecoveryInstruction(body.Messages, ledger, toolMaps, body.ToolChoice)
+	if recovery != "" {
+		prompt += "\n\n" + recovery
+		answerPrompt += "\n\n" + recovery
+		log.Printf("[edit-recovery] id=%s fresh_edit_failure=1 action=read_before_edit", requestID)
+	}
+	routerEvidence := func() string {
+		text := routerPromptMessages(body.Messages) + "\n" + ledger.RouterContext()
+		if recovery != "" {
+			text += "\n\n" + recovery
+		}
+		return text
+	}
 	planningMode := s.settings.get().ToolPlanningMode
 	var calls []detectedToolCall
 	var parsed bool
@@ -1931,7 +1948,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		// Only fall through to text streaming when the router explicitly selects
 		// no tool; this prevents a natural-language preamble from becoming a
 		// completed assistant turn with the actual call lost.
-		routePrompt := modelToolRouterPrompt(routerPromptMessages(body.Messages)+"\n"+ledger.RouterContext(), toolMaps, body.ToolChoice)
+		routePrompt := modelToolRouterPrompt(routerEvidence(), toolMaps, body.ToolChoice)
 		log.Printf("[req-trace] id=%s stage=router_start prompt_len=%d", requestID, len(routePrompt))
 		routeRes, routedAccount, routeErr := s.routerChatWithFailover(ctx, "stream-router", acc, chathub.Request{Text: routePrompt, Tone: tone, Attachments: body.Attachments, ToolsDeclared: true, SchemasInText: true})
 		if routedAccount.ID != "" {
@@ -2005,7 +2022,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	}
 	if body.Stream {
 		if parsed && len(calls) == 0 && normalizedToolChoiceMode(body.ToolChoice) == "auto" && routerRetry {
-			retryPrompt := modelToolRouterPrompt(routerPromptMessages(body.Messages)+"\n"+ledger.RouterContext(), toolMaps, "required") + "\nINTENT RETRY: Select at least one declared tool for this concrete action request. Do not answer with prose or NO_TOOL_NEEDED."
+			retryPrompt := modelToolRouterPrompt(routerEvidence(), toolMaps, "required") + "\nINTENT RETRY: Select at least one declared tool for this concrete action request. Do not answer with prose or NO_TOOL_NEEDED."
 			retryRes, retryErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: retryPrompt, Tone: tone, Attachments: body.Attachments, ToolsDeclared: true, SchemasInText: true})
 			recordRouterFrames(routerFrameInput{RequestID: requestID, Stage: "stream-router-intent-retry", Prompt: retryPrompt, Text: retryRes.Text, Reasoning: retryRes.Reasoning, Events: retryRes.Events, Err: retryErr})
 			if retryErr == nil && retryRes.ConversationID != "" {
@@ -2151,7 +2168,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			// A native ChatHub event can contain a fabricated or empty tool name.
 			// Do not leak it to the local runner: ask the model to remap the intent
 			// to exactly one of the tools the client actually declared.
-			repairPrompt := modelToolRouterPrompt(routerPromptMessages(body.Messages)+"\n"+ledger.RouterContext(), toolMaps, "required") +
+			repairPrompt := modelToolRouterPrompt(routerEvidence(), toolMaps, "required") +
 				toolRejectionRepairInstruction(rejected, toolMaps)
 			repairRes, repairErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: repairPrompt, Tone: tone, Attachments: body.Attachments})
 			if repairErr == nil {
@@ -2277,7 +2294,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	// remains tool-agnostic; it only validates and serializes the decision.
 	if planningMode == "router" && len(toolMaps) > 0 && fmt.Sprint(body.ToolChoice) != "none" {
 		routerOutcome := newRouterOutcome(requestID, "router", len(toolMaps), body.ToolChoice, routerIntent)
-		routePrompt := modelToolRouterPrompt(routerPromptMessages(body.Messages)+"\n"+ledger.RouterContext(), toolMaps, body.ToolChoice)
+		routePrompt := modelToolRouterPrompt(routerEvidence(), toolMaps, body.ToolChoice)
 		// routerChatWithFailover already retries a connect-stage transport
 		// failure on a different healthy account and a different outbound exit.
 		// A rate-limited or auth-failed attempt is swapped the same way, so the
@@ -2365,7 +2382,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			// A concrete action request deserves one constrained retry even in auto
 			// mode. This is the narrow repair path that avoids forcing tools for
 			// ordinary informational questions.
-			retryText := modelToolRouterPrompt(routerPromptMessages(body.Messages)+"\n"+ledger.RouterContext(), toolMaps, "required") + "\nINTENT RETRY: Select at least one declared tool for this concrete action request. Do not answer with prose or NO_TOOL_NEEDED."
+			retryText := modelToolRouterPrompt(routerEvidence(), toolMaps, "required") + "\nINTENT RETRY: Select at least one declared tool for this concrete action request. Do not answer with prose or NO_TOOL_NEEDED."
 			retryRes, retryErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: retryText, Tone: tone, Attachments: body.Attachments, ToolsDeclared: true, SchemasInText: true})
 			recordRouterFrames(routerFrameInput{RequestID: requestID, Stage: "router-intent-retry", Prompt: retryText, Text: retryRes.Text, Reasoning: retryRes.Reasoning, Events: retryRes.Events, Err: retryErr})
 			if retryErr == nil && retryRes.ConversationID != "" {
@@ -2704,7 +2721,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 	// Recover natural-language tool intent in native mode, and repair any
 	// structured event that failed the declared-name/schema boundary.
 	if (planningMode == "native" || invalidDetectedTool) && len(toolMaps) > 0 && fmt.Sprint(body.ToolChoice) != "none" {
-		routePrompt := modelToolRouterPrompt(routerPromptMessages(body.Messages)+"\n"+ledger.RouterContext(), toolMaps, body.ToolChoice)
+		routePrompt := modelToolRouterPrompt(routerEvidence(), toolMaps, body.ToolChoice)
 		routeRes, routeErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: routePrompt, Tone: tone, Attachments: body.Attachments, ToolsDeclared: true, SchemasInText: true})
 		recordRouterFrames(routerFrameInput{RequestID: requestID, Stage: "native-recovery", Prompt: routePrompt, Text: routeRes.Text, Reasoning: routeRes.Reasoning, Events: routeRes.Events, Err: routeErr})
 		if routeErr == nil {

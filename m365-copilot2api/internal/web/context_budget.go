@@ -41,26 +41,29 @@ const toolResultPromptLimit = ledgerResultLimit
 // them accounted without pricing a 200KB base64 blob as 50000 prompt tokens.
 const attachmentTokenCost = 1024
 
-// sendableContentText returns the text the send path would actually emit for
-// this message. It deliberately reuses parseContent and compactToolResult --
-// the very functions flattenPromptMessages calls -- so the estimate cannot
-// drift from the prompt.
-func sendableContentText(message oaiMsg) (string, int) {
+// sendableContentTextWithToolNames shares parsing, Read gutter rendering and
+// truncation with flattenPromptMessages. A preceding assistant call supplies
+// the identity that a tool result itself often omits.
+func sendableContentTextWithToolNames(message oaiMsg, names map[string]string) (string, int) {
 	text, attachments := parseContent(message.Content)
 	if strings.EqualFold(strings.TrimSpace(message.Role), "tool") {
-		text = compactToolResult(text, toolResultPromptLimit)
+		text = promptToolResult(toolResultName(message, names), text, attachments)
 	}
 	return text, len(attachments)
 }
 
 func messageTokenCost(message oaiMsg, model string) int {
+	return messageTokenCostWithToolNames(message, model, nil)
+}
+
+func messageTokenCostWithToolNames(message oaiMsg, model string, names map[string]string) int {
 	count, _ := tokenEstimator(model)
 	cost := messageProtocolTokens + count(strings.TrimSpace(message.Role))
-	text, attachments := sendableContentText(message)
+	text, attachments := sendableContentTextWithToolNames(message, names)
 	cost += count(text) + attachments*attachmentTokenCost
 	cost += count(message.Name)
 	cost += count(message.ToolCallID)
-	for _, call := range message.ToolCalls {
+	for _, call := range promptToolCalls(message.ToolCalls) {
 		cost += serializedTokenCount(call, count)
 	}
 	return cost
@@ -97,7 +100,9 @@ type messageGroup struct {
 // assistant/tool messages form one evictable group.
 func messageGroups(messages []oaiMsg, model string) (instructions []oaiMsg, groups []messageGroup) {
 	var current *messageGroup
+	names := make(map[string]string)
 	for _, message := range messages {
+		recordToolCallNames(names, message)
 		if isInstructionRole(message.Role) {
 			instructions = append(instructions, message)
 			continue
@@ -107,7 +112,7 @@ func messageGroups(messages []oaiMsg, model string) (instructions []oaiMsg, grou
 			current = &groups[len(groups)-1]
 		}
 		current.messages = append(current.messages, message)
-		current.cost += messageTokenCost(message, model)
+		current.cost += messageTokenCostWithToolNames(message, model, names)
 	}
 	return instructions, groups
 }

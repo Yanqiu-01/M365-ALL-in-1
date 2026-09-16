@@ -38,8 +38,9 @@ func (s *Server) anthropicCountTokens(w http.ResponseWriter, r *http.Request) {
 	}
 
 	total := 0
+	names := toolCallNames(o.Messages)
 	for _, m := range o.Messages {
-		total += messageTokenCost(m, body.Model)
+		total += messageTokenCostWithToolNames(m, body.Model, names)
 	}
 	// Tool schemas are part of the input the model has to read, so a count that
 	// omitted them would let a client fill the window with history and then be

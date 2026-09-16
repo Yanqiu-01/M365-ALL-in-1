@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"runtime"
 	"strings"
+
+	"m365-copilot2api/internal/chathub"
 )
 
 func modelToolRouterPrompt(prompt string, tools []map[string]any, choice any) string {
@@ -48,7 +50,7 @@ func modelToolRouterPrompt(prompt string, tools []map[string]any, choice any) st
 	if strings.Contains(prompt, "tool_calls]") || strings.Contains(prompt, "[tool result id=") ||
 		strings.Contains(prompt, "tool_calls:") || strings.Contains(prompt, "tool[call_") {
 		rules += `
-- Completed evidence must not be repeated: [role tool_calls] and [tool result id=...] rows are prior results already delivered to the user, never re-invoke them
+- Completed evidence must not be repeated: [role tool_calls] and [tool result id=...] rows record prior actions. Successful mutating calls with identical arguments are complete. A failed Edit is not completed work; a fresh Read after an edit failure or file change is unfinished work
 - Only start a new tool call when fresh unfinished work remains on the current request`
 	}
 	if name := requestedToolChoiceName(choice); name != "" {
@@ -75,7 +77,7 @@ func modelToolRouterPrompt(prompt string, tools []map[string]any, choice any) st
 	// POSIX shell 工具的裸路径又会被吃掉反斜杠（grep 报无结果）。网关侧已有
 	// 兜底（json_salvage.go），但源头写对就完全不触发。与 Transit note 同理，
 	// 路由轮不经过 runtimeWorkspaceInstruction，所以这条规则要单独带上。
-	routerTransitNote += windowsPathRouterNote()
+	routerTransitNote += windowsPathRouterNote() + "\n" + chathub.FileEditProtocolNote + "\n"
 	return fmt.Sprintf(`You are a tool selection assistant. Based on the user request, decide which tool to call next.
 %s
 Available tools: %s
@@ -133,7 +135,6 @@ func lastToolDirectiveIndex(text string) int {
 		}
 	}
 }
-
 
 // parseModelToolDecision 抽取模型的路由决策。
 //

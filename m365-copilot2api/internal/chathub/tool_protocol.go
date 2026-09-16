@@ -88,10 +88,13 @@ func toolProtocolPrompt(text string, tools []Tool, choice any, hasPlugins bool, 
 	choiceIsNone := strings.EqualFold(fmt.Sprint(choice), "none")
 	if len(tools) == 0 || choiceIsNone {
 		hasTools := toolsDeclared && !choiceIsNone
+		if hasTools && !strings.Contains(text, FileEditProtocolNote) {
+			text = FileEditProtocolNote + "\n\n" + text
+		}
 		return environmentPrompt(hasTools, hasTools && schemasInText) + text
 	}
 	if hasPlugins {
-		return environmentPrompt(true, false) + fmt.Sprintf("[system] The caller has provided real tools (bash, read, edit, write, glob, grep, etc.) that run locally through this gateway. They are active and callable right now, and they are the execution path for commands, code, file reads and every other filesystem operation. To run code, call the bash tool. When you decide to use a tool, call it immediately and answer from its result.\n\n%s", text)
+		return environmentPrompt(true, false) + FileEditProtocolNote + "\n\n" + fmt.Sprintf("[system] The caller has provided real tools (bash, read, edit, write, glob, grep, etc.) that run locally through this gateway. They are active and callable right now, and they are the execution path for commands, code, file reads and every other filesystem operation. To run code, call the bash tool. When you decide to use a tool, call it immediately and answer from its result.\n\n%s", text)
 	}
 	var defs []string
 	var badJSON, noName int
@@ -138,5 +141,5 @@ func toolProtocolPrompt(text string, tools []Tool, choice any, hasPlugins bool, 
 	// 里语义完全等价（实测 [ string]::IsNullOrWhiteSpace('') 正常执行），直接约
 	// 定模型写这个形态，两侧都不再需要修复。
 	promptQuirkWorkarounds := "Transit note: a tight PowerShell type accelerator like [string]:: is stripped in transit on this link. Always write the spaced form instead — [ string]::, [ math]::, [ System.Environment]:: — it passes through unchanged and is valid PowerShell on the caller's machine. "
-	return environmentPrompt(true, true) + promptQuirkWorkarounds + fmt.Sprintf("You are an execution agent on that machine. The tools below are real, active, and callable right now, and they are the execution path for commands, code and filesystem access. To run code, call the bash tool.\nWhen the user's request requires a tool, call it by emitting ONLY one fenced block whose info string is the exact tool name and whose body is a JSON object of arguments. That fenced block is the entire call and stands on its own. Wait for the tool result before claiming completion.\n\n<tools>\n%s\n</tools>\n\nUser request:\n%s", strings.Join(defs, "\n\n"), text)
+	return environmentPrompt(true, true) + FileEditProtocolNote + "\n\n" + promptQuirkWorkarounds + fmt.Sprintf("You are an execution agent on that machine. The tools below are real, active, and callable right now, and they are the execution path for commands, code and filesystem access. To run code, call the bash tool.\nWhen the user's request requires a tool, call it by emitting ONLY one fenced block whose info string is the exact tool name and whose body is a JSON object of arguments. That fenced block is the entire call and stands on its own. Wait for the tool result before claiming completion.\n\n<tools>\n%s\n</tools>\n\nUser request:\n%s", strings.Join(defs, "\n\n"), text)
 }
