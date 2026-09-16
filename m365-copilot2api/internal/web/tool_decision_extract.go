@@ -669,6 +669,7 @@ var (
 		"FromMinutes":        "[System.TimeSpan]::",
 		"IsMatch":            "[System.Text.RegularExpressions.Regex]::",
 		"Escape":             "[System.Text.RegularExpressions.Regex]::",
+		"Replace":            "[regex]::",
 	}
 )
 

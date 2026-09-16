@@ -63,6 +63,18 @@ func TestPowerShellCommandRepairSelectDecision(t *testing.T) {
 	}
 }
 
+func TestPowerShellCommandRepairRestoresRegexReplace(t *testing.T) {
+	tools := powerShellRepairTools("PowerShell")
+	command := "$content=:Replace($content, ''(?s)<Row title=\"Theme Mode\".*?<Row title=\"纸张底色\"'', $replacement)"
+	calls, ok := selectDecision([]toolCandidate{{Name: "PowerShell", Args: map[string]any{"command": command}}}, tools, "auto")
+	if !ok || len(calls) != 1 {
+		t.Fatalf("selectDecision: ok=%v calls=%+v", ok, calls)
+	}
+	want := "$content=[regex]::Replace($content, ''(?s)<Row title=\"Theme Mode\".*?<Row title=\"纸张底色\"'', $replacement)"
+	if got := decodedCommand(t, calls[0]); got != want {
+		t.Fatalf("command=%q, want %q", got, want)
+	}
+}
 func TestPowerShellCommandRepairSelectAllValid(t *testing.T) {
 	tools := powerShellRepairTools("powershell")
 	candidates := []toolCandidate{
