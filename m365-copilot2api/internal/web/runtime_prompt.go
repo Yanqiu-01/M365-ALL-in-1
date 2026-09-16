@@ -2,7 +2,6 @@ package web
 
 import (
 	"fmt"
-	"os"
 	"runtime"
 	"strings"
 )
@@ -19,10 +18,6 @@ const runtimeWorkspaceMarker = "M365-gateway-runtime"
 // 这条提示是给所有协议入口的（OpenAI / Responses / Anthropic 最终都进
 // openaiChat）。custom exec 另有一条更严的约束,见 protocol_compat.go。
 func runtimeWorkspaceInstruction() string {
-	cwd, err := os.Getwd()
-	if err != nil || strings.TrimSpace(cwd) == "" {
-		cwd = "(unavailable — run the working-directory probe below before touching files)"
-	}
 	return fmt.Sprintf(`[%s]
 You are running through the M365 Copilot2API gateway, which executes on the user's own machine: a real computer with a real filesystem.
 
@@ -35,9 +30,9 @@ If a specific tool you want is not offered in this request, say which one you ne
 ## This machine
 
 %s
-Working directory: %s
+The caller's tool session has its own working directory. That directory is not this gateway process's launch folder, and it is not automatically the project being edited. After each shell call the session may reset to the caller's default directory.
 
-Paths here look like the working directory above — not like a Linux container path. Use paths relative to that directory, or absolute paths in the form shown above.
+Use absolute paths for files, cd, npm, git, and package-manager commands. Relative npm/git commands belong in the target project, not in whatever directory the shell happens to open in. If a declared shell tool has a working_directory / workdir / cwd argument, set it to the target project; a leading cd in the command is not enough by itself.
 
 ## Before you write
 
@@ -49,14 +44,13 @@ Read a file before overwriting it. State a file as created, modified, or verifie
 
 ## One clarification about uploaded files
 
-If a conversation ever references %s, that is where Microsoft 365 keeps files a user uploaded to Copilot's own service. It is unrelated to this machine and does not exist here. The working directory above is the only project root.
+If a conversation ever references %s, that is where Microsoft 365 keeps files a user uploaded to Copilot's own service. It is unrelated to this machine and does not exist here. The project being edited is the one named in the user's request or in the latest successful Read/Edit path, never this gateway's launch folder.
 
 ## Tool etiquette
 
 Do not offer Microsoft 365 or Copilot native tools as a substitute for the caller's local tools. The caller's tools are the ones that can actually see and change this machine.`,
 		runtimeWorkspaceMarker,
 		describeRuntimeHost(runtime.GOOS, runtime.GOARCH),
-		cwd,
 		probeInstructions(runtime.GOOS),
 		uploadedFilesPath(),
 	)

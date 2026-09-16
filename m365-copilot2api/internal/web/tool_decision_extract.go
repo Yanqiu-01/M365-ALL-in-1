@@ -692,7 +692,7 @@ func repairPowerShellArguments(name string, args map[string]any) map[string]any 
 	if !ok || command == "" {
 		return args
 	}
-	repaired := command
+	repaired := pinRelativeNpmToCommandDirectory(command)
 	for method, accelerator := range powerShellEatenAccelerators {
 		if accelerator == "" {
 			continue // 属性型（MaxValue/MinValue）暂不恢复：吃法未实测确认。
@@ -713,6 +713,188 @@ func repairPowerShellArguments(name string, args map[string]any) map[string]any 
 	}
 	clone["command"] = repaired
 	return clone
+}
+
+// pinRelativeNpmToCommandDirectory keeps npm from inheriting the caller's
+// reset shell cwd. Claude Code reports "Shell cwd was reset to ..." after each
+// tool call, so a later "npm run ..." looks for package.json in the gateway
+// launch folder. If the command already cds into a project, rewrite a relative
+// npm invocation to --prefix <that directory>. Absolute --prefix/--cwd and
+// npm -C stay untouched.
+func pinRelativeNpmToCommandDirectory(command string) string {
+	dir := commandChangeDirectory(command)
+	if dir == "" {
+		return command
+	}
+	return rewriteRelativeNpm(command, dir)
+}
+
+func commandChangeDirectory(command string) string {
+	lower := strings.ToLower(command)
+	markers := []string{"cd ", "set-location ", "push-location "}
+	best := -1
+	kind := ""
+	for _, marker := range markers {
+		idx := strings.LastIndex(lower, marker)
+		if idx > best {
+			best, kind = idx, marker
+		}
+	}
+	if best < 0 {
+		return ""
+	}
+	rest := strings.TrimSpace(command[best+len(kind):])
+	if rest == "" {
+		return ""
+	}
+	if end := indexCommandSeparator(rest); end >= 0 {
+		rest = rest[:end]
+	}
+	dir, _ := splitPowerShellToken(rest)
+	dir = strings.Trim(dir, `"'`)
+	dir = strings.TrimSpace(dir)
+	if dir == "" || dir == "." || dir == ".." {
+		return ""
+	}
+	if looksLikeAbsolutePath(dir) || strings.ContainsAny(dir, `/\`) {
+		return dir
+	}
+	return ""
+}
+
+func indexCommandSeparator(command string) int {
+	for i := 0; i < len(command); i++ {
+		switch command[i] {
+		case ';', '|', '&', '\n', '\r':
+			return i
+		}
+	}
+	return -1
+}
+func splitPowerShellToken(rest string) (string, string) {
+	rest = strings.TrimLeft(rest, " \t")
+	if rest == "" {
+		return "", ""
+	}
+	if rest[0] == '\'' || rest[0] == '"' {
+		quote := rest[0]
+		for i := 1; i < len(rest); i++ {
+			if rest[i] == quote {
+				return rest[:i+1], rest[i+1:]
+			}
+		}
+		return rest, ""
+	}
+	for i := 0; i < len(rest); i++ {
+		switch rest[i] {
+		case ' ', '\t', ';', '|', '&', '\n', '\r':
+			return rest[:i], rest[i:]
+		}
+	}
+	return rest, ""
+}
+
+func looksLikeAbsolutePath(path string) bool {
+	if path == "" {
+		return false
+	}
+	if strings.HasPrefix(path, `\\`) || strings.HasPrefix(path, "//") {
+		return true
+	}
+	if len(path) >= 3 && path[1] == ':' && (path[2] == '\\' || path[2] == '/') {
+		c := path[0]
+		return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+	}
+	return false
+}
+
+func rewriteRelativeNpm(command, dir string) string {
+	lower := strings.ToLower(command)
+	var out strings.Builder
+	out.Grow(len(command) + len(dir) + 16)
+	i := 0
+	changed := false
+	for i < len(command) {
+		idx := strings.Index(lower[i:], "npm")
+		if idx < 0 {
+			out.WriteString(command[i:])
+			break
+		}
+		idx += i
+		if !npmTokenStart(command, idx) {
+			out.WriteString(command[i : idx+3])
+			i = idx + 3
+			continue
+		}
+		rest := command[idx+3:]
+		trimmed := strings.TrimLeft(rest, " \t")
+		if !npmSubcommand(trimmed) || npmHasExplicitPrefix(trimmed) {
+			out.WriteString(command[i : idx+3])
+			i = idx + 3
+			continue
+		}
+		out.WriteString(command[i:idx])
+		out.WriteString("npm --prefix ")
+		out.WriteString(quotePowerShellPath(dir))
+		out.WriteByte(' ')
+		out.WriteString(trimmed)
+		changed = true
+		i = len(command)
+	}
+	if !changed {
+		return command
+	}
+	return out.String()
+}
+
+func npmTokenStart(command string, idx int) bool {
+	if idx > 0 {
+		prev := command[idx-1]
+		if isIdentByte(prev) || prev == '-' || prev == '.' || prev == '\\' || prev == '/' {
+			return false
+		}
+	}
+	if idx+3 < len(command) {
+		next := command[idx+3]
+		if isIdentByte(next) || next == '-' || next == '.' {
+			return false
+		}
+	}
+	return true
+}
+
+func npmSubcommand(rest string) bool {
+	rest = strings.TrimLeft(rest, " \t")
+	if rest == "" {
+		return false
+	}
+	cmd, _ := splitPowerShellToken(rest)
+	cmd = strings.ToLower(strings.Trim(cmd, `"'`))
+	switch cmd {
+	case "run", "test", "start", "ci", "install", "i", "pack", "publish", "exec", "run-script":
+		return true
+	default:
+		return false
+	}
+}
+
+func npmHasExplicitPrefix(rest string) bool {
+	fields := strings.Fields(rest)
+	for i := 0; i < len(fields); i++ {
+		f := strings.ToLower(strings.Trim(fields[i], `"'`))
+		switch {
+		case f == "--prefix" || f == "--cwd" || f == "-c" || strings.HasPrefix(f, "--prefix=") || strings.HasPrefix(f, "--cwd="):
+			return true
+		}
+	}
+	return false
+}
+
+func quotePowerShellPath(path string) string {
+	if strings.ContainsAny(path, " \t;'\"") {
+		return "'" + strings.ReplaceAll(path, "'", "''") + "'"
+	}
+	return path
 }
 
 // restoreEatenAccelerator 把 command 里「:Method(」残迹恢复成

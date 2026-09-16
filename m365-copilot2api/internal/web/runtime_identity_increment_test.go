@@ -23,7 +23,7 @@ func TestAttachRuntimeIdentityToIncrementRestoresTheMarker(t *testing.T) {
 	}
 	// GOOS-specific host text is asserted in runtime_prompt_test.go; here it is
 	// enough that the re-attached block still states where the model is.
-	if !strings.Contains(got, "Working directory:") {
+	if !strings.Contains(got, "launch folder") {
 		t.Errorf("the re-attached block does not say where execution happens:\n%s", got)
 	}
 }

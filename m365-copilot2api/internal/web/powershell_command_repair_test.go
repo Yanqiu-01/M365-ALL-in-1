@@ -75,6 +75,23 @@ func TestPowerShellCommandRepairRestoresRegexReplace(t *testing.T) {
 		t.Fatalf("command=%q, want %q", got, want)
 	}
 }
+
+func TestPowerShellPinsRelativeNpmToCdDirectory(t *testing.T) {
+	command := "cd E:\\download\\Oh_my_pi\\oh-my-pi\\packages\\desktop; npm run check:types"
+	got := repairPowerShellArguments("PowerShell", map[string]any{"command": command})["command"].(string)
+	want := "cd E:\\download\\Oh_my_pi\\oh-my-pi\\packages\\desktop; npm --prefix E:\\download\\Oh_my_pi\\oh-my-pi\\packages\\desktop run check:types"
+	if got != want {
+		t.Fatalf("command=%q, want %q", got, want)
+	}
+}
+
+func TestPowerShellLeavesPrefixedNpmUnchanged(t *testing.T) {
+	command := "cd E:\\download\\Oh_my_pi\\oh-my-pi; npm --prefix packages/desktop run check:types"
+	got := repairPowerShellArguments("PowerShell", map[string]any{"command": command})["command"].(string)
+	if got != command {
+		t.Fatalf("prefixed npm changed: %q", got)
+	}
+}
 func TestPowerShellCommandRepairSelectAllValid(t *testing.T) {
 	tools := powerShellRepairTools("powershell")
 	candidates := []toolCandidate{
