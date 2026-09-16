@@ -65,3 +65,44 @@ func TestRootPageServesIndexForLoginAsOriginalAPK(t *testing.T) {
 		}
 	}
 }
+
+func TestWebAssetPathPrefersExecutableDirectoryOverProcessCwd(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+		exe = resolved
+	}
+	webDir := filepath.Join(filepath.Dir(exe), "web")
+	if err := os.MkdirAll(webDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	want := []byte("from-exe")
+	path := filepath.Join(webDir, "index.html")
+	if err := os.WriteFile(path, want, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Remove(path) })
+
+	cwd := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(cwd, "web"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cwd, "web", "index.html"), []byte("from-cwd"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	old, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(cwd); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(old) })
+
+	got := webAssetPath("index.html")
+	if got != path {
+		t.Fatalf("webAssetPath= %q, want executable-adjacent %q", got, path)
+	}
+}

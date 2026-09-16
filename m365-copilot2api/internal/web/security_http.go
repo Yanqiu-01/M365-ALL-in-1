@@ -3,8 +3,24 @@ package web
 import (
 	"net/http"
 	"os"
+	"path/filepath"
 )
 
+func webAssetPath(name string) string {
+	candidates := []string{filepath.Join("web", name)}
+	if exe, err := os.Executable(); err == nil {
+		if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+			exe = resolved
+		}
+		candidates = append([]string{filepath.Join(filepath.Dir(exe), "web", name)}, candidates...)
+	}
+	for _, path := range candidates {
+		if _, err := os.Stat(path); err == nil {
+			return path
+		}
+	}
+	return candidates[0]
+}
 func securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -36,7 +52,7 @@ func (s *Server) rootPage(w http.ResponseWriter, r *http.Request) {
 	// 与 APK 原始行为无关，属有意扩展。Content-Type 必须显式声明，否则浏览器
 	// 不会把响应识别为图标。
 	if r.URL.Path == "/favicon.ico" && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
-		f, err := os.Open("web/favicon.ico")
+		f, err := os.Open(webAssetPath("favicon.ico"))
 		if err != nil {
 			http.NotFound(w, r)
 			return
@@ -58,16 +74,16 @@ func (s *Server) rootPage(w http.ResponseWriter, r *http.Request) {
 		// 字节）：登录态由前端 JS 依据 /api/admin/session 切换，没有独立的
 		// 登录页路由。上游那句 name = "login.html" 的分支在二开版里已被删除，
 		// 恢复时误将其带回，导致 /login 只返回 10611 字节的空壳页面。
-		name = "web/index.html"
+		name = webAssetPath("index.html")
 	case "/workbench":
 		// 本次按用户明确要求新增的「仅聊天」前端工作台，与 APK 原始行为无关：
 		// APK rodata 只有 "web/index.html"，不存在 workbench.html，原版 GET
 		// /workbench 应为 404。此分支属于有意的功能扩展，不是上文所述那类凭空
 		// 复原出的虚构路由，请勿按「APK 无此路径」为由直接删除。
-		name = "web/workbench.html"
+		name = webAssetPath("workbench.html")
 	case "/panel":
 		// 一体化控制面板入口。该页面仍由管理员中间件保护,不加入鉴权豁免。
-		name = "web/panel.html"
+		name = webAssetPath("panel.html")
 	default:
 		http.NotFound(w, r)
 		return
