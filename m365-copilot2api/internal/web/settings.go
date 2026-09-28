@@ -416,24 +416,32 @@ func configuredToolCallLimit(s *settingsStore) int {
 //
 // batchShellCallCount 统计批内 shell 类调用的条数：超过 1 时 shell 部分
 // 串行（只放行首条 shell 调用与全部读类调用），读类照常并发。
+// adaptiveToolCallLimit decides how many calls from a batch can run in parallel.
+//
+// Conservative串行 only when the same tool appears multiple times in one batch,
+// since duplicate invocations of a stateful tool (e.g., multiple bash calls in
+// the same conversation context) might interfere. Different tools, even if both
+// are shell-like, execute independently and can run in parallel.
+//
+// Examples:
+//   - [read, bash, task] → all parallel (3 different tools)
+//   - [bash, bash] → serial (same tool twice)
+//   - [read, read, bash] → limit 1 (read appears twice)
 func adaptiveToolCallLimit(c []detectedToolCall, configured int) int {
 	if len(c) < 2 || configured < 2 {
 		return 1
 	}
-	shellCalls := 0
+	seen := map[string]int{}
 	for _, call := range c {
 		name := strings.ToLower(strings.TrimSpace(call.Name))
-		if toolShellNames[name] {
-			shellCalls++
+		seen[name]++
+	}
+	for _, count := range seen {
+		if count > 1 {
+			return 1
 		}
 	}
-	// 批里全是读类（0 条 shell）：直接放满。
-	// 只有 1 条 shell：它与其余读类互不干扰，放满。
-	// 2 条以上 shell：可能共享会话状态，保守串行。
-	if shellCalls <= 1 {
-		return configured
-	}
-	return 1
+	return configured
 }
 
 // toolShellNames are tool names that can run arbitrary commands, or delegate to

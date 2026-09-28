@@ -1719,6 +1719,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	body.Messages = ensureRuntimeWorkspaceInstruction(body.Messages)
+	body.Messages = normalizeToolHistory(body.Messages)
 	if cleaned, notes := sanitizeToolConversation(body.Messages); len(notes) > 0 {
 		body.Messages = cleaned
 		log.Printf("[req-trace] id=%s stage=tool_history_sanitized drops=%d detail=%v", requestID, len(notes), notes)

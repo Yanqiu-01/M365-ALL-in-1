@@ -123,6 +123,8 @@ func writeAnthropicResult(w http.ResponseWriter, model string, stream bool, src 
 			blockType = t
 		}
 		switch blockType {
+		case "text":
+			startBlock = map[string]any{"type": "text", "text": ""}
 		case "tool_use":
 			startBlock = map[string]any{"type": "tool_use", "id": m["id"], "name": m["name"], "input": map[string]any{}}
 		case "thinking":

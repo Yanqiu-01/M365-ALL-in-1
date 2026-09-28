@@ -99,26 +99,36 @@ func TestOutboundProxySettingValidation(t *testing.T) {
 	}
 }
 
-// 2026-09-08 规则重写后的期望：判定按批内 shell 类调用条数，而不是
-// 「任一可变异工具就整批串行」。见 adaptiveToolCallLimit 的注释。
-func TestAdaptiveToolCallLimitSerializesMultipleShellCalls(t *testing.T) {
+// Adaptive limit now serializes only when the same tool appears multiple times,
+// not when there are multiple different shell tools. This allows bash+task+read
+// to run in parallel, fixing the "one tool at a time" bottleneck.
+func TestAdaptiveToolCallLimitSerializesDuplicateTools(t *testing.T) {
 	calls := []detectedToolCall{{Name: "bash"}, {Name: "bash"}}
 	if got := adaptiveToolCallLimit(calls, 4); got != 1 {
-		t.Fatalf("two shell calls must serialize, got %d", got)
+		t.Fatalf("duplicate bash calls must serialize, got %d", got)
+	}
+	calls = []detectedToolCall{{Name: "read_file"}, {Name: "read_file"}, {Name: "bash"}}
+	if got := adaptiveToolCallLimit(calls, 4); got != 1 {
+		t.Fatalf("duplicate read_file calls must serialize, got %d", got)
+	}
+}
+
+func TestAdaptiveToolCallLimitAllowsDifferentShellTools(t *testing.T) {
+	// bash+task+read are three different tools: all can run in parallel
+	calls := []detectedToolCall{{Name: "bash"}, {Name: "task"}, {Name: "read_file"}}
+	if got := adaptiveToolCallLimit(calls, 4); got != 4 {
+		t.Fatalf("different tools should parallelize, got %d", got)
 	}
 }
 
 func TestAdaptiveToolCallLimitAllowsReadPlusOneShell(t *testing.T) {
-	// read+bash 并行：读类不共享 shell 会话状态，一条 shell 与读类互不干扰。
-	// 旧规则把这条组合串成 1，是「一次只能调用一个工具」的直接原因。
 	calls := []detectedToolCall{{Name: "read_file"}, {Name: "bash"}}
 	if got := adaptiveToolCallLimit(calls, 4); got != 4 {
-		t.Fatalf("read+one-shell should parallelize, got %d", got)
+		t.Fatalf("read+bash should parallelize, got %d", got)
 	}
 }
 
 func TestAdaptiveToolCallLimitAllowsOneSubagentWithReads(t *testing.T) {
-	// task（子组）+ 读类并行：子组调度本身不占 shell 会话。
 	calls := []detectedToolCall{{Name: "task"}, {Name: "read_file"}, {Name: "glob"}}
 	if got := adaptiveToolCallLimit(calls, 4); got != 4 {
 		t.Fatalf("task+reads should parallelize, got %d", got)
