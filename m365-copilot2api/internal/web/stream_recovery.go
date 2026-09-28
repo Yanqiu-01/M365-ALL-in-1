@@ -183,20 +183,24 @@ func (s *Server) streamChatWithRecovery(ctx context.Context, account auth.Accoun
 	var result chathub.Result
 	var reconciler *retryTextReconciler
 	var deliveredEvents streamRecoveryEventLedger
+	var lastErr error
+	excluded := map[string]bool{}
 
 	err := retryUpstream(ctx, "stream-recovery", func(attempt int) error {
 		recovery := attempt > 1
 		if recovery {
-			next, err := s.nextHealthyAccount(current.ID)
+			if !accountFailoverAllowed(ctx) {
+				return lastErr
+			}
+			next, err := s.nextHealthyAccountExcept(excluded)
 			if err != nil {
-				return err
+				return lastErr
 			}
 			current = next
-			request = original
-			request.ConversationID = ""
-			request.SessionID = ""
-			request.Started = true
-			request.Text = original.Text + "\n\n" + streamRecoveryPrompt(delivered.String())
+			request = accountReplayRequest(ctx, original)
+			if delivered.Len() > 0 {
+				request.Text += "\n\n" + streamRecoveryPrompt(delivered.String())
+			}
 			reconciler = &retryTextReconciler{delivered: delivered.String()}
 		}
 
@@ -232,8 +236,16 @@ func (s *Server) streamChatWithRecovery(ctx context.Context, account auth.Accoun
 			return nil
 		})
 		result = res
+		lastErr = err
 		if err != nil {
+			excluded[current.ID] = true
+			if s.accountPool != nil {
+				s.accountPool.MarkFailure(current.ID, err, rateLimitCooldown)
+			}
 			return err
+		}
+		if s.accountPool != nil {
+			s.accountPool.MarkSuccess(current.ID)
 		}
 		if recovery && reconciler != nil {
 			if tail := reconciler.push("", true); tail != "" {

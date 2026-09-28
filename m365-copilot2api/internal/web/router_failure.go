@@ -44,6 +44,9 @@ func classifyRouterFailure(ctx context.Context, err error, toolChoice any) route
 	if clientGone(ctx, err) {
 		return routerFailureAbandon
 	}
+	if ctx != nil && errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return routerFailureFatal
+	}
 	if toolChoiceRequiresToolCall(toolChoice) {
 		return routerFailureFatal
 	}
@@ -64,12 +67,12 @@ func clientGone(ctx context.Context, err error) bool {
 	return errors.Is(err, context.Canceled)
 }
 
-// writeRouterFatal emits the terminal router error, preserving the existing
-// status and message shape so clients that already parse it keep working.
+// writeRouterFatal preserves classified failures instead of hiding all of them
+// behind a router 502. Unknown transport errors retain the router stage label.
 func writeRouterFatal(w http.ResponseWriter, stage string, err error) {
-	msg := upstreamStageError(stage, err)
-	if IsRateLimited(err) {
-		msg = "upstream is rate limiting; try again shortly"
+	if upstreamStatus(err) != http.StatusBadGateway {
+		writeUpstreamError(w, err)
+		return
 	}
-	writeOpenAIError(w, http.StatusBadGateway, "router_error", msg)
+	writeOpenAIError(w, http.StatusBadGateway, "router_error", upstreamStageError(stage, err))
 }

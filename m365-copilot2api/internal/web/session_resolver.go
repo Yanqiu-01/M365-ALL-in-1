@@ -1102,6 +1102,19 @@ func (sr *sessionResolver) ListSessions() []sessionBinding {
 	return out
 }
 
+// retireAccountBinding removes only a stale binding owned by the migrated
+// request. Never delete a binding a concurrent continuation has already moved.
+func (sr *sessionResolver) retireAccountBinding(sessionID, accountID, conversationID string) {
+	sr.mu.Lock()
+	defer sr.mu.Unlock()
+	sess, ok := sr.sessions[sessionID]
+	if !ok || sess.AccountID != accountID || sess.ConversationID != conversationID {
+		return
+	}
+	sr.dropLocked(sessionID, sess)
+	sr.persist.markDirty()
+}
+
 func (sr *sessionResolver) DeleteSession(sessionID string) bool {
 	sr.mu.Lock()
 	defer sr.mu.Unlock()

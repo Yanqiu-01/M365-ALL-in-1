@@ -1,6 +1,7 @@
 package web
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -58,6 +59,12 @@ func writeAccountResolveError(w http.ResponseWriter, err error, errType string) 
 func classifyUpstream(err error) string {
 	if err == nil {
 		return ""
+	}
+	if errors.Is(err, context.Canceled) {
+		return "request canceled"
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "upstream request timed out"
 	}
 	text := strings.ToLower(err.Error())
 	contains := func(needles ...string) bool {
@@ -128,10 +135,19 @@ func upstreamError(err error) string {
 	return "upstream request failed"
 }
 
-// upstreamStatus maps a failed upstream call to the client-visible HTTP status:
-// rate limits stay 429 (with Retry-After when known), auth failures become 401,
-// everything else is 502. Unknown upstream failures must never leak internals.
+// statusClientClosedRequest is the conventional status for a canceled caller,
+// not an upstream failure. It is also used for requests that ended without a body.
+const statusClientClosedRequest = 499
+
+// upstreamStatus keeps cancellation, deadlines, rate limits and auth failures
+// distinct from unknown upstream failures. Transport details stay server-side.
 func upstreamStatus(err error) int {
+	if errors.Is(err, context.Canceled) {
+		return statusClientClosedRequest
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return http.StatusGatewayTimeout
+	}
 	if IsRateLimited(err) {
 		return http.StatusTooManyRequests
 	}
@@ -141,6 +157,21 @@ func upstreamStatus(err error) int {
 	return http.StatusBadGateway
 }
 
+func upstreamStreamErrorCode(err error) string {
+	switch upstreamStatus(err) {
+	case statusClientClosedRequest:
+		return "request_canceled"
+	case http.StatusGatewayTimeout:
+		return "timeout_error"
+	case http.StatusTooManyRequests:
+		return "rate_limit"
+	case http.StatusUnauthorized:
+		return "authentication_error"
+	default:
+		return "upstream_error"
+	}
+}
+
 // writeUpstreamError renders a failed upstream call as an HTTP response,
 // surfacing the Retry-After hint for rate limits so clients can back off.
 func writeUpstreamError(w http.ResponseWriter, err error) {
@@ -148,6 +179,16 @@ func writeUpstreamError(w http.ResponseWriter, err error) {
 		w.Header().Set("Retry-After", fmt.Sprintf("%d", retry))
 	}
 	status := upstreamStatus(err)
+	if status == statusClientClosedRequest {
+		// Keep the cancellation visible to wrappers without writing a response body
+		// to a caller that has already gone away.
+		w.WriteHeader(status)
+		return
+	}
+	if status == http.StatusGatewayTimeout {
+		writeOpenAIError(w, status, "timeout_error", "upstream request timed out")
+		return
+	}
 	if status == http.StatusTooManyRequests {
 		if w.Header().Get("Retry-After") == "" {
 			w.Header().Set("Retry-After", fmt.Sprintf("%d", int(rateLimitCooldown.Seconds())))

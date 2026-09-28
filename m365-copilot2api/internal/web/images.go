@@ -117,10 +117,7 @@ func (s *Server) imageGenerations(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if len(res.Images) == 0 {
-		refusalText := strings.Join([]string{res.Text, res.RawResult}, "\n")
-		if isImageQuotaRefusal(refusalText) {
-			w.Header().Set("Retry-After", "86400")
-			writeOpenAIError(w, http.StatusTooManyRequests, "rate_limit_error", "M365 image generation quota is exhausted; try again later or use another account")
+		if writeImageRefusal(w, res.Text, res.RawResult) {
 			return
 		}
 		textPreview := res.Text
@@ -172,14 +169,14 @@ func (s *Server) imageGenerations(w http.ResponseWriter, r *http.Request) {
 		if designerToken == "" {
 			designerToken, err = s.designerAccessToken(acc)
 			if err != nil {
-				http.Error(w, upstreamError(err), 502)
+				writeUpstreamError(w, err)
 				return
 			}
 		}
 		imageData, contentType, err := downloadDesignerImage(ctx, sourceURL, designerToken)
 		if err != nil {
 			log.Printf("[image-gen-download] err=%v", err)
-			http.Error(w, upstreamError(err), 502)
+			writeUpstreamError(w, err)
 			return
 		}
 		if format == "b64_json" {
@@ -426,6 +423,63 @@ func (s *Server) generatedImageFile(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "private, max-age=300")
 	w.Header().Set("Content-Length", fmt.Sprint(len(item.Data)))
 	_, _ = w.Write(item.Data)
+}
+
+// writeImageRefusal distinguishes an explicit refusal from a missing image. A
+// policy refusal is not a transport failure and must not trigger account retries.
+func writeImageRefusal(w http.ResponseWriter, text, rawResult string) bool {
+	if isImageQuotaRefusal(text + "\n" + rawResult) {
+		w.Header().Set("Retry-After", "86400")
+		writeOpenAIError(w, http.StatusTooManyRequests, "rate_limit_error", "M365 image generation quota is exhausted; try again later or use another account")
+		return true
+	}
+	// Inspect the assistant's answer, not raw metadata that may echo the prompt.
+	if !isImagePolicyRefusal(text) {
+		return false
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusBadRequest)
+	_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{
+		"message": "image generation was declined by the upstream content policy",
+		"type":    "invalid_request_error",
+		"code":    "content_policy_violation",
+	}})
+	return true
+}
+
+func isImagePolicyRefusal(text string) bool {
+	low := strings.ToLower(strings.TrimSpace(text))
+	low = strings.ReplaceAll(low, "’", "'")
+	// Alternative suggestions after the refusal are not evidence for its reason.
+	low = strings.SplitN(low, "\n\n", 2)[0]
+	for _, phrase := range []string{
+		"content_policy_violation", "violates our content policy", "violates the content policy",
+		"blocked by the safety filter", "did not pass the safety check", "failed the safety check",
+		"未能通过安全检查", "未通过安全检查", "违反内容政策", "违反了内容政策",
+	} {
+		if strings.Contains(low, phrase) {
+			return true
+		}
+	}
+	refused := false
+	for _, phrase := range []string{"i can't", "i cannot", "i'm unable", "unable to generate", "不能", "无法", "拒绝"} {
+		if strings.Contains(low, phrase) {
+			refused = true
+			break
+		}
+	}
+	if !refused {
+		return false
+	}
+	for _, reason := range []string{
+		"content policy", "safety policy", "safety guidelines", "sexually explicit", "sexualized", "sexualised", "sexually suggestive",
+		"内容政策", "安全政策", "安全准则", "性暗示", "性化", "色情",
+	} {
+		if strings.Contains(low, reason) {
+			return true
+		}
+	}
+	return false
 }
 
 func isImageQuotaRefusal(text string) bool {

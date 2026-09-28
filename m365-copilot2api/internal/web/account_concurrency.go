@@ -185,16 +185,26 @@ var answerChat = func(ctx context.Context, s *Server, accountID string, account 
 func (s *Server) routerChatWithFailover(ctx context.Context, stage string, acc auth.AccountToken, request chathub.Request) (chathub.Result, auth.AccountToken, error) {
 	current := acc
 	var result chathub.Result
+	var lastErr error
+	excluded := map[string]bool{}
 	err := retryUpstream(ctx, stage, func(attempt int) error {
 		if attempt > 1 {
-			if next, nextErr := s.nextHealthyAccount(current.ID); nextErr == nil {
+			if !accountFailoverAllowed(ctx) {
+				if IsRateLimited(lastErr) || IsAuthFailure(lastErr) {
+					return lastErr
+				}
+			} else if next, nextErr := s.nextHealthyAccountExcept(excluded); nextErr == nil {
 				current = next
+			} else if IsRateLimited(lastErr) || IsAuthFailure(lastErr) {
+				return lastErr
 			}
 		}
 		account := chathub.Account{AccessToken: current.AccessToken, OID: current.OID, TID: current.TID}
 		res, chatErr := routerFailoverChat(ctx, s, current.ID, account, request)
 		result = res
+		lastErr = chatErr
 		if chatErr != nil {
+			excluded[current.ID] = true
 			s.accountPool.MarkFailure(current.ID, chatErr, rateLimitCooldown)
 			return chatErr
 		}

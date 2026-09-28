@@ -130,6 +130,7 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 		})
 		return reasoningEntry
 	}
+	var upstreamStreamError map[string]any
 	scanner := bufio.NewScanner(pr)
 	scanner.Buffer(make([]byte, 4096), 2<<20)
 	for scanner.Scan() {
@@ -137,11 +138,15 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 			return
 		}
 		line := scanner.Text()
-		if !strings.HasPrefix(line, "data: ") || line == "data: [DONE]" {
+		if line == "data: [DONE]" || (!strings.HasPrefix(line, "data: ") && !strings.HasPrefix(line, "{")) {
 			continue
 		}
 		var chunk map[string]any
 		if json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &chunk) != nil {
+			continue
+		}
+		if innerError, ok := chunk["error"].(map[string]any); ok {
+			upstreamStreamError = innerError
 			continue
 		}
 		choices, _ := chunk["choices"].([]any)
@@ -223,16 +228,19 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 	// pr.Close above stays as the guard for the early-return paths.
 	_ = pr.Close()
 	<-innerDone
-	if scanner.Err() != nil || irw.status >= http.StatusBadRequest {
+	if scanner.Err() != nil || irw.status >= http.StatusBadRequest || upstreamStreamError != nil {
 		status := irw.status
-		if status == 0 {
+		if status < http.StatusBadRequest {
 			status = http.StatusBadGateway
+		}
+		if upstreamStreamError == nil {
+			upstreamStreamError = map[string]any{"code": status, "message": "inner chat request failed"}
 		}
 		emit("response.failed", map[string]any{
 			"type": "response.failed",
 			"response": map[string]any{
 				"id": id, "object": "response", "status": "failed", "model": model,
-				"error": map[string]any{"code": status, "message": "inner chat request failed"},
+				"error": upstreamStreamError,
 			},
 		})
 		return
@@ -366,6 +374,7 @@ var innerStatsKey innerStatsKeyType
 // innerStats 承接内层回填的统计量。
 type innerStats struct {
 	CacheTokens int64
+	RetryAfter  string
 }
 
 // withInnerStats 给内部委派请求挂上回填槽。
@@ -408,6 +417,7 @@ func (s *Server) runOpenAIAdapterWithStats(r *http.Request, o oaiReq) (map[strin
 	r2, sink := withInnerStats(r2)
 	rr := httptest.NewRecorder()
 	s.openaiChat(rr, r2)
+	sink.RetryAfter = rr.Header().Get("Retry-After")
 	var out map[string]any
 	err := json.Unmarshal(rr.Body.Bytes(), &out)
 	return out, rr.Body.Bytes(), rr.Code, sink, err
@@ -443,6 +453,13 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	out, raw, status, stats, err := s.runOpenAIAdapterWithStats(r, o)
+	if status == statusClientClosedRequest {
+		w.WriteHeader(status)
+		return
+	}
+	if stats != nil && stats.RetryAfter != "" {
+		w.Header().Set("Retry-After", stats.RetryAfter)
+	}
 	if status >= 400 {
 		writeResponsesError(w, status, "upstream_error", errorMessage(raw, "upstream protocol error"))
 		return
@@ -543,6 +560,13 @@ func (s *Server) anthropicMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	out, raw, status, stats, err := s.runOpenAIAdapterWithStats(r, o)
+	if status == statusClientClosedRequest {
+		w.WriteHeader(status)
+		return
+	}
+	if stats != nil && stats.RetryAfter != "" {
+		w.Header().Set("Retry-After", stats.RetryAfter)
+	}
 	if status >= 400 {
 		writeAnthropicError(w, status, "api_error", errorMessage(raw, "upstream protocol error"))
 		return

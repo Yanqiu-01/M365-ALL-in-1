@@ -1266,25 +1266,9 @@ func (s *Server) resolveAccount(accountID string) (auth.AccountToken, error) {
 	return s.tokens.EnsureValid(accountID)
 }
 
-// nextHealthyAccount returns the next round-robin account that is still
-// healthy, skipping the given id first, and validates its token. Used by the
-// failover path after a rate-limited or auth-failed attempt.
+// nextHealthyAccount validates candidates without returning the failed account.
 func (s *Server) nextHealthyAccount(avoidID string) (auth.AccountToken, error) {
-	probeLimit := len(s.tokens.List())
-	for i := 0; i < probeLimit; i++ {
-		acc, ok := s.tokens.Next()
-		if !ok {
-			return auth.AccountToken{}, fmt.Errorf("no accounts; login first")
-		}
-		if avoidID != "" && acc.ID == avoidID {
-			continue
-		}
-		if !s.accountAvailable(acc.ID) {
-			continue
-		}
-		return s.tokens.EnsureValid(acc.ID)
-	}
-	return auth.AccountToken{}, fmt.Errorf("no healthy account available for failover")
+	return s.nextHealthyAccountExcept(map[string]bool{avoidID: true})
 }
 
 type chatBody struct {
@@ -1781,6 +1765,12 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	binding := &accountBinding{
+		fixed:           strings.TrimSpace(body.AccountID) != "" || body.ConversationID != "" || body.SessionID != "",
+		fullPrompt:      prompt,
+		fullAttachments: append([]chathub.Attachment(nil), body.Attachments...),
+	}
+	r = r.WithContext(context.WithValue(r.Context(), accountBindingKey{}, binding))
 	if body.SessionKey != "" {
 		if v, ok := s.sessions.get(body.SessionKey); ok {
 			body.AccountID = firstNonEmpty(body.AccountID, v.AccountID)
@@ -1799,7 +1789,6 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	// 内容键会话复用：命中后云端对话已存全量历史，只需把客户端新增的
 	// 消息拼成增量 prompt 发送（对齐 DeepSeek 上下文缓存语义）。
 	answerPrompt := prompt
-	resolvedConversationID := ""
 	// Incremental prompt: only send messages beyond what the cloud conversation
 	// already has. Two paths reach this:
 	//   - body.ConversationID was empty → content-key resolver finds the match;
@@ -1831,7 +1820,6 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	if body.ConversationID == "" && len(body.Messages) > 0 {
 		resolved := s.sessionResolver.Resolve(r, &body)
 		if !resolved.IsNew {
-			resolvedConversationID = resolved.ConversationID
 			body.ConversationID = resolved.ConversationID
 			body.SessionID = resolved.SessionID
 			body.AccountID = firstNonEmpty(body.AccountID, resolved.AccountID)
@@ -1855,10 +1843,11 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			log.Printf("[session-resolver] incremental prompt_len=%d (full was %d)", len(answerPrompt), len(prompt))
 		}
 	}
+	binding.accountID, binding.conversationID, binding.sessionID = body.AccountID, body.ConversationID, body.SessionID
 	accountID := body.AccountID
-	acc, err := s.resolveAccount(accountID)
+	acc, err := s.resolveBoundAccount(accountID, binding.fixed)
 	if err != nil {
-		log.Printf("[account-route] resolve failed requested=%q err=%v", accountID, err)
+		log.Printf("[account-route] id=%s source=session fixed=%t action=resolve_failed", requestID, binding.fixed)
 		if isAccountResolveFailure(err) {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
@@ -1866,7 +1855,10 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		writeUpstreamError(w, err)
 		return
 	}
-	log.Printf("[account-route] selected id=%q email=%q token_present=%t oid_present=%t tid_present=%t", acc.ID, acc.Email, acc.AccessToken != "", acc.OID != "", acc.TID != "")
+	if binding.selectAccount(&body, acc.ID) {
+		answerPrompt = binding.fullPrompt
+	}
+	log.Printf("[account-route] id=%s account_hash=%s fixed=%t migrated=%t token_present=%t oid_present=%t tid_present=%t", requestID, accountTraceID(acc.ID), binding.fixed, binding.migrated, acc.AccessToken != "", acc.OID != "", acc.TID != "")
 	if acc.OID == "" || acc.TID == "" {
 		if o, t := extractOIDTID(acc.AccessToken); o != "" {
 			acc.OID, acc.TID = o, t
@@ -1918,6 +1910,8 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		return text
 	}
 	planningMode := s.settings.get().ToolPlanningMode
+	binding.fullPrompt = prompt
+	binding.replayPrompt = buildAnswerRequest(prompt, tone, body, ledger, planningMode).Text
 	var calls []detectedToolCall
 	var parsed bool
 	// routerIntent is the raw heuristic: did the user ask for a concrete action?
@@ -1952,6 +1946,9 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[req-trace] id=%s stage=router_start prompt_len=%d", requestID, len(routePrompt))
 		routeRes, routedAccount, routeErr := s.routerChatWithFailover(ctx, "stream-router", acc, chathub.Request{Text: routePrompt, Tone: tone, Attachments: body.Attachments, ToolsDeclared: true, SchemasInText: true})
 		if routedAccount.ID != "" {
+			if binding.selectAccount(&body, routedAccount.ID) {
+				answerPrompt = binding.fullPrompt
+			}
 			acc = routedAccount
 			account = chathub.Account{AccessToken: acc.AccessToken, OID: acc.OID, TID: acc.TID}
 		}
@@ -2131,6 +2128,9 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		}
 		res, usedAccount, err := s.streamChatWithRecovery(ctx, acc, answerReq, streamEvent)
 		if usedAccount.ID != "" {
+			if binding.selectAccount(&body, usedAccount.ID) {
+				answerPrompt = binding.replayPrompt
+			}
 			acc = usedAccount
 			account = chathub.Account{AccessToken: acc.AccessToken, OID: acc.OID, TID: acc.TID}
 		}
@@ -2149,7 +2149,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				_ = emitText(deferred.String())
 			}
 			_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(streamTruncatedChunk(id, model, progress))+"\n\n")
-			_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(map[string]any{"error": map[string]any{"message": msg, "code": "rate_limit"}})+"\n\n")
+			_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(map[string]any{"error": map[string]any{"message": msg, "code": upstreamStreamErrorCode(err)}})+"\n\n")
 			_ = sseRaw(r.Context(), w, flusher, "data: [DONE]\n\n")
 			return
 		}
@@ -2301,6 +2301,9 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		// previous single-shot 429/401 failover is folded into it.
 		routeRes, routedAccount, routeErr := s.routerChatWithFailover(ctx, "router", acc, chathub.Request{Text: routePrompt, Tone: tone, Attachments: body.Attachments, ToolsDeclared: true, SchemasInText: true})
 		if routedAccount.ID != "" {
+			if binding.selectAccount(&body, routedAccount.ID) {
+				answerPrompt = binding.fullPrompt
+			}
 			acc = routedAccount
 			account = chathub.Account{AccessToken: acc.AccessToken, OID: acc.OID, TID: acc.TID}
 		}
@@ -2523,22 +2526,18 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 			return
 		}
 		res, err = s.chatWithAccountReasoning(ctx, acc.ID, account, answerReq, onDelta, onReasoning)
-		if err != nil && body.AccountID == "" && (body.ConversationID == "" || body.ConversationID == resolvedConversationID) && (IsRateLimited(err) || IsAuthFailure(err)) {
-			// Retry a throttled stream on the next healthy account; the client
-			// has only seen the ": connected" preamble so far, so the retry is
-			// indistinguishable from a fresh request.
+		if err != nil && !binding.fixed && firstDelta && ctx.Err() == nil && (IsRateLimited(err) || IsAuthFailure(err)) {
+			// Only retry before a content/reasoning delta has reached the client.
+			s.accountPool.MarkFailure(acc.ID, err, rateLimitCooldown)
 			next, nerr := s.nextHealthyAccount(acc.ID)
 			if nerr == nil {
-				failoverReq := answerReq
-				if body.ConversationID == resolvedConversationID {
-					failoverReq.ConversationID = ""
-					failoverReq.SessionID = ""
-				}
-				ctx2, cancel2 := context.WithTimeout(r.Context(), time.Duration(s.settings.get().ChatTimeoutSeconds)*time.Second)
-				defer cancel2()
-				if res2, err2 := s.chatWithAccountReasoning(ctx2, next.ID, chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}, failoverReq, onDelta, onReasoning); err2 == nil {
+				failoverReq := accountReplayRequest(ctx, answerReq)
+				if res2, err2 := s.chatWithAccountReasoning(ctx, next.ID, chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}, failoverReq, onDelta, onReasoning); err2 == nil {
 					res = res2
+					binding.selectAccount(&body, next.ID)
 					acc = next
+					account = chathub.Account{AccessToken: acc.AccessToken, OID: acc.OID, TID: acc.TID}
+					answerPrompt = failoverReq.Text
 					err = nil
 				} else {
 					err = err2
@@ -2569,7 +2568,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 			}
 			msg = sanitizePublicInternalText(msg)
 			_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(streamTruncatedChunk(id, model, progress))+"\n\n")
-			_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(map[string]any{"error": map[string]any{"message": msg, "code": "rate_limit"}})+"\n\n")
+			_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(map[string]any{"error": map[string]any{"message": msg, "code": upstreamStreamErrorCode(err)}})+"\n\n")
 		}
 		pt := EstimateTokens(prompt)
 		ct := EstimateTokens(res.Text)
@@ -2618,26 +2617,23 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 				err = nil
 			}
 		}
-		if err != nil && body.AccountID == "" && (body.ConversationID == "" || body.ConversationID == resolvedConversationID) && (IsRateLimited(err) || IsAuthFailure(err)) {
-			// Failover only when nothing pins the request to a conversation or
-			// account; a fresh chat can safely retry on the next healthy account.
+		if err != nil && !binding.fixed && ctx.Err() == nil && (IsRateLimited(err) || IsAuthFailure(err)) {
+			s.accountPool.MarkFailure(acc.ID, err, rateLimitCooldown)
 			next, nerr := s.nextHealthyAccount(acc.ID)
 			if nerr == nil {
-				failoverReq := answerReq
-				if body.ConversationID == resolvedConversationID {
-					failoverReq.ConversationID = ""
-					failoverReq.SessionID = ""
-				}
-				ctx2, cancel2 := context.WithTimeout(r.Context(), time.Duration(s.settings.get().ChatTimeoutSeconds)*time.Second)
-				defer cancel2()
-				res2, err2 := s.chatWithAccount(ctx2, next.ID, chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}, failoverReq)
+				failoverReq := accountReplayRequest(ctx, answerReq)
+				res2, err2 := answerChat(ctx, s, next.ID, chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}, failoverReq)
 				if err2 == nil {
 					res = res2
+					binding.selectAccount(&body, next.ID)
 					acc = next
+					account = chathub.Account{AccessToken: acc.AccessToken, OID: acc.OID, TID: acc.TID}
+					answerPrompt = failoverReq.Text
 					err = nil
 					s.accountPool.MarkSuccess(next.ID)
 				} else {
 					err = err2
+					s.accountPool.MarkFailure(next.ID, err2, rateLimitCooldown)
 				}
 			}
 		}
@@ -2909,6 +2905,13 @@ func (s *Server) bindConversation(acc auth.AccountToken, body *oaiReq, r *http.R
 	})
 	if !emptyConversation {
 		compression := s.sessionResolver.Bind(res.SessionID, res.ConversationID, acc.ID, &historyBody, "", r)
+		if body.SessionKey != "" && s.sessions != nil {
+			s.sessions.upsert(conversation{ID: body.SessionKey, AccountID: acc.ID, ConversationID: res.ConversationID, SessionID: res.SessionID, Title: prompt})
+		}
+		if body.User != "" && s.userSessions != nil {
+			s.userSessions.Put(body.User, res.ConversationID, res.SessionID, acc.ID)
+		}
+		s.finishAccountMigration(r.Context())
 		if compression != nil && s.historyArchive != nil {
 			accountEmail := acc.Email
 			if accountEmail == "" && s.tokens != nil {

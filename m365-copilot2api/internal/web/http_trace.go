@@ -1,7 +1,9 @@
 package web
 
 import (
+	"context"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -90,13 +92,23 @@ func httpTrace(next http.Handler) http.Handler {
 		tw := &traceWriter{ResponseWriter: w}
 		next.ServeHTTP(tw, r)
 		status := tw.status
+		canceled := r.Context().Err() == context.Canceled
 		if status == 0 {
 			status = http.StatusOK
+			if canceled {
+				status = statusClientClosedRequest
+			}
 		}
 		if traceSkip(r.URL.Path, status) {
 			return
 		}
-		log.Printf("[http-trace] id=%s method=%s path=%s status=%d bytes=%d total_ms=%d",
-			requestIDFrom(r), r.Method, r.URL.Path, status, tw.bytes, time.Since(start).Milliseconds())
+		// Host is supplied by the caller; only the server's local address identifies
+		// which listener handled a request when several instances share a log.
+		local := "unknown"
+		if addr, ok := r.Context().Value(http.LocalAddrContextKey).(net.Addr); ok {
+			local = addr.String()
+		}
+		log.Printf("[http-trace] id=%s method=%s path=%s status=%d bytes=%d total_ms=%d local=%q pid=%d canceled=%t",
+			requestIDFrom(r), r.Method, r.URL.Path, status, tw.bytes, time.Since(start).Milliseconds(), local, os.Getpid(), canceled)
 	})
 }
