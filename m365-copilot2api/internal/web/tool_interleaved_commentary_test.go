@@ -112,23 +112,24 @@ func (t *testResponseWriter) Write(b []byte) (int, error) {
 func (t *testResponseWriter) WriteHeader(int) {}
 
 func TestResponsesInputWithInterleavedCommentary(t *testing.T) {
-	input := `[
-		{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "run ls"}]},
-		{"type": "function_call", "call_id": "c1", "name": "exec_command", "arguments": {"command":"ls"}},
-		{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Checking directory."}]},
-		{"type": "function_call_output", "call_id": "c1", "output": "file.txt"}
-	]`
-	req := responsesRequest{Input: json.RawMessage(input)}
+	input := []any{
+		map[string]any{"type": "message", "role": "user", "content": []any{map[string]any{"type": "input_text", "text": "run ls"}}},
+		map[string]any{"type": "function_call", "call_id": "c1", "name": "exec_command", "arguments": map[string]any{"command": "ls"}},
+		map[string]any{"type": "message", "role": "assistant", "content": []any{map[string]any{"type": "output_text", "text": "Checking directory."}}},
+		map[string]any{"type": "function_call_output", "call_id": "c1", "output": "file.txt"},
+	}
+	req := responsesRequest{Input: input}
 	body, err := req.openAI()
 	if err != nil {
 		t.Fatal(err)
 	}
+	body.Messages = normalizeToolHistory(body.Messages)
 	if err := validateToolConversation(body.Messages); err != nil {
 		t.Fatalf("responses input with commentary rejected: %v", err)
 	}
 	foundCommentary := false
 	for _, m := range body.Messages {
-		if m.Role == "assistant" && len(m.ToolCalls) == 0 && strings.Contains(contentToString(m.Content), "Checking") {
+		if m.Role == "assistant" && strings.Contains(contentToString(m.Content), "Checking") {
 			foundCommentary = true
 		}
 	}

@@ -19,23 +19,75 @@ var fencedToolCall = regexp.MustCompile("(?s)```([A-Za-z0-9_-]+)\\s*\\n(.*?)\\n`
 // after the info string, so it cannot see this shape; the router directive
 // parser only looks for CALL_TOOL. This extractor bridges both gaps: any
 // ```Name(args) or ```Name {json} appearing anywhere in text counts as a call.
-var fencedInlineParenCall = regexp.MustCompile("(?s)```([A-Za-z0-9_-]+)[ \t]*(\\([^{}]*(?:\\{.*?\\})?\\)[ \t]*\\n?|\\{.*?\\})[ \t]*\\n?```")
+//
+// 2026-09-28: The original regex used [^{}]* which rejected JSON parameters
+// entirely. Changed to capture the opening delimiter and extract the body manually
+// with balanced brace/paren counting to handle arbitrary JSON nesting.
+var fencedInlineParenCall = regexp.MustCompile("(?s)```([A-Za-z0-9_-]+)[ \t]*([({])")
 
 // fencedInlineCallCandidates returns the (name, argsSpan) pairs that either
 // extractor can see, so callers can deduplicate instead of double-firing.
 func fencedInlineCallCandidates(text string) []struct{ Name, Body string } {
 	var out []struct{ Name, Body string }
-	for _, m := range fencedInlineParenCall.FindAllStringSubmatch(text, -1) {
-		name, body := m[1], strings.TrimSpace(m[2])
-		if strings.HasPrefix(body, "(") {
-			body = strings.TrimSuffix(strings.TrimPrefix(body, "("), ")")
-		}
+	for _, m := range fencedInlineParenCall.FindAllStringSubmatchIndex(text, -1) {
+		name := text[m[2]:m[3]]
+		opener := text[m[4]:m[5]][0]
+
+		// Extract body with balanced brace/paren counting
+		body := extractBalancedBody(text[m[5]:], opener)
 		if body == "" {
 			continue
 		}
 		out = append(out, struct{ Name, Body string }{name, body})
 	}
 	return out
+}
+
+// extractBalancedBody extracts content between balanced delimiters.
+// opener is '(' or '{'. Returns the content INCLUDING the delimiters for '{',
+// and EXCLUDING them for '(' (to unwrap parenthesized JSON like Name({...})).
+func extractBalancedBody(text string, opener byte) string {
+	closer := byte(')')
+	if opener == '{' {
+		closer = '}'
+	}
+
+	depth := 1
+	for i := 0; i < len(text); i++ {
+		ch := text[i]
+		if ch == '\\' && i+1 < len(text) {
+			i++ // skip escaped character
+			continue
+		}
+		if ch == opener {
+			depth++
+		} else if ch == closer {
+			depth--
+			if depth == 0 {
+				// Found matching closer
+				var body string
+				if opener == '{' {
+					// For bare JSON, include the braces
+					body = "{" + strings.TrimSpace(text[:i]) + "}"
+				} else {
+					// For parenthesized calls, unwrap the parens
+					body = strings.TrimSpace(text[:i])
+				}
+
+				// Check for closing ``` after the delimiter
+				remaining := text[i+1:]
+				remaining = strings.TrimSpace(remaining)
+				if strings.HasPrefix(remaining, "```") || remaining == "" {
+					return body
+				}
+				// No closing fence found within reasonable distance
+				if len(remaining) < 20 {
+					return body
+				}
+			}
+		}
+	}
+	return ""
 }
 
 // declaredShell returns the shell-ish tool name the client actually

@@ -19,49 +19,54 @@ import (
 //
 //	assistant: "checking the file" + [tool_call id=X]
 //	tool: result for id=X
+//
+// Important: This ONLY merges assistant messages WITHOUT tool calls into the
+// preceding assistant message WITH tool calls. It does NOT merge multiple
+// assistant messages with tool calls together (parallel call splitting),
+// which should be rejected by validateToolConversation.
 func normalizeToolHistory(messages []oaiMsg) []oaiMsg {
 	out := make([]oaiMsg, 0, len(messages))
-	pendingCalls := []oaiMsg{}
 
 	for i := 0; i < len(messages); i++ {
 		m := messages[i]
 
-		// Accumulate assistant messages with tool calls
+		// Check if this is a tool-call assistant message followed by commentary
 		if m.Role == "assistant" && len(m.ToolCalls) > 0 {
-			pendingCalls = append(pendingCalls, m)
-			continue
-		}
-
-		// If we see an assistant message without calls while holding pending calls,
-		// merge its content into the first pending call
-		if m.Role == "assistant" && len(m.ToolCalls) == 0 && len(pendingCalls) > 0 && messageHasContent(m.Content) {
-			first := pendingCalls[0]
-			if !messageHasContent(first.Content) {
-				first.Content = m.Content
-			} else {
-				first.Content = fmt.Sprintf("%s\n\n%s", contentToString(first.Content), contentToString(m.Content))
-			}
-			if m.ReasoningContent != "" {
-				if first.ReasoningContent == "" {
-					first.ReasoningContent = m.ReasoningContent
-				} else {
-					first.ReasoningContent += "\n\n" + m.ReasoningContent
+			// Look ahead for commentary (assistant messages without tool calls)
+			commentary := []oaiMsg{}
+			j := i + 1
+			for j < len(messages) && messages[j].Role == "assistant" && len(messages[j].ToolCalls) == 0 {
+				if messageHasContent(messages[j].Content) {
+					commentary = append(commentary, messages[j])
 				}
+				j++
 			}
-			pendingCalls[0] = first
-			continue
-		}
 
-		// Flush pending calls when we see a tool result or non-assistant message
-		if len(pendingCalls) > 0 && (m.Role == "tool" || m.Role != "assistant") {
-			out = append(out, pendingCalls...)
-			pendingCalls = nil
+			// If we found commentary, merge it into this tool-call message
+			if len(commentary) > 0 {
+				merged := m
+				for _, c := range commentary {
+					if !messageHasContent(merged.Content) {
+						merged.Content = c.Content
+					} else {
+						merged.Content = fmt.Sprintf("%s\n\n%s", contentToString(merged.Content), contentToString(c.Content))
+					}
+					if c.ReasoningContent != "" {
+						if merged.ReasoningContent == "" {
+							merged.ReasoningContent = c.ReasoningContent
+						} else {
+							merged.ReasoningContent += "\n\n" + c.ReasoningContent
+						}
+					}
+				}
+				out = append(out, merged)
+				i = j - 1 // Skip the merged commentary
+				continue
+			}
 		}
 
 		out = append(out, m)
 	}
 
-	// Flush any remaining calls at the end
-	out = append(out, pendingCalls...)
 	return out
 }

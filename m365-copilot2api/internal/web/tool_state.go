@@ -14,7 +14,7 @@ func validateToolConversation(messages []oaiMsg) error {
 	for i, m := range messages {
 		switch m.Role {
 		case "assistant":
-			if len(m.ToolCalls) == 0 && len(pending) > 0 {
+			if len(pending) > 0 {
 				return fmt.Errorf("tool results missing before assistant message at index %d", i)
 			}
 			for _, call := range m.ToolCalls {
