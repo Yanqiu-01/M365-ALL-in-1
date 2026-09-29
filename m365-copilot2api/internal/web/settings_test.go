@@ -99,17 +99,34 @@ func TestOutboundProxySettingValidation(t *testing.T) {
 	}
 }
 
-// Adaptive limit now serializes only when the same tool appears multiple times,
-// not when there are multiple different shell tools. This allows bash+task+read
-// to run in parallel, fixing the "one tool at a time" bottleneck.
-func TestAdaptiveToolCallLimitSerializesDuplicateTools(t *testing.T) {
-	calls := []detectedToolCall{{Name: "bash"}, {Name: "bash"}}
-	if got := adaptiveToolCallLimit(calls, 4); got != 1 {
-		t.Fatalf("duplicate bash calls must serialize, got %d", got)
+func TestAdaptiveToolCallLimitKeepsSharedShellGuard(t *testing.T) {
+	for _, calls := range [][]detectedToolCall{
+		{{Name: "bash"}, {Name: "Bash"}},
+		{{Name: "shell"}, {Name: "SHELL"}},
+		{{Name: "shell"}, {Name: "bash"}},
+		{{Name: "bash"}, {Name: "powershell"}, {Name: "Task"}},
+	} {
+		if got := adaptiveToolCallLimit(calls, 4); got != 1 {
+			t.Fatalf("multiple session-shell calls must serialize, got %d", got)
+		}
 	}
-	calls = []detectedToolCall{{Name: "read_file"}, {Name: "read_file"}, {Name: "bash"}}
-	if got := adaptiveToolCallLimit(calls, 4); got != 1 {
-		t.Fatalf("duplicate read_file calls must serialize, got %d", got)
+}
+
+func TestAdaptiveToolCallLimitAllowsRepeatedIndependentTools(t *testing.T) {
+	for _, name := range []string{"Task", "Agent", "Workflow", "multi_agent_v1__spawn_agent", "Read", "read_file"} {
+		t.Run(name, func(t *testing.T) {
+			calls := []detectedToolCall{{Name: name}, {Name: name}, {Name: name}}
+			if got := adaptiveToolCallLimit(calls, 32); got != 32 {
+				t.Fatalf("repeated independent %s calls were capped at %d", name, got)
+			}
+		})
+	}
+	calls := []detectedToolCall{{Name: "Read"}, {Name: "Read"}, {Name: "Bash"}, {Name: "Task"}, {Name: "Task"}}
+	if got := adaptiveToolCallLimit(calls, 32); got != 32 {
+		t.Fatalf("independent mixed batch capped at %d", got)
+	}
+	if got := adaptiveToolCallLimit(calls, 1); got != 1 {
+		t.Fatal("configured serial limit ignored")
 	}
 }
 

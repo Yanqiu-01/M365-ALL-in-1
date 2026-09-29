@@ -100,14 +100,32 @@ func (s *Server) nextHealthyAccountExcept(excluded map[string]bool) (auth.Accoun
 	if len(accounts) == 0 {
 		return auth.AccountToken{}, errNoAccounts
 	}
-	// Snapshot candidates once: another concurrent request advancing Store.Next
-	// must not make this request miss a healthy candidate or retry a failed one.
-	var firstErr error
-	for _, account := range accounts {
-		if excluded[account.ID] || !s.accountAvailable(account.ID) {
-			continue
+	// Use the same health-aware scheduler as new requests. The old implementation
+	// scanned the persistent snapshot from index zero, so every refresh failure
+	// concentrated failover on the first healthy accounts in accounts.json.
+	blocked := make(map[string]bool, len(excluded))
+	for id, skip := range excluded {
+		if skip {
+			blocked[id] = true
 		}
-		validated, err := s.tokens.EnsureValid(account.ID)
+	}
+	var firstErr error
+	for attempts := 0; attempts < len(accounts); attempts++ {
+		available := func(id string) bool {
+			return !blocked[id] && s.accountAvailable(id)
+		}
+		var inflight map[string]int
+		if s.accountConcurrency != nil {
+			if snapshot, ok := s.accountConcurrency.Snapshot()["inflight"].(map[string]int); ok {
+				inflight = snapshot
+			}
+		}
+		candidate, ok := s.resourceScheduler.Select(accounts, available, inflight)
+		if !ok {
+			break
+		}
+		blocked[candidate.ID] = true
+		validated, err := s.tokens.EnsureValid(candidate.ID)
 		if err == nil {
 			return validated, nil
 		}

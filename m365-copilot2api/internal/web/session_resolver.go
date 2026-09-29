@@ -410,6 +410,11 @@ func messageTokenSet(msgs []oaiMsg) map[string]bool {
 	var used int64
 	for start > 0 && len(msgs)-start < maxMessages {
 		m := msgs[start-1]
+		// Shared harness instructions identify the client, not its conversation.
+		if m.Role == "system" || m.Role == "developer" {
+			start--
+			continue
+		}
 		messageBytes := int64(len(m.Role) + 1 + len(contentToString(m.Content)))
 		if used+messageBytes > maxBytes {
 			break
@@ -427,6 +432,9 @@ func messageTokenSet(msgs []oaiMsg) map[string]bool {
 	var text strings.Builder
 	text.Grow(int(used))
 	for _, m := range msgs[start:] {
+		if m.Role == "system" || m.Role == "developer" {
+			continue
+		}
 		remaining := maxBytes - int64(text.Len())
 		if remaining <= 1 { // reserve one byte for the separator below
 			break
@@ -547,13 +555,17 @@ func (sr *sessionResolver) Resolve(r *http.Request, body *oaiReq) ResolveResult 
 			sess.LastUsedAt = time.Now().UTC()
 			sr.sessions[explicitID] = sess
 			sr.persist.markDirty()
+			historyLen := 0
+			if sess.ConversationID != "" {
+				historyLen = len(sess.ContextHistory)
+			}
 			return ResolveResult{
 				SessionID:      sess.SessionID,
 				ConversationID: sess.ConversationID,
 				AccountID:      sess.AccountID,
 				MatchedBy:      "explicit",
 				IsNew:          false,
-				HistoryLen:     len(sess.ContextHistory),
+				HistoryLen:     historyLen,
 			}
 		}
 	}
@@ -567,14 +579,33 @@ func (sr *sessionResolver) Resolve(r *http.Request, body *oaiReq) ResolveResult 
 		sess.LastUsedAt = time.Now().UTC()
 		sr.sessions[bestID] = sess
 		sr.persist.markDirty()
+		historyLen := n
+		if sess.ConversationID == "" {
+			// A local-only binding has no cloud history to send an increment to.
+			historyLen = 0
+		}
 		return ResolveResult{
 			SessionID:      sess.SessionID,
 			ConversationID: sess.ConversationID,
 			AccountID:      sess.AccountID,
 			MatchedBy:      fmt.Sprintf("context_prefix_%d", n),
 			IsNew:          false,
-			HistoryLen:     n,
+			HistoryLen:     historyLen,
 		}
+	}
+
+	// Vocabulary overlap alone cannot identify a new conversation. Weak matching
+	// is only a recovery path for requests that actually carry prior answer/tool
+	// history; explicit IDs and exact prefixes above retain their own semantics.
+	hasHistory := false
+	for _, message := range body.Messages {
+		if message.Role == "assistant" || message.Role == "tool" {
+			hasHistory = true
+			break
+		}
+	}
+	if !hasHistory {
+		return ResolveResult{IsNew: true}
 	}
 
 	// 弱约束兜底：内容不构成严格前缀，但与某个历史高度相似（如客户端本地
@@ -616,6 +647,11 @@ func (sr *sessionResolver) Resolve(r *http.Request, body *oaiReq) ResolveResult 
 		if sess.TenantKey != tenantKey {
 			continue
 		}
+		// A tool-only record has a local SessionID but no reusable cloud history.
+		// Keep it for exact/explicit continuation, never as weak account affinity.
+		if sess.ConversationID == "" || (body.AccountID != "" && body.AccountID != sess.AccountID) {
+			continue
+		}
 		score := contextSimilarityCached(sess.ContextHistory, sess.contextTokens, body.Messages, requestTokens)
 		if score < threshold {
 			continue
@@ -639,17 +675,11 @@ func (sr *sessionResolver) Resolve(r *http.Request, body *oaiReq) ResolveResult 
 		if repeatSuffixLen(sess.ContextHistory, body.Messages, sess.contentHashes, nil) > 0 {
 			return ResolveResult{IsNew: true}
 		}
-		// 相似度是弱证据，不足以作为账号切换依据：不得采纳命中会话的
-		// AccountID，只保留当前请求自身解析得到的账号。仅当本请求未带账号
-		// 时才沿用会话记录里的 AccountID，避免把别人的账号贴到当前用户上。
-		resolvedAccountID := body.AccountID
-		if resolvedAccountID == "" {
-			resolvedAccountID = sess.AccountID
-		}
+		// The candidate filter keeps account and cloud IDs from the same binding.
 		return ResolveResult{
 			SessionID:      sess.SessionID,
 			ConversationID: sess.ConversationID,
-			AccountID:      resolvedAccountID,
+			AccountID:      sess.AccountID,
 			MatchedBy:      fmt.Sprintf("context_similar_%.2f", bestScore),
 			IsNew:          false,
 			HistoryLen:     0,

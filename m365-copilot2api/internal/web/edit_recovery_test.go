@@ -150,6 +150,13 @@ func TestEditRecoveryReachesRouterAndNativeHTTPPaths(t *testing.T) {
 						expectedTool = "Edit"
 						args = `{"file_path":"a.ts","old_string":"\told","new_string":"\tnew"}`
 					}
+					selectedTool := expectedTool
+					if !afterRead {
+						// The model ignores the prompt and repeats the failed Edit. The
+						// final response gate must still recover with a declared Read.
+						selectedTool = "Edit"
+						args = string(failedEditCandidate().Arguments)
+					}
 					var tools []chathub.Tool
 					for _, tool := range editRecoveryTools() {
 						tools = append(tools, chathub.Tool{Type: "function", Function: json.RawMessage(mustJSON(tool["function"]))})
@@ -188,9 +195,9 @@ func TestEditRecoveryReachesRouterAndNativeHTTPPaths(t *testing.T) {
 						if !strings.Contains(req.Text, chathub.FileEditProtocolNote) {
 							t.Fatal("router missed JSON-escaping rules")
 						}
-						return chathub.Result{Text: "CALL_TOOL: " + expectedTool + "(" + args + ")"}, nil
+						return chathub.Result{Text: "CALL_TOOL: " + selectedTool + "(" + args + ")"}, nil
 					}
-					output := "```" + expectedTool + "\n" + args + "\n```"
+					output := "```" + selectedTool + "\n" + args + "\n```"
 					answerChat = func(_ context.Context, _ *Server, _ string, _ chathub.Account, req chathub.Request) (chathub.Result, error) {
 						inspect("native", req)
 						return chathub.Result{Text: output}, nil

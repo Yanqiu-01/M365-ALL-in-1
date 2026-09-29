@@ -87,13 +87,13 @@ func TestExtractBalancedBody(t *testing.T) {
 	}{
 		{
 			name:   "simple JSON",
-			text:   `"fork_context":true}`,
+			text:   `"fork_context":true}` + "```",
 			opener: '{',
 			want:   `{"fork_context":true}`,
 		},
 		{
 			name:   "nested braces",
-			text:   `"a":{"b":"c"}}`,
+			text:   `"a":{"b":"c"}}` + "```",
 			opener: '{',
 			want:   `{"a":{"b":"c"}}`,
 		},
@@ -105,9 +105,10 @@ func TestExtractBalancedBody(t *testing.T) {
 		},
 		{
 			name:   "escaped quote",
-			text:   "\"msg\":\"say \\\"hello\\\"\"}",
+			text:   "\"msg\":\"say \\\"hello\\\"\"}```",
 			opener: '{',
-			want:   "{\"msg\":\"say \\\"hello\\\"\"}"		},
+			want:   "{\"msg\":\"say \\\"hello\\\"\"}",
+		},
 	}
 
 	for _, tt := range tests {
@@ -126,4 +127,3 @@ func min(a, b int) int {
 	}
 	return b
 }
-

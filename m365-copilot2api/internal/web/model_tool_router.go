@@ -43,8 +43,8 @@ func modelToolRouterPrompt(prompt string, tools []map[string]any, choice any) st
 	// 子组里再开子组，一层层铺下去，token 与时间双爆（2026-09-08 用户实测
 	// 「子组会无限分发子组」）。约束放在路由契约里：子组的 prompt 参数必须是
 	// 自包含的叶子任务说明——明确告知执行者不要再用子组工具，直接用读/写/
-	// shell 类工具完成。这是提示层约束（无法硬性验证 prompt 内容），配合
-	// 并发限制（一次最多一个 task 调用）兜底。
+	// shell 类工具完成。这里限制的是子组内部递归，不是同一轮启动多个独立子组；
+	// Task/Agent/spawn 同名调用可以并行，不能用截断调用的方式阻止递归。
 	rules += `
 - When you dispatch a task/agent/subagent tool, its prompt must be a self-contained leaf instruction: tell the executor to do the work directly with read/write/shell tools and NOT to dispatch further subagents. Subgroup chains that do not terminate are rejected by the caller.`
 	if strings.Contains(prompt, "tool_calls]") || strings.Contains(prompt, "[tool result id=") ||

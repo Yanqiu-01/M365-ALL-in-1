@@ -95,6 +95,10 @@ func toolResultLooksFailed(name, result string) bool {
 	if trimmed == "" {
 		return false
 	}
+	// This is the client's error envelope, not a word found inside file content.
+	if strings.HasPrefix(strings.ToLower(trimmed), "<tool_use_error>") {
+		return true
+	}
 	// OpenAI clients may return the bare Edit error without Anthropic's
 	// authoritative "Error:" prefix. Keep the ledger consistent with recovery
 	// for stale snapshots and identical replacements as well as not-found.
@@ -563,6 +567,12 @@ func filterCompletedCalls(calls []detectedToolCall, l agentLedger) []detectedToo
 		// !toolLooksObservational 把同一个名字算作「变更」自相矛盾 —— 同一份
 		// 名字在相隔十几行的两处被判成相反的类别。实测症状见
 		// toolCanRepeatSameArguments 的注释（post_ledger=0 静默丢空）。
+		// A failed Edit did not complete the write. The final emission guard
+		// enforces a successful later Read, including mixed candidate batches.
+		if prior.Failed && strings.EqualFold(strings.TrimSpace(c.Name), "Edit") {
+			out = append(out, c)
+			continue
+		}
 		if !toolCanRepeatSameArguments(c.Name) {
 			continue
 		}

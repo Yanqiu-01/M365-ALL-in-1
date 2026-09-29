@@ -42,3 +42,7 @@ conversations.json
 server.exe
 *.log
 *.err
+
+# Python audit runners; live reports belong in the root /_audit-sidecar/.
+__pycache__/
+*.pyc

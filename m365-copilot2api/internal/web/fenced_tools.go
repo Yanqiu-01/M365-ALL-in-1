@@ -8,86 +8,61 @@ import (
 
 var fencedToolCall = regexp.MustCompile("(?s)```([A-Za-z0-9_-]+)\\s*\\n(.*?)\\n```")
 
-// fencedInlineParenCall matches the answer-turn shape where the model opens a
-// fence and puts the tool call in directive form on the SAME line:
-// ```Edit({"file_path":"C:\\x.md","old_string":"a","new_string":"b"})
-// This is not a hypothetical: a live 2026-09-07 continuation turn emitted
-// exactly this for a Chinese-path Edit and the call was delivered as visible
-// prose instead of a tool_use — the client (Claude Code) saw the model "talk
-// about" the edit without performing it, and the follow-up refusal "需要本机的
-// edit 或 write 工具" followed. The canonical fence regex requires a newline
-// after the info string, so it cannot see this shape; the router directive
-// parser only looks for CALL_TOOL. This extractor bridges both gaps: any
-// ```Name(args) or ```Name {json} appearing anywhere in text counts as a call.
-//
-// 2026-09-28: The original regex used [^{}]* which rejected JSON parameters
-// entirely. Changed to capture the opening delimiter and extract the body manually
-// with balanced brace/paren counting to handle arbitrary JSON nesting.
-var fencedInlineParenCall = regexp.MustCompile("(?s)```([A-Za-z0-9_-]+)[ \t]*([({])")
+// Inline calls put the opening delimiter on the same line as the tool name.
+// Find the header with a regexp, then use the shared quote-aware scanner for
+// the body: brackets in JSON strings are data, not call boundaries.
+var fencedInlineParenCall = regexp.MustCompile("```([A-Za-z0-9_-]+)[ \t]*([({])")
 
-// fencedInlineCallCandidates returns the (name, argsSpan) pairs that either
-// extractor can see, so callers can deduplicate instead of double-firing.
 func fencedInlineCallCandidates(text string) []struct{ Name, Body string } {
 	var out []struct{ Name, Body string }
+	consumedUntil := 0
 	for _, m := range fencedInlineParenCall.FindAllStringSubmatchIndex(text, -1) {
-		name := text[m[2]:m[3]]
-		opener := text[m[4]:m[5]][0]
-
-		// Extract body with balanced brace/paren counting
-		body := extractBalancedBody(text[m[5]:], opener)
-		if body == "" {
+		if m[0] < consumedUntil {
+			continue // A quoted example inside another call is not another call.
+		}
+		body, end := inlineFenceBody(text, m[4])
+		if end == 0 {
 			continue
 		}
-		out = append(out, struct{ Name, Body string }{name, body})
+		out = append(out, struct{ Name, Body string }{text[m[2]:m[3]], body})
+		consumedUntil = end
 	}
 	return out
 }
 
-// extractBalancedBody extracts content between balanced delimiters.
-// opener is '(' or '{'. Returns the content INCLUDING the delimiters for '{',
-// and EXCLUDING them for '(' (to unwrap parenthesized JSON like Name({...})).
-func extractBalancedBody(text string, opener byte) string {
+// inlineFenceBody returns a complete argument body and the end of its closing
+// fence. Bare JSON keeps its braces; a parenthesized call drops only the parens.
+// Missing fences or trailing non-whitespace are never executable candidates.
+func inlineFenceBody(text string, open int) (string, int) {
+	if open < 0 || open >= len(text) {
+		return "", 0
+	}
+	opener := text[open]
 	closer := byte(')')
 	if opener == '{' {
 		closer = '}'
+	} else if opener != '(' {
+		return "", 0
 	}
-
-	depth := 1
-	for i := 0; i < len(text); i++ {
-		ch := text[i]
-		if ch == '\\' && i+1 < len(text) {
-			i++ // skip escaped character
-			continue
-		}
-		if ch == opener {
-			depth++
-		} else if ch == closer {
-			depth--
-			if depth == 0 {
-				// Found matching closer
-				var body string
-				if opener == '{' {
-					// For bare JSON, include the braces
-					body = "{" + strings.TrimSpace(text[:i]) + "}"
-				} else {
-					// For parenthesized calls, unwrap the parens
-					body = strings.TrimSpace(text[:i])
-				}
-
-				// Check for closing ``` after the delimiter
-				remaining := text[i+1:]
-				remaining = strings.TrimSpace(remaining)
-				if strings.HasPrefix(remaining, "```") || remaining == "" {
-					return body
-				}
-				// No closing fence found within reasonable distance
-				if len(remaining) < 20 {
-					return body
-				}
-			}
-		}
+	close := balancedSpan(text, open, opener, closer)
+	if close < 0 {
+		return "", 0
 	}
-	return ""
+	remaining := text[close+1:]
+	trimmed := strings.TrimLeft(remaining, " \t\r\n")
+	if !strings.HasPrefix(trimmed, "```") {
+		return "", 0
+	}
+	end := close + 1 + len(remaining) - len(trimmed) + 3
+	if opener == '{' {
+		return text[open : close+1], end
+	}
+	return strings.TrimSpace(text[open+1 : close]), end
+}
+
+func extractBalancedBody(text string, opener byte) string {
+	body, _ := inlineFenceBody(string(opener)+text, 0)
+	return body
 }
 
 // declaredShell returns the shell-ish tool name the client actually

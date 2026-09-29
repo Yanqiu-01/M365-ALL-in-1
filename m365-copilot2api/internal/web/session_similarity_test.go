@@ -160,6 +160,7 @@ func TestResolveSimilarFallbackFormatAndFingerprint(t *testing.T) {
 	sr2 := newResolver()
 	sr2.sessions["s1"] = sessionBinding{
 		SessionID:      "s1",
+		ConversationID: "c1",
 		TenantKey:      "anon",
 		IPFingerprint:  clientIPFingerprint(req("agent/1.0")),
 		ContextHistory: hist,
@@ -175,6 +176,7 @@ func TestResolveSimilarFallbackFormatAndFingerprint(t *testing.T) {
 	r3 := req("agent/1.0")
 	sr3.sessions["s1"] = sessionBinding{
 		SessionID:      "s1",
+		ConversationID: "c1",
 		TenantKey:      "anon",
 		IPFingerprint:  clientIPFingerprint(r3),
 		ContextHistory: hist,
@@ -210,6 +212,7 @@ func TestResolveSimilarThresholdEnvOverride(t *testing.T) {
 		r.Header.Set("User-Agent", "probe/1.0")
 		sr.sessions["s1"] = sessionBinding{
 			SessionID:      "s1",
+			ConversationID: "c1",
 			TenantKey:      "anon",
 			IPFingerprint:  clientIPFingerprint(r),
 			ContextHistory: hist,

@@ -1895,6 +1895,27 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		}
 		return valid, rejected
 	}
+	guard := newEditCallGuard(body.Messages)
+	emitToolCalls := func(id, model string, stream bool, calls *[]detectedToolCall, result chathub.Result) bool {
+		prepared, err := guard.prepare(*calls, toolMaps, body.ToolChoice)
+		if err != nil {
+			failure := map[string]any{"error": map[string]any{"type": "tool_recovery_required", "code": "edit_requires_fresh_read", "message": err.Error()}}
+			log.Printf("[edit-recovery] id=%s action=blocked_unread_edit", requestID)
+			if stream {
+				w.Header().Set("Content-Type", "text/event-stream")
+				flusher, _ := w.(http.Flusher)
+				_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(failure)+"\n\n")
+				_ = sseRaw(r.Context(), w, flusher, "data: [DONE]\n\n")
+			} else {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusConflict)
+				_ = json.NewEncoder(w).Encode(failure)
+			}
+			return false
+		}
+		*calls = prepared
+		return writeToolResponse(w, id, model, stream, prepared, result) == nil
+	}
 	// The failure arrives in this request's tool results, not in the model's
 	// answer. Carry a bounded correction into both routing and answer paths.
 	recovery := editRecoveryInstruction(body.Messages, ledger, toolMaps, body.ToolChoice)
@@ -2000,14 +2021,16 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				calls[i].ID = scopedCallID(calls[i].Name, string(calls[i].Arguments), i, scope)
 			}
 			calls = limitToolCalls(calls, adaptiveToolCallLimit(calls, configuredToolCallLimit(s.settings)))
-			_ = writeToolResponse(w, "chatcmpl-"+uuid.NewString(), firstNonEmpty(body.Model, "m365-copilot"), true, calls, routeRes)
+			if !emitToolCalls("chatcmpl-"+uuid.NewString(), firstNonEmpty(body.Model, "m365-copilot"), true, &calls, routeRes) {
+				return
+			}
 			// 工具轮提前返回：本地轻量登记会话（空 ConversationID），不把
 			// 一次性 router 对话写入 sessionResolver。routeRes 的云端对话
 			// 已由上方的 dropTransientConversation 删除。
 			bindRes := routeRes
 			bindRes.ConversationID = ""
 			bindRes.SessionID = ""
-			s.bindConversation(acc, &body, r, bindRes, answerPrompt, startedAt)
+			s.bindConversation(acc, &body, r, bindRes, answerPrompt, startedAt, calls...)
 			return
 		}
 		if normalizedToolChoiceMode(body.ToolChoice) == "auto" && routerRetry {
@@ -2043,14 +2066,16 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 						retryCalls[i].ID = scopedCallID(retryCalls[i].Name, string(retryCalls[i].Arguments), i, scope)
 					}
 					retryCalls = limitToolCalls(retryCalls, adaptiveToolCallLimit(retryCalls, configuredToolCallLimit(s.settings)))
-					_ = writeToolResponse(w, "chatcmpl-"+uuid.NewString(), firstNonEmpty(body.Model, "m365-copilot"), true, retryCalls, retryRes)
+					if !emitToolCalls("chatcmpl-"+uuid.NewString(), firstNonEmpty(body.Model, "m365-copilot"), true, &retryCalls, retryRes) {
+						return
+					}
 					// 工具轮提前返回：本地轻量登记会话（空 ConversationID），
 					// 不把一次性 router 对话写入 sessionResolver。retryRes
 					// 的云端对话已由上方的 dropTransientConversation 删除。
 					bindRes := retryRes
 					bindRes.ConversationID = ""
 					bindRes.SessionID = ""
-					s.bindConversation(acc, &body, r, bindRes, answerPrompt, startedAt)
+					s.bindConversation(acc, &body, r, bindRes, answerPrompt, startedAt, retryCalls...)
 					return
 				}
 			}
@@ -2197,11 +2222,13 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				return n
 			}())
 			calls = limitToolCalls(calls, adaptiveToolCallLimit(calls, configuredToolCallLimit(s.settings)))
-			_ = writeToolResponse(w, id, model, true, calls, toolResult)
+			if !emitToolCalls(id, model, true, &calls, toolResult) {
+				return
+			}
 			if body.User != "" && res.ConversationID != "" {
 				s.userSessions.Put(body.User, res.ConversationID, res.SessionID, acc.ID)
 			}
-			s.bindConversation(acc, &body, r, res, answerPrompt, startedAt)
+			s.bindConversation(acc, &body, r, res, answerPrompt, startedAt, calls...)
 			return
 		}
 		if err := flushStreamText(&pending, toolMaps, body.ToolChoice, true, sink); err != nil {
@@ -2234,11 +2261,13 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				ejectedRejected := len(ejectedRejectedCalls)
 				if len(ejectedCalls) > 0 {
 					ejectedCalls = limitToolCalls(ejectedCalls, adaptiveToolCallLimit(ejectedCalls, configuredToolCallLimit(s.settings)))
-					_ = writeToolResponse(w, id, model, true, ejectedCalls, corrected)
+					if !emitToolCalls(id, model, true, &ejectedCalls, corrected) {
+						return
+					}
 					if body.User != "" && res.ConversationID != "" {
 						s.userSessions.Put(body.User, res.ConversationID, res.SessionID, acc.ID)
 					}
-					s.bindConversation(acc, &body, r, res, answerPrompt, startedAt)
+					s.bindConversation(acc, &body, r, res, answerPrompt, startedAt, ejectedCalls...)
 					return
 				}
 				// 扣住的那句拒绝作废，换成纠正轮的正文。ejectDelivery 保证
@@ -2366,7 +2395,9 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				calls[i].ID = scopedCallID(calls[i].Name, string(calls[i].Arguments), i, scope)
 			}
 			calls = limitToolCalls(calls, adaptiveToolCallLimit(calls, configuredToolCallLimit(s.settings)))
-			_ = writeToolResponse(w, "chatcmpl-"+uuid.NewString(), firstNonEmpty(body.Model, "m365-copilot"), body.Stream, calls, routeRes)
+			if !emitToolCalls("chatcmpl-"+uuid.NewString(), firstNonEmpty(body.Model, "m365-copilot"), body.Stream, &calls, routeRes) {
+				return
+			}
 			// 非流式工具轮提前返回：本地轻量登记会话（空 ConversationID），
 			// 不把一次性 router 对话写入 sessionResolver。routeRes 的云端
 			// 对话是 router 合成 prompt 走的一次性对话，这里对称地调用
@@ -2378,7 +2409,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			bindRes := routeRes
 			bindRes.ConversationID = ""
 			bindRes.SessionID = ""
-			s.bindConversation(acc, &body, r, bindRes, prompt, startedAt)
+			s.bindConversation(acc, &body, r, bindRes, prompt, startedAt, calls...)
 			return
 		}
 		if len(calls) == 0 && normalizedToolChoiceMode(body.ToolChoice) == "auto" && routerRetry {
@@ -2406,7 +2437,9 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 						calls[i].ID = scopedCallID(calls[i].Name, string(calls[i].Arguments), i, scope)
 					}
 					calls = limitToolCalls(calls, adaptiveToolCallLimit(calls, configuredToolCallLimit(s.settings)))
-					_ = writeToolResponse(w, "chatcmpl-"+uuid.NewString(), firstNonEmpty(body.Model, "m365-copilot"), body.Stream, calls, retryRes)
+					if !emitToolCalls("chatcmpl-"+uuid.NewString(), firstNonEmpty(body.Model, "m365-copilot"), body.Stream, &calls, retryRes) {
+						return
+					}
 					// 非流式 intent-retry 工具轮提前返回：本地轻量登记
 					// 会话（空 ConversationID），不把一次性 router 对话写入
 					// sessionResolver。retryRes 的云端对话已由上方的
@@ -2414,7 +2447,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 					bindRes := retryRes
 					bindRes.ConversationID = ""
 					bindRes.SessionID = ""
-					s.bindConversation(acc, &body, r, bindRes, prompt, startedAt)
+					s.bindConversation(acc, &body, r, bindRes, prompt, startedAt, calls...)
 					return
 				}
 			}
@@ -2442,7 +2475,9 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 						calls[i].ID = scopedCallID(calls[i].Name, string(calls[i].Arguments), i, scope)
 					}
 					calls = limitToolCalls(calls, adaptiveToolCallLimit(calls, configuredToolCallLimit(s.settings)))
-					_ = writeToolResponse(w, "chatcmpl-"+uuid.NewString(), firstNonEmpty(body.Model, "m365-copilot"), body.Stream, calls, retryRes)
+					if !emitToolCalls("chatcmpl-"+uuid.NewString(), firstNonEmpty(body.Model, "m365-copilot"), body.Stream, &calls, retryRes) {
+						return
+					}
 					// 非流式 required-retry 工具轮提前返回：本地轻量登记
 					// 会话（空 ConversationID），不把一次性 router 对话写入
 					// sessionResolver。required-retry 路径上方没有对称的
@@ -2454,7 +2489,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 					bindRes := retryRes
 					bindRes.ConversationID = ""
 					bindRes.SessionID = ""
-					s.bindConversation(acc, &body, r, bindRes, prompt, startedAt)
+					s.bindConversation(acc, &body, r, bindRes, prompt, startedAt, calls...)
 					return
 				}
 			}
@@ -2702,7 +2737,10 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		invalidDetectedTool = len(rejected) > 0
 		if len(calls) > 0 {
 			calls = limitToolCalls(calls, adaptiveToolCallLimit(calls, configuredToolCallLimit(s.settings)))
-			_ = writeToolResponse(w, id, model, body.Stream, calls, res)
+			if !emitToolCalls(id, model, body.Stream, &calls, res) {
+				return
+			}
+			s.bindConversation(acc, &body, r, res, prompt, startedAt, calls...)
 			return
 		}
 	}
@@ -2711,7 +2749,10 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		invalidDetectedTool = invalidDetectedTool || len(rejected) > 0
 		if len(calls) > 0 {
 			calls = limitToolCalls(calls, adaptiveToolCallLimit(calls, configuredToolCallLimit(s.settings)))
-			_ = writeToolResponse(w, id, model, body.Stream, calls, res)
+			if !emitToolCalls(id, model, body.Stream, &calls, res) {
+				return
+			}
+			s.bindConversation(acc, &body, r, res, prompt, startedAt, calls...)
 			return
 		}
 	}
@@ -2736,7 +2777,10 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 					calls[i].ID = scopedCallID(calls[i].Name, string(calls[i].Arguments), i, scope)
 				}
 				calls = limitToolCalls(calls, adaptiveToolCallLimit(calls, configuredToolCallLimit(s.settings)))
-				_ = writeToolResponse(w, id, model, body.Stream, calls, routeRes)
+				if !emitToolCalls(id, model, body.Stream, &calls, routeRes) {
+					return
+				}
+				s.bindConversation(acc, &body, r, res, prompt, startedAt, calls...)
 				return
 			}
 		}
@@ -2896,14 +2940,19 @@ const sessionHeaderName = "X-M365-Session-Id"
 // cacheStats / sink 回填，但跳过 sessionResolver.Bind 与 conversationManager
 // 等任何依赖上游会话 ID 的动作 —— 没有上游会话可绑，写进去反而会让显式路径
 // 或 auto_cleanup 误把一次性 router 对话当成长效会话。
-func (s *Server) bindConversation(acc auth.AccountToken, body *oaiReq, r *http.Request, res chathub.Result, prompt string, startedAt time.Time) {
+func (s *Server) bindConversation(acc auth.AccountToken, body *oaiReq, r *http.Request, res chathub.Result, prompt string, startedAt time.Time, emittedCalls ...detectedToolCall) {
 	emptyConversation := res.ConversationID == ""
 	historyBody := *body
-	historyBody.Messages = append(cloneMessages(body.Messages), oaiMsg{
-		Role:             "assistant",
-		Content:          res.Text,
-		ReasoningContent: res.Reasoning,
-	})
+	assistant := oaiMsg{Role: "assistant", Content: res.Text, ReasoningContent: res.Reasoning}
+	if len(emittedCalls) > 0 {
+		// Store the wire message, not the router's CALL_TOOL prose. The client
+		// echoes these IDs and arguments with tool results on the next request.
+		assistant.Content = nil
+		for _, call := range toolCallMaps(emittedCalls) {
+			assistant.ToolCalls = append(assistant.ToolCalls, call.(map[string]any))
+		}
+	}
+	historyBody.Messages = append(cloneMessages(body.Messages), assistant)
 	if !emptyConversation {
 		compression := s.sessionResolver.Bind(res.SessionID, res.ConversationID, acc.ID, &historyBody, "", r)
 		if body.SessionKey != "" && s.sessions != nil {
@@ -2933,14 +2982,10 @@ func (s *Server) bindConversation(acc auth.AccountToken, body *oaiReq, r *http.R
 			}
 		}
 	} else {
-		// 轻量登记：工具轮的上游对话是一次性 router 对话（已由
-		// dropTransientConversation 删除），不写入 ConversationID。生成
-		// 独立 UUID 作为 SessionID，绕过 Bind 内 explicitID 覆盖分支
-		// （explicitID 仅在 sessionID=="" 时才覆盖），避免与客户端显式
-		// X-M365-Session-Id 串扰。ContextHistory 含 router 决策文本，
-		// 与下一轮回传的 tool_calls 助手消息不构成严格前缀，不会命中
-		// 内容前缀匹配（那会向空对话只发增量、丢失上下文）；但可参与
-		// 相似度兜底，命中时 HistoryLen=0，回答轮发全量到新对话。
+		// Keep a local-only record for explicit/exact-prefix continuation. Its
+		// SessionID is a local UUID, not a reusable cloud session; weak similarity
+		// must not use it to choose an account. A matched local record always
+		// replays full history because the transient router conversation is gone.
 		s.sessionResolver.Bind(uuid.NewString(), "", acc.ID, &historyBody, "", r)
 	}
 

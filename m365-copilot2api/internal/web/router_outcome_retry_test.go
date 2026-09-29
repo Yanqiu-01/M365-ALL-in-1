@@ -10,7 +10,7 @@ import (
 )
 
 // 流式 intent retry 此前一条终局 disposition 都不记：成功时（server.go 的
-// writeToolResponse 之前）没记 emitted_tool_calls，失败落回答路径时也没记
+// emitToolCalls 之前）没记 emitted_tool_calls，失败落回答路径时也没记
 // retry_exhausted。非流式那侧两条都在（intent_retry→emitted_tool_calls、
 // intent_retry→retry_exhausted）。
 //
@@ -58,17 +58,17 @@ func TestStreamIntentRetryRecordsBothTerminalDispositions(t *testing.T) {
 	}
 }
 
-// 成功那条必须记在 writeToolResponse 之前 —— 之后才记就等于「提前 return 掉了
+// 成功那条必须记在 emitToolCalls 之前 —— 之后才记就等于「提前 return 掉了
 // 就不记」，正是原来的形状。
 func TestStreamIntentRetrySuccessIsRecordedBeforeItReturns(t *testing.T) {
 	block := streamRetryBlock(t, serverSource(t))
 	emitted := strings.Index(block, "emitted_tool_calls")
-	write := strings.Index(block, "writeToolResponse(")
+	write := strings.Index(block, "emitToolCalls(")
 	if emitted < 0 || write < 0 {
-		t.Fatalf("emitted_tool_calls=%d writeToolResponse=%d：至少一个不在流式重试块里", emitted, write)
+		t.Fatalf("emitted_tool_calls=%d emitToolCalls=%d：至少一个不在流式重试块里", emitted, write)
 	}
 	if emitted > write {
-		t.Errorf("emitted_tool_calls 记在 writeToolResponse 之后（%d > %d）："+
+		t.Errorf("emitted_tool_calls 记在 emitToolCalls 之后（%d > %d）："+
 			"该分支写完响应就 return，记在后面等于不记", emitted, write)
 	}
 }
