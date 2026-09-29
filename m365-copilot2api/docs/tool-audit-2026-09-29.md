@@ -140,5 +140,41 @@ valid SSE framing must not be represented as proof of token-by-token delivery.
 A second workflow verification attempt could not start because its service did
 not expose the requested model; it supplied no audit evidence either.
 
+## Final deployed verification
+
+- Gateway source revision: `60b8ae117a0e9745c91897753e6c7565cafde543`;
+  built from a clean worktree (`vcs.modified=false`).
+- Deployed executable SHA-256:
+  `0089517caaf809350bad3a178c3e095ce911806c33f43fd79d1438be6ab683a4`.
+- Final live matrix: **24/24 passed**, now including Messages serial mode,
+  all using `gpt-5.6-reasoning` / `max`. Each expected parallel batch returned
+  three structured calls with preserved arguments and distinct IDs.
+- Final temporary-file recovery: **3/3 passed**. Chat, Messages and Responses
+  each emitted Read → Edit → Read, with correct final file bytes. Durations:
+  38.578 s, 32.891 s and 35.015 s respectively.
+- Correlated logs during 2026-09-29 17:53:17–17:58:53 (+08:00) show **11 max / HTTP
+  200 requests per protocol**: eight matrix requests and three recovery turns,
+  33 requests total. Other concurrent traffic in that interval is not counted
+  as this test's traffic. In particular, unrelated xhigh Messages calls also
+  existed; the runner did not issue them.
+- Latency remains variable: the final Messages stream/parallel request took
+  **161.235 s**. The matrix's 300 s client timeout was longer than the initial
+  120 s budget; passing the final matrix does not erase earlier timeouts or
+  establish a latency guarantee. Four timeout diagnostic lines appeared in
+  the shared log window; their ownership is not established by a window count.
+- Frontend, favicon and authenticated model-list checks returned 200 after
+  deployment. A final post-run health snapshot also returned 200; it was not
+  a continuous monitor of that final test window. Earlier monitoring results
+  are recorded separately above.
+- Five Python runner unit tests verify rate-limit stopping, Messages max/serial
+  request construction, and streaming assertions. Rate-limited runners stop
+  queued/new cases rather than silently rotating credentials or retrying.
+
+Raw local measurements are in ignored `_audit-sidecar/audit-20260929/`.
+The repaired workspace contains versioned scripts, tests and this report;
+private runtime files and rollback executables remain outside Git. Documentation
+may advance the branch after the executable's source revision without changing
+its Go code.
+
 No production key, token, account address, private prompt, or executable is
 committed.
