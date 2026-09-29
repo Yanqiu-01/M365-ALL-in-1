@@ -11,10 +11,10 @@ import (
 	"time"
 )
 
-// proxyPoolMutationMu serializes the settings-backed mutations made by this
-// handler. The outbound pool is process-global, and taking a fresh snapshot
-// while an import/delete is committing used to make concurrent edits overwrite
-// each other. Health checks intentionally do not take this lock.
+// proxyPoolMutationMu serializes settings PUTs and the settings-backed mutations
+// made by this handler. The outbound pool is process-global, and taking a fresh
+// snapshot while an import/delete is committing used to make concurrent edits
+// overwrite each other. Health checks intentionally do not take this lock.
 var proxyPoolMutationMu sync.Mutex
 
 // persistProxyPool writes the pool back to settings. It must use the raw URLs:
@@ -234,6 +234,16 @@ func (s *Server) appendProxyPool(candidates []string) (int, error) {
 	for _, raw := range next {
 		seen[proxyPoolRawKey(raw)] = struct{}{}
 	}
+	// A runtime reset must not turn the next add/import into a destructive
+	// replacement of the durable pool. Keep raw credentials, never API views.
+	for _, raw := range s.settings.get().ProxyPool {
+		key := proxyPoolRawKey(raw)
+		if _, exists := seen[key]; key == "" || exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		next = append(next, raw)
+	}
 	added := 0
 	for _, candidate := range candidates {
 		key := proxyPoolRawKey(candidate)
@@ -247,7 +257,7 @@ func (s *Server) appendProxyPool(candidates []string) (int, error) {
 		next = append(next, candidate)
 		added++
 	}
-	if added == 0 {
+	if added == 0 && len(next) == len(previous) {
 		return 0, nil
 	}
 	if err := outbound.ConfigurePool(next); err != nil {

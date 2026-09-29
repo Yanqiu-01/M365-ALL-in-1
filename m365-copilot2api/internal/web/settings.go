@@ -338,6 +338,10 @@ func (s *Server) adminSettings(w http.ResponseWriter, r *http.Request) {
 		// the legacy APK fixture only covers fields that existed before it.
 		jsonOut(w, map[string]any{"settings": view, "codexModels": configurableCodexModels, "upstreamTones": knownUpstreamTones(), "restartRequiredFields": settingsRestartRequiredFields})
 	case http.MethodPut:
+		// Share the pool mutation lock: a stale settings snapshot must not
+		// overwrite an import/delete that committed while this PUT was merging.
+		proxyPoolMutationMu.Lock()
+		defer proxyPoolMutationMu.Unlock()
 		// 前端可能只修改一个字段（如监听地址），其余字段以零值提交。
 		// 逐字段合并到当前设置再校验，避免"改一个字段弄丢其他配置"。
 		cur := s.settings.get()
@@ -369,16 +373,22 @@ func (s *Server) adminSettings(w http.ResponseWriter, r *http.Request) {
 		if s.sessionResolver != nil {
 			evicted = s.sessionResolver.SetMaxSessions(v.SessionMax)
 		}
-		if e := outbound.ConfigurePool(v.ProxyPool); e != nil {
-			writeOpenAIError(w, 400, "invalid_request_error", e.Error())
-			return
+		// Pool mode takes precedence, as at startup. Configure(single) clears
+		// the process-global pool, so these paths must be mutually exclusive.
+		var proxyErr error
+		if len(v.ProxyPool) > 0 {
+			proxyErr = outbound.ConfigurePool(v.ProxyPool)
+		} else {
+			proxyErr = outbound.Configure(v.OutboundProxy)
 		}
-		if e := outbound.Configure(v.OutboundProxy); e != nil {
-			writeOpenAIError(w, 400, "invalid_request_error", e.Error())
+		if proxyErr != nil {
+			writeOpenAIError(w, 400, "invalid_request_error", proxyErr.Error())
 			return
 		}
 		chathub.SetClientProfile(v.ClientProfile)
 		chathub.EnableWireCapture(v.CaptureRouterFrames)
+		v.ProxyPool = outbound.RedactProxyURLs(v.ProxyPool)
+		v.OutboundProxy = outbound.RedactProxyURL(v.OutboundProxy)
 		response := map[string]any{"ok": true, "settings": v}
 		if s.sessionResolver != nil {
 			response["sessionsEvicted"] = evicted
