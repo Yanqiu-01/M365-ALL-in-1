@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -43,6 +44,8 @@ def payload_for(protocol, stream, prompt, tools=False, serial=False, forbid=Fals
         payload["tool_choice"] = {"type": "none" if forbid else "auto"} if protocol == "messages" else ("none" if forbid else "auto")
         if protocol != "messages":
             payload["parallel_tool_calls"] = not serial
+        elif serial:
+            payload["tool_choice"]["disable_parallel_tool_use"] = True
     return payload
 
 
@@ -127,7 +130,9 @@ def decode_reply(protocol, stream, raw):
     return {"text": "".join(text), "calls": calls, "state": state, "errors": errors, "terminal_count": terminal_count}
 
 
-def run_case(base_url, key, protocol, stream, scenario, timeout):
+def run_case(base_url, key, protocol, stream, scenario, timeout, rate_limited=None):
+    if rate_limited is not None and rate_limited.is_set():
+        return {"case": f"{protocol}/{scenario}/stream={stream}", "model": MODEL, "effort": EFFORT, "passed": False, "skipped": "stopped after HTTP 429; honor Retry-After before a new run"}
     marker = "AUDIT_OK_" + uuid.uuid4().hex[:12]
     expected = ["A: literal ) and {; inspect only", "B: literal ( and }; inspect only", "C: 路径 C:\\audit\\notes.txt; inspect only"]
     if scenario in ("text", "none"):
@@ -163,6 +168,9 @@ def run_case(base_url, key, protocol, stream, scenario, timeout):
         result["passed"] = bool(passed)
     except urllib.error.HTTPError as error:
         result.update(passed=False, http_status=error.code, error="HTTPError")
+        if error.code == 429:
+            result["retry_after"] = error.headers.get("Retry-After", "unspecified")
+            if rate_limited is not None: rate_limited.set()
     except Exception as error:
         # Never log the request, credentials, or arbitrary upstream error bodies.
         result.update(passed=False, error=type(error).__name__)
@@ -190,11 +198,12 @@ def main():
         for stream in (False, True):
             scenarios = ["text"] if args.suite == "smoke" else ["parallel", "none"]
             if args.suite == "all": scenarios.insert(0, "text")
-            if args.suite != "smoke" and protocol != "messages": scenarios.append("serial")
+            if args.suite != "smoke": scenarios.append("serial")
             cases.extend((protocol, stream, scenario) for scenario in scenarios)
     results = []
+    rate_limited = threading.Event()
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(args.workers, 4))) as executor:
-        futures = [executor.submit(run_case, args.base_url, key, *case, args.timeout) for case in cases]
+        futures = [executor.submit(run_case, args.base_url, key, *case, args.timeout, rate_limited) for case in cases]
         for future in concurrent.futures.as_completed(futures):
             result = future.result()
             results.append(result)

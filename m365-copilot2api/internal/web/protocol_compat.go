@@ -316,18 +316,39 @@ type anthropicTool struct {
 	Description string         `json:"description,omitempty"`
 	InputSchema map[string]any `json:"input_schema"`
 }
+type anthropicOutputConfig struct {
+	Effort string `json:"effort,omitempty"`
+}
+
 type anthropicRequest struct {
-	Model      string             `json:"model"`
-	System     any                `json:"system,omitempty"`
-	Messages   []anthropicMessage `json:"messages"`
-	Tools      []anthropicTool    `json:"tools,omitempty"`
-	ToolChoice any                `json:"tool_choice,omitempty"`
-	Stream     bool               `json:"stream,omitempty"`
-	MaxTokens  int                `json:"max_tokens,omitempty"`
+	Model           string                 `json:"model"`
+	System          any                    `json:"system,omitempty"`
+	Messages        []anthropicMessage     `json:"messages"`
+	Tools           []anthropicTool        `json:"tools,omitempty"`
+	ToolChoice      any                    `json:"tool_choice,omitempty"`
+	Stream          bool                   `json:"stream,omitempty"`
+	MaxTokens       int                    `json:"max_tokens,omitempty"`
+	OutputConfig    *anthropicOutputConfig `json:"output_config,omitempty"`
+	ReasoningEffort string                 `json:"reasoning_effort,omitempty"`
 }
 
 func (r anthropicRequest) openAI() (oaiReq, error) {
 	o := oaiReq{Model: r.Model, Stream: r.Stream}
+	effort, err := normalizeReasoningEffort(r.ReasoningEffort)
+	if err != nil {
+		return o, err
+	}
+	if r.OutputConfig != nil {
+		configured, err := normalizeReasoningEffort(r.OutputConfig.Effort)
+		if err != nil {
+			return o, err
+		}
+		if effort != "" && configured != "" && effort != configured {
+			return o, fmt.Errorf("output_config.effort conflicts with reasoning_effort")
+		}
+		effort = firstNonEmpty(configured, effort)
+	}
+	o.ReasoningEffort = effort
 	if r.System != nil {
 		o.Messages = append(o.Messages, oaiMsg{Role: "system", Content: r.System})
 	}
@@ -420,6 +441,14 @@ func (r anthropicRequest) openAI() (oaiReq, error) {
 		o.Tools = append(o.Tools, chathub.Tool{Type: "function", Function: b})
 	}
 	if c, ok := r.ToolChoice.(map[string]any); ok {
+		if raw, exists := c["disable_parallel_tool_use"]; exists {
+			disabled, valid := raw.(bool)
+			if !valid {
+				return o, fmt.Errorf("disable_parallel_tool_use must be a boolean")
+			}
+			parallel := !disabled
+			o.ParallelToolCalls = &parallel
+		}
 		switch c["type"] {
 		case "auto":
 			o.ToolChoice = "auto"

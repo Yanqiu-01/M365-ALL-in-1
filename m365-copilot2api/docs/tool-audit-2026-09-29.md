@@ -14,9 +14,13 @@ protocol adapters, streaming completion/error handling, account fallback and
 session restoration, final Edit emission, startup resources and rollback.
 Running the full test suite is not a proof that every possible bug is absent.
 
-All new **live** model requests use `gpt-5.6-reasoning` with `max` effort. The
-model catalog advertises that combination and the gateway's effort normalizer
-accepts `max`. Model identity is the requested gateway route, not an independent
+All new **live** model requests request `gpt-5.6-reasoning` with `max` effort.
+Log correlation uncovered that the Messages adapter initially discarded the
+effort field: earlier Messages measurements therefore do **not** prove execution
+at max. The follow-up adapter repair forwards `output_config.effort` and the
+`reasoning_effort` extension, validates conflicts, and is verified separately.
+The model catalog advertises that combination and the effort normalizer accepts
+`max`. Model identity is the requested gateway route, not an independent
 attestation of Microsoft's underlying model implementation.
 
 ## Repairs included
@@ -41,6 +45,13 @@ attestation of Microsoft's underlying model implementation.
 - Do not inject a second Read when one is already selected. Do not treat an
   explicit `<tool_use_error>` Read result as a successful refresh. Preserve
   legal Edit retries after reading, including mixed tool batches.
+- Forward Messages `output_config.effort` / `reasoning_effort`, rejecting
+  invalid or conflicting settings instead of silently falling back. Forward
+  `disable_parallel_tool_use` to the common parallel-call limiter.
+- Preserve cancellation/deadline status in buffered protocol adapters. A router
+  can return without a response after cancellation; parsing the recorder's
+  empty default-200 body previously fabricated a 502. This path now returns
+  cancellation 499 without a body, or deadline 504.
 
 The guard recognizes the declared `Edit`/`Read` contract. It is not a universal
 policy for every arbitrarily named MCP patch tool. It cannot recover history
@@ -114,5 +125,20 @@ backups remain in the deployment directory, not Git.
   assigning cause. Provider limits and content refusals must remain respected.
 
 Post-deployment measurements are recorded separately so the initial failed
-measurements above remain visible. No production key, token, account address,
-private prompt, or executable is committed.
+measurements above remain visible. On the intermediate `7cee336` build the live
+matrix passed 21/22: Messages nonstream parallel timed out at 240 seconds and
+Responses stream parallel succeeded in 224.828 seconds. All three temporary-file
+recovery runs executed Read → Edit → Read with correct final content; these
+Messages runs still preceded the effort-forwarding fix. Monitoring sampled
+frontend HTTP 200 85 times and observed two timeout signals plus one HTTP 502.
+The 502 correlated with the canceled Messages request and led to the buffered
+adapter cancellation regression/fix above. The long successful Responses call
+remains a latency observation, not proof of a parser defect.
+
+Messages streaming is currently converted from a buffered inner completion;
+valid SSE framing must not be represented as proof of token-by-token delivery.
+A second workflow verification attempt could not start because its service did
+not expose the requested model; it supplied no audit evidence either.
+
+No production key, token, account address, private prompt, or executable is
+committed.

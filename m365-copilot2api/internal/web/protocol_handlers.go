@@ -418,6 +418,17 @@ func (s *Server) runOpenAIAdapterWithStats(r *http.Request, o oaiReq) (map[strin
 	rr := httptest.NewRecorder()
 	s.openaiChat(rr, r2)
 	sink.RetryAfter = rr.Header().Get("Retry-After")
+	// Router cancellation may intentionally return without writing anything.
+	// A recorder defaults to HTTP 200; decoding its empty body would fabricate
+	// a 502 after the client has already disconnected.
+	if err := r.Context().Err(); err != nil {
+		status := upstreamStatus(err)
+		if status == statusClientClosedRequest {
+			return nil, nil, status, sink, err
+		}
+		raw := []byte(mustJSON(map[string]any{"error": map[string]any{"message": classifyUpstream(err)}}))
+		return nil, raw, status, sink, err
+	}
 	var out map[string]any
 	err := json.Unmarshal(rr.Body.Bytes(), &out)
 	return out, rr.Body.Bytes(), rr.Code, sink, err

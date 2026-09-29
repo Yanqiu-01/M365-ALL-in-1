@@ -8,6 +8,7 @@ import sys
 import tempfile
 import time
 import urllib.parse
+import urllib.error
 import urllib.request
 import uuid
 
@@ -40,6 +41,7 @@ def convert_history(protocol, history):
 def run(protocol, base, key, timeout):
     start = time.monotonic()
     events, errors = [], []
+    rate_limit = {}
     seed = "seed-" + uuid.uuid4().hex
     history = [{"role": "user", "content": "In audit.txt change the line containing old to new, preserving its tab indentation and all other lines. Recover from the failed Edit below by reading current content first. Verify the file after the successful edit. Use only the declared Read and Edit tools."},
                {"role": "assistant", "content": None, "tool_calls": [{"id": seed, "type": "function", "function": {"name": "Edit", "arguments": json.dumps({"file_path": "audit.txt", "old_string": "\t\told", "new_string": "\tnew"})}}]},
@@ -70,6 +72,11 @@ def run(protocol, base, key, timeout):
             try:
                 with opener.open(request, timeout=timeout) as response:
                     reply = decode_reply(protocol, False, response.read().decode("utf-8"))
+            except urllib.error.HTTPError as error:
+                errors.append("HTTPError")
+                if error.code == 429:
+                    rate_limit = {"http_status": 429, "retry_after": error.headers.get("Retry-After", "unspecified")}
+                break
             except Exception as error:
                 errors.append(type(error).__name__); break
             if reply["errors"]: errors.extend(reply["errors"]); break
@@ -105,7 +112,7 @@ def run(protocol, base, key, timeout):
                 history.append({"role": "tool", "tool_call_id": call["id"], "content": result})
             if verified: break
         final_matches = target.read_text(encoding="utf-8") == "before\n\tnew\nafter\n"
-    return {"protocol": protocol, "model": MODEL, "effort": EFFORT, "passed": not errors and verified and final_matches, "verified_by_read": verified, "final_file_matches": final_matches, "errors": errors, "events": events, "seconds": round(time.monotonic() - start, 3)}
+    return {**rate_limit, "protocol": protocol, "model": MODEL, "effort": EFFORT, "passed": not errors and verified and final_matches, "verified_by_read": verified, "final_file_matches": final_matches, "errors": errors, "events": events, "seconds": round(time.monotonic() - start, 3)}
 
 
 def main():
@@ -122,6 +129,9 @@ def main():
     for protocol in ("chat", "messages", "responses"):
         result = run(protocol, args.base_url, key, args.timeout); results.append(result)
         print(json.dumps(result), flush=True)
+        if result.get("http_status") == 429:
+            print("Remaining protocols skipped after HTTP 429; honor Retry-After before a new run.", flush=True)
+            break
     args.report.parent.mkdir(parents=True, exist_ok=True)
     args.report.write_text(json.dumps({"model": MODEL, "effort": EFFORT, "results": results}, indent=2) + "\n", encoding="utf-8")
     return 0 if all(r["passed"] for r in results) else 1
